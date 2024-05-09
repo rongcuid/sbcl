@@ -135,3 +135,10 @@
              (simple-string
               (string-to-c-string ,value
                                   (c-string-external-format ,type)))))))
+;;;; Struct Support (or the lack thereof)
+(define-alien-type-method (record :arg-tn) (type state)
+  (declare (ignore type state))
+  (error "Passing structs by value is unsupported."))
+(define-alien-type-method (record :result-tn) (type state)
+  (declare (ignore type state))
+  (error "Returning structs by value is unsupported."))
