@@ -136,13 +136,9 @@
               (string-to-c-string ,value
                                   (c-string-external-format ,type)))))))
 ;;;; Struct Support (or the lack thereof)
-;; NOTE: RECORD follows the hierarchy of RECORD -> MEM-BLOCK -> ALIEN-VALUE -> SAP.
-;; All platforms have passing SAP defined, which causes passing record by value
-;; to silently corrupt.
-;; -- Rongcui
 (define-alien-type-method (record :arg-tn) (type state)
   (declare (ignore type state))
-  (error "Passing structs by value is unsupported on this platform."))
+  (error "Passing structs by value is unsupported."))
 (define-alien-type-method (record :result-tn) (type state)
   (declare (ignore type state))
-  (error "Returning structs by value is unsupported on this platform."))
+  (error "Returning structs by value is unsupported."))
