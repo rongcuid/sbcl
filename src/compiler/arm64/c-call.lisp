@@ -1,4 +1,79 @@
-;;;; VOPs and other machine-specific support routines for call-out to C
+;;;; VOPs and other machine-specific support routines for call-out to C.
+;;;;
+;;;; ARM64 follows calling convention described in [AAPCS64].
+;;;; Following is a summary of this calling convention.
+;;;; Notice that this documentation is added after the implementation, thus specific details may differ.
+;;;;
+;;;; AAPCS64 argument passing is performed in the following stages:
+;;;;
+;;;; Stage A: Initialization, performed exactly once.
+;;;; 1. Set Next General Purpose Register Number (NGRN) to zero.
+;;;; 2. Set Next SIMD and FP Register Number (NSRN) to zero.
+;;;; 3. Set Next Scalable Predicate Register Number (NPRN) to zero (not applicable).
+;;;; 4. Set Next Stacked Argument Address (NSAA) set to current SP.
+;;;;
+;;;; Stage B: Pre-padding and extension.
+;;;;    Match first rule for each argument, or pass unmodified if no match.
+;;;; 1. If argument is pure scalable type, pass unmodified.
+;;;; 2. If Composite Type whose size CANNOT be determined by BOTH caller and callee,
+;;;;    copy to memory and replace by pointer (doesn't exist in C)
+;;;; 3. If HFA or HVA, pass unmodified.
+;;;; 4. If Composite Type with size > 16 bytes, copy to memory and replace by pointer.
+;;;; 5. If Composite Type (with size <= 16 bytes), round up to nearest multiples of 8 bytes.
+;;;; 6. If alignment-adjusted type, pass a copy of the value such that:
+;;;;    - For Fundamental Type, aligned to natural alignment of that type.
+;;;;    - For Composite Type:
+;;;;        * If natural alignment <= 8 bytes, align to 8 bytes.
+;;;;        * If natural alignment >= 16 bytes, align to 16 bytes
+;;;;    - Alignment of copy is used for applying marshaling rules (not applicable)
+;;;;
+;;;; Stage C: Assignment of arguments to registers and stack.
+;;;;    Match each rule for each argument until argument has been allocated.
+;;;;    When assigned to register, unused bits have unspecified value.
+;;;;    When assigned to stack, padding bytes have unspecified value.
+;;;; 1. If half-, single-, double-, quad- float/short vector type and NSRN < 8:
+;;;;    - Allocate to LSBs of v[NSRN] and increment NSRN.
+;;;; 2. If HFA/HVA and there are enough SIMD and FP registers (NSRN + N members <= 8):
+;;;;    - Allocate to SIMD and FP registers, one per member, and increase NSRN by N.
+;;;; 3. If HFA/HVA, then set NSRA to 8 and round up size of argument to next multiple of 8 bytes.
+;;;; 4. If NFA/HVA, quad-float, or short vector type:
+;;;;    - If natural alignment <= 8, round up NSAA to next multiple of 8.
+;;;;    - If natural alignment >= 16, round up NSAA to next multiple of 16.
+;;;; 5. If half- or single- float, set size of argument to 8 bytes, remaining bytes unspecified.
+;;;; 6. If HFA, HVA, half-, single-, double-, quad-float, or short vector type:
+;;;;    - Allocate and copy to memory at adjusted NSAA; increment NSAA by size.
+;;;; 7. If argument is pure scalable type consist of NV scalable vector types and NP scalable predicate types, if argument is named, if NSRN+NV <= 8, and if NPRN+NP <= 4:
+;;;;    - Allocate Scalable Vector Types to z[NSRN]...z[NSRN+NV-1] inclusive; increment NSRN by NV.
+;;;;    - Allocate Scalable Predicate Types to p[NPRN]...p[NPRN+NP-1] inclusive; increment NPRN by NP
+;;;; 8. If Pure Scalable Type that has not been allocated by rules above:
+;;;;    - Copy to memory and replace by pointer, then allocate according to rules below.
+;;;; 9. If integral or pointer type, size <= 8 bytes, and NGRN < 8:
+;;;;    - Allocate to LSBs in x[NGRN] and increment NGRN by 1.
+;;;; 10. If argument has alignment of 16 bytes, round up NGRN to next even number.
+;;;; 11. If integral type, size = 16, and NGRN < 7:
+;;;;    - Allocate lower-address dword to x[NGRN] and high-address dword x[NGRN+1].
+;;;;    - Increment NGRN by 2.
+;;;; 12. If Composite Type and size in double words <= 8-NGRN:
+;;;;    - Allocate to consecutive GPR starting at x[NGRN], as if loaded from dword-aligned address with LDR instructions.
+;;;;    - Increment NGRN by registers used.
+;;;; 13. If NGRA = 8.
+;;;; 14. If NSAA is rounded up to max(8, Natural Alignment of Type).
+;;;; 15. If Composite Type:
+;;;;    - Allocate to memory at adjusted NSAA. Increment NSAA by size.
+;;;; 16. If size < 8 bytes, set size to 8 bytes.
+;;;; 17. Allocate to adjusted NSAA and increment NSAA by size.
+;;;;
+;;;; AAPCS64 return is performed as following:
+;;;;
+;;;; 1. If return type T is such that a function `void func(T arg)' requires passing T in a register:
+;;;;    - Return result in the same registers as it would use for such argument.
+;;;; 2. Otherwise:
+;;;;    - Reserve memory of sufficient size and alignment.
+;;;;    - Pass the address as additional argument in x8.
+;;;;    - Note that x8 is not preserved by callee.
+;;;;
+;;;; Ref:
+;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
