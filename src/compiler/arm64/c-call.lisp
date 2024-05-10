@@ -2,7 +2,8 @@
 ;;;;
 ;;;; ARM64 follows calling convention described in [AAPCS64].
 ;;;; Following is a summary of this calling convention.
-;;;; Notice that this documentation is added after the implementation, thus specific details may differ.
+;;;; Notice that this documentation is added after the implementation,
+;;;; thus specific details such as notation, names, etc. may differ.
 ;;;;
 ;;;; AAPCS64 argument passing is performed in the following stages:
 ;;;;
@@ -31,7 +32,7 @@
 ;;;;    Match each rule for each argument until argument has been allocated.
 ;;;;    When assigned to register, unused bits have unspecified value.
 ;;;;    When assigned to stack, padding bytes have unspecified value.
-;;;; 1. If half-, single-, double-, quad- float/short vector type and NSRN < 8:
+;;;; 1. If argument is half-, single-, double-, quad- float or short vector type and NSRN < 8:
 ;;;;    - Allocate to LSBs of v[NSRN] and increment NSRN.
 ;;;; 2. If HFA/HVA and there are enough SIMD and FP registers (NSRN + N members <= 8):
 ;;;;    - Allocate to SIMD and FP registers, one per member, and increase NSRN by N.
@@ -91,8 +92,11 @@
 (defconstant +max-register-args+ 8)
 
 (defstruct arg-state
+  ;; NGRN
   (num-register-args 0)
+  ;; NSRN
   (fp-registers 0)
+  ;; NSAA = SP + stack-frame-size
   (stack-frame-size 0))
 
 (defstruct (result-state (:copier nil))
@@ -136,6 +140,7 @@
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
+  "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-num-register-args state) (1+ reg-args))
@@ -152,6 +157,7 @@
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
+  "Pass floats by AAPCS64: FP register (C.1) or stack (C.5, C.6)"
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-fp-registers state) (1+ reg-args))
@@ -187,7 +193,15 @@
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
   (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
-;;;
+
+(define-alien-type-method (sb-alien::record :arg-tn) (type state)
+  (declare (ignore type state))
+  (error "WIP arm64 struct value passing"))
+
+(define-alien-type-method (sb-alien::record :result-tn) (type state)
+  (declare (ignore type state))
+  (error "WIP arm64 struct value return."))
+;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
     (foldable flushable movable))
