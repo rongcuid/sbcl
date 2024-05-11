@@ -1,7 +1,9 @@
 ;;;; VOPs and other machine-specific support routines for call-out to C.
 ;;;;
 ;;;; ARM64 follows calling convention described in [AAPCS64].
-;;;; Following is a summary of this calling convention.
+;;;; Mac OS X is based on the same ABI, but have some modifications [MACABI].
+;;;; Both calling convention are summarized below for reference and for the case
+;;;; when original document is difficult to find.
 ;;;; Notice that this documentation is added after the implementation,
 ;;;; thus specific details such as notation, names, etc. may differ.
 ;;;;
@@ -73,8 +75,41 @@
 ;;;;    - Pass the address as additional argument in x8.
 ;;;;    - Note that x8 is not preserved by callee.
 ;;;;
+;;;; TODO: ARM64 Variadic
+;;;;
+;;;; Mac OS X [MACABI] uses the arm64 calling convention, except for a few deviations.
+;;;;
+;;;; Registers:
+;;;; - Register x18 is reserved and should not be used.
+;;;; - Frame pointer (x29, FP) must always address a valid frame record.
+;;;;    - Some functions (leaf, tail call, etc.) may opt not to create an entries in the list
+;;;;
+;;;; Data types:
+;;;; - wchar_t is signed 32 bit type
+;;;; - char is signed
+;;;; - long is 64 bit
+;;;; - __fp16 uses IEEE754-2008 format
+;;;; - long double is IEEE754 double-float, instead of quad-float
+;;;;
+;;;; Stack red zone:
+;;;; - 128 bytes below SP is ``red zone'' which is not touched by the OS
+;;;; - If function calls itself, caller must assume callee can modify this zone
+;;;;
+;;;; Argument passing:
+;;;; - Function arguments may consume slots on stack that are not multiple of 8 bytes.
+;;;;    - If total number of bytes used is not multiple of 8, pad to multiple of 8 bytes.
+;;;;    - B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
+;;;; - When passing an argument with 16 byte alignment, it can start in odd-numbered xN register.
+;;;; - Caller, instead of callee, perform signed/zero extension of arguments fewer than 32 bits.
+;;;;    - TODO: where does AAPCS64 say anythiing about 32-bits??? -- Rongcui
+;;;; - Functions may ignore params containing empty struct types.
+;;;;    - This is unspecified by AAPCS64
+;;;;
+;;;; TODO: Mac OS Variadic
+;;;;
 ;;;; Ref:
 ;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
+;;;; [MACABI] Writing ARM64 code for Apple platforms, https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
