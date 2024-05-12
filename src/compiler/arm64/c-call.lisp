@@ -75,7 +75,51 @@
 ;;;;    - Pass the address as additional argument in x8.
 ;;;;    - Note that x8 is not preserved by callee.
 ;;;;
-;;;; TODO: ARM64 Variadic
+;;;; AAPCS64 contains additional specification on variadic arguments:
+;;;; - Varargs consist of ``named arguments'' and ``anonymous arguments''
+;;;; - Regular function calls are like varargs with only named arguments
+;;;; - In unprototyped and variadic C, ``__fp16'' and ``single float'' are converted to double
+;;;;
+;;;; Prologue of a function accepting varargs and which invokes ``va_start'' is expected to
+;;;; save the incoming argument registers to two register save areas in its own stack frame:
+;;;; - One area holding GP registers xn-x7
+;;;; - One area holding FP/SIMD registers vn-v7
+;;;; - Only those beyond named parameters need to be saved.
+;;;; - If a function is known to never accept a certain class of registers, that save area may be omitted.
+;;;; - In each area, registers are saved in ascending order.
+;;;; - For memory format of FP/SIMD save area, registers must be saved as if each is saved using integer STR instruction for the entire register.
+;;;;
+;;;; The ``va_list'' argument is passed as the following structure:
+;;;;
+;;;; ```
+;;;; typedef struct  va_list {
+;;;;    void * stack; // next stack param
+;;;;    void * gr_top; // end of GP arg reg save area
+;;;;    void * vr_top; // end of FP/SIMD arg reg save area
+;;;;    int gr_offs; // offset from  gr_top to next GP register arg
+;;;;    int vr_offs; // offset from  vr_top to next FP/SIMD register arg
+;;;;} va_list;
+;;;; '''
+;;;;
+;;;; The ``va_start'' macro initializes fields of ``va_list'' argument as:
+;;;; - Let ``named_gr'' be the number of GP registers known to hold named incoming args
+;;;; - Let ``named_vr'' be the number of FP/SIMD registers known to hold named incoming args
+;;;; - Set ``stack'' to:
+;;;;    - Addr following last (highest addressed) named argument on stack, rounded up to next multiple of 8 bytes.
+;;;;    - Or if no named arguments, value of stack pointer when function is entered.
+;;;; - Set ``gr_top'' to:
+;;;;    - Addr of the byte immediately following GP register save area, aligned to 16 bytes
+;;;; - Set ``vr_top'' to:
+;;;;    - Addr of the byte immediately following FP/SIMD register save area, aligned to 16 bytes
+;;;; - Set ``gr_offs'' to (0 - ((8 - named_gr)) * 8)
+;;;; - Set ``vr_offs'' to (0 - ((8 - named_vr)) * 16)
+;;;; - If it's known that ``va_list'' is never used to access FP/SIMD registers:
+;;;;    - No FP/SIMD registers need to be saved
+;;;;    - ``vr_top'' and ``vr_offs'' are 0.
+;;;;    - If GP register save area is immediately below stack pointer on entry:
+;;;;        - ``stack'' can be set address of the anonymous argument in GP arg save area
+;;;;        - ``gr_top'' and ``gr_offs'' are 0.
+;;;; - The optimization above for FP/SIMD register cannot be used for GP registers.
 ;;;;
 ;;;; Mac OS X [MACABI] uses the arm64 calling convention, except for a few deviations.
 ;;;;
@@ -105,7 +149,13 @@
 ;;;; - Functions may ignore params containing empty struct types.
 ;;;;    - This is unspecified by AAPCS64
 ;;;;
-;;;; TODO: Mac OS Variadic
+;;;; Variadic function:
+;;;; - Arguments are initialized as Stage A and Stage B
+;;;; - When assigning register and stack slots, follow these rules for each variadic arg:
+;;;;    - Round up NSRN to the next multiple of 8 bytes.
+;;;;    - Assign each variadic argument to appropriate 8-byte stack slots.
+;;;; - In essense, Mac OS's ``va_list'' is represented by a ``char *'' instead of a structure
+;;;;    - NOTE: that's paraphrased from Mac documentation. I think it's more like ``uint64_t *'' -- Rongcui
 ;;;;
 ;;;; Ref:
 ;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
