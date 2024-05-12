@@ -1,5 +1,14 @@
 ;;;; VOPs and other machine-specific support routines for call-out to C.
+
+;;;; This software is part of the SBCL system. See the README file for
+;;;; more information.
 ;;;;
+;;;; This software is derived from the CMU CL system, which was
+;;;; written at Carnegie Mellon University and released into the
+;;;; public domain. The software is in the public domain and is
+;;;; provided with absolutely no warranty. See the COPYING and CREDITS
+;;;; files for more information.
+
 ;;;; ARM64 follows calling convention described in [AAPCS64].
 ;;;; Mac OS X is based on the same ABI, but have some modifications [MACABI].
 ;;;; Both calling convention are summarized below for reference and for the case
@@ -141,11 +150,12 @@
 ;;;;
 ;;;; Argument passing:
 ;;;; - Function arguments may consume slots on stack that are not multiple of 8 bytes.
-;;;;    - If total number of bytes used is not multiple of 8, pad to multiple of 8 bytes.
-;;;;    - B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
+;;;;    - If total number of bytes used for stack arguments is not multiple of 8:
+;;;;        - Pad to multiple of 8 bytes.
+;;;;    - Affects B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
 ;;;; - When passing an argument with 16 byte alignment, it can start in odd-numbered xN register.
 ;;;; - Caller, instead of callee, perform signed/zero extension of arguments fewer than 32 bits.
-;;;;    - TODO: where does AAPCS64 say anythiing about 32-bits??? -- Rongcui
+;;;;    - NOTE: this means caller must not leave padding bits unspecified
 ;;;; - Functions may ignore params containing empty struct types.
 ;;;;    - This is unspecified by AAPCS64
 ;;;;
@@ -156,19 +166,12 @@
 ;;;;    - Assign each variadic argument to appropriate 8-byte stack slots.
 ;;;; - In essense, Mac OS's ``va_list'' is represented by a ``char *'' instead of a structure
 ;;;;    - NOTE: that's paraphrased from Mac documentation. I think it's more like ``uint64_t *'' -- Rongcui
+;;;; - TODO: verify whether slotting follows the AAPCS64 rules or the Mac OS rules
 ;;;;
 ;;;; Ref:
 ;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
 ;;;; [MACABI] Writing ARM64 code for Apple platforms, https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
 
-;;;; This software is part of the SBCL system. See the README file for
-;;;; more information.
-;;;;
-;;;; This software is derived from the CMU CL system, which was
-;;;; written at Carnegie Mellon University and released into the
-;;;; public domain. The software is in the public domain and is
-;;;; provided with absolutely no warranty. See the COPYING and CREDITS
-;;;; files for more information.
 
 (in-package "SB-VM")
 
