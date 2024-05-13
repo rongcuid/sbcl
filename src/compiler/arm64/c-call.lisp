@@ -68,8 +68,8 @@
 ;;;; 12. If Composite Type and size in double words <= 8-NGRN:
 ;;;;    - Allocate to consecutive GPR starting at x[NGRN], as if loaded from dword-aligned address with LDR instructions.
 ;;;;    - Increment NGRN by registers used.
-;;;; 13. If NGRA = 8.
-;;;; 14. If NSAA is rounded up to max(8, Natural Alignment of Type).
+;;;; 13. NGRA is set to 8.
+;;;; 14. NSAA is rounded up to max(8, Natural Alignment of Type).
 ;;;; 15. If Composite Type:
 ;;;;    - Allocate to memory at adjusted NSAA. Increment NSAA by size.
 ;;;; 16. If size < 8 bytes, set size to 8 bytes.
@@ -130,7 +130,7 @@
 ;;;;        - ``gr_top'' and ``gr_offs'' are 0.
 ;;;; - The optimization above for FP/SIMD register cannot be used for GP registers.
 ;;;;
-;;;; Mac OS X [MACABI] uses the arm64 calling convention, except for a few deviations.
+;;;; Mac OS X (Darwin) [MACABI] uses the arm64 calling convention, except for a few deviations.
 ;;;;
 ;;;; Registers:
 ;;;; - Register x18 is reserved and should not be used.
@@ -230,35 +230,35 @@
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
   (let ((reg-args (arg-state-num-register-args state)))
-    (cond ((< reg-args +max-register-args+)
+    (cond ((< reg-args +max-register-args+) ; C.9
            (setf (arg-state-num-register-args state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
-          (t
-           (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
+          (t ; C.13 and below
+           (let ((frame-size (align-up (arg-state-stack-frame-size state) size))) ; C.14
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
-             (cond #+darwin
+             (cond #+darwin ; On Darwin, integer can consume non-8-byte slots; C.17
                    ((/= size n-word-bytes)
                     (lambda (value node block nsp)
                       (move-to-stack-location value size frame-size
                                               prim-type reg-sc node block nsp)))
-                   (t
+                   (t ; C.16, C.17
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass floats by AAPCS64: FP register (C.1) or stack (C.5, C.6)"
   (let ((reg-args (arg-state-fp-registers state)))
-    (cond ((< reg-args +max-register-args+)
+    (cond ((< reg-args +max-register-args+) ; C.1
            (setf (arg-state-fp-registers state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc reg-args))
-          (t
+          (t ; C.5 and below
            (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
-             (cond #+darwin
+             (cond #+darwin ; On Darwin, floats can consume non-8-byte slots; C.6
                    ((/= size n-word-bytes)
                     (lambda (value node block nsp)
                       (move-to-stack-location value size frame-size
                                               prim-type reg-sc node block nsp)))
-                   (t
+                   (t ; C.5, C.6
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
@@ -283,8 +283,13 @@
   (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
 
 (define-alien-type-method (sb-alien::record :arg-tn) (type state)
-  (declare (ignore type state))
-  (error "WIP arm64 struct value passing"))
+  (declare (ignore state))
+  (let ((bits (alien-type-bits type)))
+    (cond
+      #+darwin ; Darwin specifies that empty records are ignored
+      ((not bits) (lambda (value node block nsp) (declare (ignore value node block nsp))))
+      (t
+       (error "WIP ARM64: ARG-TN for RECORD, size ~A bits" (alien-type-bits type))))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore type state))
