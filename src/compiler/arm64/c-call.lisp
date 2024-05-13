@@ -284,12 +284,16 @@
 
 (define-alien-type-method (sb-alien::record :arg-tn) (type state)
   (declare (ignore state))
-  (let ((bits (alien-type-bits type)))
+  (let* ((bits (alien-type-bits type))
+         (size (truncate (or bits 0) n-byte-bits)))
     (cond
       #+darwin ; Darwin specifies that empty records are ignored
-      ((not bits) (lambda (value node block nsp) (declare (ignore value node block nsp))))
+      ((zerop size)
+       (lambda (value node block nsp) (declare (ignore value node block nsp))))
+      ((<= size 16)
+       (error "WIP ARM64: passing struct of size ~A by registers or by stack" size))
       (t
-       (error "WIP ARM64: ARG-TN for RECORD, size ~A bits" (alien-type-bits type))))))
+       (error "WIP ARM64: passing struct of size ~A by stack" size)))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore type state))
