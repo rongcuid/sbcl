@@ -579,14 +579,12 @@
 (cl:in-package :cl-user)
 ;;;; Bug 313202: C struct pass/return by value
 ;;; Compile and load shared library
-(defvar *delete-alien-struct-by-value* nil)
 (unless (probe-file "alien-struct-by-value.so")
   (sb-ext:run-program "/bin/sh" '("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
                                   "-o" "alien-struct-by-value.so"
-                                  "alien-struct-by-value.c"))
-  (setf *delete-alien-struct-by-value* t))
+                                  "alien-struct-by-value.c")))
 (load-shared-object (truename "alien-struct-by-value.so"))
-;;; Large struct pass by stack
+;;; Large struct, alignment 8
 (define-alien-type nil
     (struct large-align-8
             (m0 (integer 64)) (m4 (integer 64)) (m8 (integer 64)) (m12 (integer 64))
@@ -600,6 +598,7 @@
   (let ((defs (loop for i upto 15 collect `(def-large-align-8-test ,i))))
     `(progn ,@defs)))
 (defs-large-align-8-test)
+(define-alien-routine large-align-8-test-mutate void (m (struct large-align-8)))
 (with-test (:name :struct-by-value-large-align-8-args)
   (with-alien ((m (struct large-align-8)))
     (macrolet ((set-members ()
@@ -616,8 +615,14 @@
                                  `(assert (= ,i (,f m))))
                          into tests
                        finally (return `(progn ,@tests)))))
+      ;; Initialize struct
       (set-members)
+      ;; Test that struct is correctly passed
+      (test-members)
+      ;; Call a C function that mutates struct locally
+      (large-align-8-test-mutate m)
+      ;; Test that the original struct is not modified
       (test-members))))
 
 ;;; Clean up
-(when *delete-alien-struct-by-value* (delete-file "alien-struct-by-value.so"))
+(delete-file "alien-struct-by-value.so")
