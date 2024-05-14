@@ -283,7 +283,6 @@
   (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
 
 (define-alien-type-method (sb-alien::record :arg-tn) (type state)
-  (declare (ignore state))
   (let* ((bits (alien-type-bits type))
          (size (truncate (or bits 0) n-byte-bits)))
     (cond
@@ -292,8 +291,8 @@
        (lambda (value node block nsp) (declare (ignore value node block nsp))))
       ((<= size 16)
        (error "WIP ARM64: passing struct of size ~A by registers or by stack" size))
-      (t
-       (error "WIP ARM64: passing struct of size ~A by stack" size)))))
+      (t ; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
+       (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number)))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore type state))
