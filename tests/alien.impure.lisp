@@ -594,7 +594,7 @@
             (m2 (integer 64)) (m6 (integer 64)) (m10 (integer 64)) (m14 (integer 64))
             (m3 (integer 64)) (m7 (integer 64)) (m11 (integer 64)) (m15 (integer 64))))
 (defmacro def-large-align-8-test (i)
-  (let ((lisp-name (intern (format nil "LARGE-ALIGN-8-TEST-M~A" i))))
+  (let ((lisp-name (sb-int:symbolicate "LARGE-ALIGN-8-TEST-M" i)))
     `(define-alien-routine ,lisp-name (integer 64) (m (struct large-align-8)))))
 (defmacro defs-large-align-8-test ()
   (let ((defs (loop for i upto 15 collect `(def-large-align-8-test ,i))))
@@ -602,20 +602,21 @@
 (defs-large-align-8-test)
 (with-test (:name :struct-by-value-large-align-8-args)
   (with-alien ((m (struct large-align-8)))
-    (setf (slot m 'm0) 0) (setf (slot m 'm1) 1)
-    (setf (slot m 'm2) 2) (setf (slot m 'm3) 3)
-    (setf (slot m 'm4) 4) (setf (slot m 'm5) 5)
-    (setf (slot m 'm6) 6) (setf (slot m 'm7) 7)
-    (setf (slot m 'm8) 8) (setf (slot m 'm9) 9)
-    (setf (slot m 'm10) 10) (setf (slot m 'm11) 11)
-    (setf (slot m 'm12) 12) (setf (slot m 'm13) 13)
-    (setf (slot m 'm14) 14) (setf (slot m 'm15) 15)
-    (macrolet ((test-member (i)
-                 (let ((f (intern (format nil "LARGE-ALIGN-8-TEST-M~A" i))))
-                   `(assert (= ,i (,f m)))))
+    (macrolet ((set-members ()
+                 "Sets member mN's value to N"
+                 (loop for i upto 15
+                       collect (let ((memb (sb-int:symbolicate "M" i)))
+                                 `(setf (slot m ',memb) ,i))
+                         into setfs
+                       finally (return `(progn ,@setfs))))
                (test-members ()
-                 (let ((ts (loop for i upto 15 collect `(test-member ,i))))
-                   `(progn ,@ts))))
+                 "Test that each member has correct value"
+                 (loop for i upto 15
+                       collect (let ((f (sb-int:symbolicate "LARGE-ALIGN-8-TEST-M" i)))
+                                 `(assert (= ,i (,f m))))
+                         into tests
+                       finally (return `(progn ,@tests)))))
+      (set-members)
       (test-members))))
 
 ;;; Clean up
