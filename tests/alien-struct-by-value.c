@@ -1,3 +1,16 @@
+/** A small structure with 8-byte alignment.
+    SysV x86-64 and AAPCS64 will pass this by register.
+*/
+struct small_align_8 {
+  long long m0, m1;
+};
+long long small_align_8_get_m0(struct small_align_8 m) { return m.m0; }
+long long small_align_8_get_m1(struct small_align_8 m) { return m.m1; }
+void small_align_8_mutate(volatile struct small_align_8 m) {
+  m.m0++;
+  m.m1++;
+}
+
 /** A large structure with 8-byte alignment.
     This should be too big for any architecture to pass by registers.
 */

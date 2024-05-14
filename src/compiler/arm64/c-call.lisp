@@ -261,6 +261,16 @@
                    (t ; C.5, C.6
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
+(defun record-arg-small (type state)
+  (declare (ignore state))
+  (error "WIP ARM64: passing small struct ~A" type))
+
+(defun record-arg-large (type state)
+  (declare (ignore type state))
+  ;; FIXME: we need a copy, not the original. Will fix later.
+  ;; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
+
 (define-alien-type-method (integer :arg-tn) (type state)
  (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
              #-darwin n-word-bytes))
@@ -291,11 +301,8 @@
       #+darwin
       ((zerop size)
        (lambda (value node block nsp) (declare (ignore value node block nsp))))
-      ((<= size 16)
-       (error "WIP ARM64: passing struct of size ~A by registers or by stack" size))
-      (t ; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
-       ;; FIXME: we need a copy, not the original. Will fix later.
-       (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number)))))
+      ((<= size 16) (record-arg-small type state))
+      (t (record-arg-large type state)))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore type state))
