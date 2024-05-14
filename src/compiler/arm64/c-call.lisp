@@ -286,12 +286,15 @@
   (let* ((bits (alien-type-bits type))
          (size (truncate (or bits 0) n-byte-bits)))
     (cond
-      #+darwin ; Darwin specifies that empty records are ignored
+      ;; Darwin specifies that empty records are ignored.
+      ;; However, notice that empty structs are not portable.
+      #+darwin
       ((zerop size)
        (lambda (value node block nsp) (declare (ignore value node block nsp))))
       ((<= size 16)
        (error "WIP ARM64: passing struct of size ~A by registers or by stack" size))
       (t ; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
+       ;; FIXME: we need a copy, not the original. Will fix later.
        (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number)))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)

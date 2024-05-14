@@ -575,3 +575,48 @@
               (parse-alien-type '(integer 9) nil)))
   (assert (eq (parse-alien-type '(* (struct nil (x int) (y int))) nil)
               (parse-alien-type '(* (struct nil (x int) (y int))) nil))))
+
+(cl:in-package :cl-user)
+;;;; Bug 313202: C struct pass/return by value
+;;; Compile and load shared library
+(defvar *delete-alien-struct-by-value* nil)
+(unless (probe-file "alien-struct-by-value.so")
+  (sb-ext:run-program "/bin/sh" '("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
+                                  "-o" "alien-struct-by-value.so"
+                                  "alien-struct-by-value.c"))
+  (setf *delete-alien-struct-by-value* t))
+(load-shared-object (truename "alien-struct-by-value.so"))
+;;; Large struct pass by stack
+(define-alien-type nil
+    (struct large-align-8
+            (m0 (integer 64)) (m4 (integer 64)) (m8 (integer 64)) (m12 (integer 64))
+            (m1 (integer 64)) (m5 (integer 64)) (m9 (integer 64)) (m13 (integer 64))
+            (m2 (integer 64)) (m6 (integer 64)) (m10 (integer 64)) (m14 (integer 64))
+            (m3 (integer 64)) (m7 (integer 64)) (m11 (integer 64)) (m15 (integer 64))))
+(defmacro def-large-align-8-test (i)
+  (let ((lisp-name (intern (format nil "LARGE-ALIGN-8-TEST-M~A" i))))
+    `(define-alien-routine ,lisp-name (integer 64) (m (struct large-align-8)))))
+(defmacro defs-large-align-8-test ()
+  (let ((defs (loop for i upto 15 collect `(def-large-align-8-test ,i))))
+    `(progn ,@defs)))
+(defs-large-align-8-test)
+(with-test (:name :struct-by-value-large-align-8-args)
+  (with-alien ((m (struct large-align-8)))
+    (setf (slot m 'm0) 0) (setf (slot m 'm1) 1)
+    (setf (slot m 'm2) 2) (setf (slot m 'm3) 3)
+    (setf (slot m 'm4) 4) (setf (slot m 'm5) 5)
+    (setf (slot m 'm6) 6) (setf (slot m 'm7) 7)
+    (setf (slot m 'm8) 8) (setf (slot m 'm9) 9)
+    (setf (slot m 'm10) 10) (setf (slot m 'm11) 11)
+    (setf (slot m 'm12) 12) (setf (slot m 'm13) 13)
+    (setf (slot m 'm14) 14) (setf (slot m 'm15) 15)
+    (macrolet ((test-member (i)
+                 (let ((f (intern (format nil "LARGE-ALIGN-8-TEST-M~A" i))))
+                   `(assert (= ,i (,f m)))))
+               (test-members ()
+                 (let ((ts (loop for i upto 15 collect `(test-member ,i))))
+                   `(progn ,@ts))))
+      (test-members))))
+
+;;; Clean up
+(when *delete-alien-struct-by-value* (delete-file "alien-struct-by-value.so"))
