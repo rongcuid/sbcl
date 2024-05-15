@@ -229,14 +229,14 @@
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
 ;; Moving a struct of size 1 to 8 to register
-(define-vop (move-struct-8-to-register)
+(define-vop (move-struct-single-dword-to-register)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg))
   (:generator 0
    (inst ldr to-reg (@ from-ptr))))
 
 ;; Moving a struct of size 9 to 16 to register
-(define-vop (move-struct-16-to-registers)
+(define-vop (move-struct-double-dword-to-registers)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg-l) (to-reg-h))
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -253,11 +253,11 @@
     (ecase size-dwords
       (1
        (let ((reg-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg)))
-           (sb-c::vop move-struct-8-to-register node block temp-tn reg-tn)))
+           (sb-c::vop move-struct-single-dword-to-register node block temp-tn reg-tn)))
       (2
        (let ((reg-l-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg))
              (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
-         (sb-c::vop move-struct-16-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
+         (sb-c::vop move-struct-double-dword-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
 
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
