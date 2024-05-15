@@ -1,3 +1,11 @@
+struct tiny_align_8 {
+  long long m0;
+};
+long long tiny_align_8_get_m0(struct tiny_align_8 m) { return m.m0; }
+void tiny_align_8_mutate(volatile struct tiny_align_8 m) {
+  m.m0++;
+}
+
 /** A small structure with 8-byte alignment.
     SysV x86-64 and AAPCS64 will pass this by register.
 */

@@ -228,6 +228,37 @@
                      temp-tn)
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
+;; Moving a struct of size 1 to 8 to register
+(define-vop (move-struct-8-to-register)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg))
+  (:generator 0
+   (inst ldr to-reg (@ from-ptr))))
+
+;; Moving a struct of size 9 to 16 to register
+(define-vop (move-struct-16-to-registers)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg-l) (to-reg-h))
+  (:generator 0
+              (let ((addr-l (@ from-ptr))
+                    (addr-h (@ from-ptr (load-store-offset 8))))
+                (inst ldr to-reg-l addr-l)
+                (inst ldr to-reg-h addr-h))))
+
+(defun move-struct-to-registers (value size-dwords node block next-reg)
+  (let ((temp-tn (sb-c:make-representation-tn
+                  (primitive-type-or-lose 'system-area-pointer)
+                  sap-reg-sc-number)))
+    (sb-c::emit-move node block (sb-c::lvar-tn node block value) temp-tn)
+    (ecase size-dwords
+      (1
+       (let ((reg-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg)))
+           (sb-c::vop move-struct-8-to-register node block temp-tn reg-tn)))
+      (2
+       (let ((reg-l-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg))
+             (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
+         (sb-c::vop move-struct-16-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
+
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
   (let ((reg-args (arg-state-num-register-args state)))
@@ -263,13 +294,33 @@
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (defun record-arg-small (type state)
-  (declare (ignore state))
-  (error "WIP ARM64: passing small struct ~A" type))
+  "Records <= 16 bytes: B.4, C.12. Pass by registers if possible."
+  (let ((reg-args (arg-state-num-register-args state))
+        (size-dwords (ceiling (alien-type-bits type) n-word-bits)))
+    (cond
+      ;; C.12, if we can fit the argument in register, copy to consecutive registers
+      ((< size-dwords (- +max-register-args+ reg-args))
+       (setf (arg-state-num-register-args state) (+ size-dwords reg-args))
+       (lambda (value node block nsp)
+         (declare (ignore nsp))
+         (move-struct-to-registers value size-dwords node block reg-args)))
+      ;; Otherwise, pass by stack
+      (t
+       (error "WIP")
+       ;; C.13, set NGRA to 8
+       (setf (arg-state-num-register-args state) +max-register-args+)
+       ;; C.14 Align NSAA
+       (let* ((frame-size (align-up (arg-state-stack-frame-size state) 8))
+              (offset (truncate frame-size 8)))
+         (setf (arg-state-stack-frame-size state) (+ frame-size size-dwords))
+         (loop for off from offset upto (+ offset size-dwords)
+               collect (make-wired-tn* 'unsigned-byte-64 unsigned-stack-sc-number offset)))))))
 
 (defun record-arg-large (type state)
-  (declare (ignore type state))
+  (declare (ignore type))
   ;; FIXME: we need a copy, not the original. Will fix later.
   ;; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
+  (warn "FIXME: Large structs pass by value does not not copy yet.")
   (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 (define-alien-type-method (integer :arg-tn) (type state)
@@ -377,39 +428,11 @@
 
 (defun natural-alignment (type)
   "Find the natural alignment of a type."
+  (declare (ignore type))
   (error "TODO"))
 
-(defun stage-b (type)
-  "Stage B of [AAPCS64].
-Returns OPERATIONS required for each argument. Each element is:
-- NIL if it is not modified.
-- OPERATION if it requires modification.
-
-OPERATION is:
-- :PAD-8 pad to multiple of 8 bytes
-- :COPY-POINTER if an argument will be copied and passed by pointer.
-- :COPY-ALIGNED if an argument will be copied to natural alignment."
-  (loop
-    for i from 0
-    for arg-type in (alien-fun-type-arg-types type)
-    collect
-    (let ((align alien-type-alignment)
-          (natural-align (natural-alignment type)))
-      ;; We don't support scalable, vector, or predicate types.
-      ;; We don't support composite types with unknown size.
-      ;; B.4 and B.5
-      (cond
-        ((alien-record-type-p type)
-         (error "TODO: B.4 or B.5"))
-        ((/= align natural-align)
-         (error "TODO: B.6"))
-        (t nil)))))
-
 (defun make-call-out-tns (type)
-  (let* ((arg-state (make-arg-state)) ; Stage A
-         (arg-ops (stage-b type))) ; Stage B
-    ;; Write operations to state
-    (setf (arg-state-arg-ops arg-state) arg-ops)
+  (let* ((arg-state (make-arg-state)))
     ;; Create TNs
     (collect ((arg-tns))
       (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
