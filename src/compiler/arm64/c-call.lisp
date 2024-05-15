@@ -31,7 +31,7 @@
 ;;;;    copy to memory and replace by pointer (doesn't exist in C)
 ;;;; 3. If HFA or HVA, pass unmodified.
 ;;;; 4. If Composite Type with size > 16 bytes, copy to memory and replace by pointer.
-;;;; 5. If Composite Type (with size <= 16 bytes), round up to nearest multiples of 8 bytes.
+;;;; 5. If Composite Type, round up to nearest multiples of 8 bytes.
 ;;;; 6. If alignment-adjusted type, pass a copy of the value such that:
 ;;;;    - For Fundamental Type, aligned to natural alignment of that type.
 ;;;;    - For Composite Type:
@@ -185,7 +185,8 @@
   ;; NSRN
   (fp-registers 0)
   ;; NSAA = SP + stack-frame-size
-  (stack-frame-size 0))
+  (stack-frame-size 0)
+  (arg-ops nil))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -374,14 +375,48 @@
               (invoke-alien-type-method :result-tn type state))
             values)))
 
+(defun natural-alignment (type)
+  "Find the natural alignment of a type."
+  (error "TODO"))
+
+(defun stage-b (type)
+  "Stage B of [AAPCS64].
+Returns OPERATIONS required for each argument. Each element is:
+- NIL if it is not modified.
+- OPERATION if it requires modification.
+
+OPERATION is:
+- :PAD-8 pad to multiple of 8 bytes
+- :COPY-POINTER if an argument will be copied and passed by pointer.
+- :COPY-ALIGNED if an argument will be copied to natural alignment."
+  (loop
+    for i from 0
+    for arg-type in (alien-fun-type-arg-types type)
+    collect
+    (let ((align alien-type-alignment)
+          (natural-align (natural-alignment type)))
+      ;; We don't support scalable, vector, or predicate types.
+      ;; We don't support composite types with unknown size.
+      ;; B.4 and B.5
+      (cond
+        ((alien-record-type-p type)
+         (error "TODO: B.4 or B.5"))
+        ((/= align natural-align)
+         (error "TODO: B.6"))
+        (t nil)))))
+
 (defun make-call-out-tns (type)
-  (let ((arg-state (make-arg-state)))
+  (let* ((arg-state (make-arg-state)) ; Stage A
+         (arg-ops (stage-b type))) ; Stage B
+    ;; Write operations to state
+    (setf (arg-state-arg-ops arg-state) arg-ops)
+    ;; Create TNs
     (collect ((arg-tns))
       (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do
-              #+darwin
+              #+darwin ; In Darwin, variadic args is passed on stack slots
               (when (eql i variadic)
                 (setf (arg-state-num-register-args arg-state) +max-register-args+
                       (arg-state-fp-registers arg-state) +max-register-args+))
