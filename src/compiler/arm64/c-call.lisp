@@ -239,11 +239,11 @@
 (define-vop (move-struct-16-to-registers)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg-l) (to-reg-h))
+  (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
-              (let ((addr-l (@ from-ptr))
-                    (addr-h (@ from-ptr (load-store-offset 8))))
-                (inst ldr to-reg-l addr-l)
-                (inst ldr to-reg-h addr-h))))
+              (inst mov temp from-ptr)
+              (inst ldr to-reg-l (@ temp))
+              (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
 
 (defun move-struct-to-registers (value size-dwords node block next-reg)
   (let ((temp-tn (sb-c:make-representation-tn
