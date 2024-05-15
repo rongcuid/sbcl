@@ -627,8 +627,9 @@
         (args #-arm args #+arm (reverse args))
         #+c-stack-is-control-stack
         (stack-pointer (make-stack-pointer-tn)))
-    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns)
+    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns preprocess-tns)
         (make-call-out-tns type)
+      (declare (ignore preprocess-tns))
       #+x86
       (vop set-fpu-word-for-c call block)
       ;; Save the stack pointer, it will get aligned and subtracting

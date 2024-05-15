@@ -185,8 +185,7 @@
   ;; NSRN
   (fp-registers 0)
   ;; NSAA = SP + stack-frame-size
-  (stack-frame-size 0)
-  (arg-ops nil))
+  (stack-frame-size 0))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -201,6 +200,42 @@
                       nl7-offset)
        index))
 
+;;;; Stage B
+;(define-vop (copy-struct-to-stack)
+;  (:args (x :scs (sap))
+;         (fp :scs (any-reg)))
+;  (:info size offset)
+;  (:generator 0))
+;(defun copy-struct-to-stack (value size node block nsp)
+;  "B.4")
+
+(defun pre-padding-and-extension (type state)
+  "Registers Stage B operation for one argument."
+  (declare (ignore type state))
+;  (let* ((bits (alien-type-bits type))
+;         (size (ceil bits n-byte-bits))
+;         (words (ceil bits n-word-bits))
+;         (guessed-align (guess-alignment bits))
+;         (actual-align (alien-type-alignment type)))
+;    ;; Stage B matches the first rule for each argument, or pass argument unmodified.
+;    ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
+;    (cond
+;      ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
+;      ((alien-record-type-p type)
+;       ;; FIXME: Check alignment for Darwin
+;       (when (> 16 size)
+;         (let ((stack-size (align-up size 8)))
+;           (setf (arg-state-stack-frame-size state)
+;                 (+ stack-size (arg-state-stack-frame-size state)))))
+;       (lambda (value node block nsp)
+;         (copy-struct-to-memory value size offset node block nsp)))
+;      ((/= guessed-align actual-align)
+;       (error "WIP: B.6"))
+;      ;; Unmodified
+;      (t nil)))
+      )
+
+;;;; Stage C
 (define-vop (move-word-arg-stack)
   (:args (x :scs (signed-reg unsigned-reg single-reg))
          (fp :scs (any-reg)))
@@ -229,6 +264,7 @@
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
 ;; Moving a struct of size 1 to 8 to register
+;; FIXME: zero the padded bytes
 (define-vop (move-struct-single-dword-to-register)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg))
@@ -236,6 +272,7 @@
    (inst ldr to-reg (@ from-ptr))))
 
 ;; Moving a struct of size 9 to 16 to register
+;; FIXME: zero the padded bytes
 (define-vop (move-struct-double-dword-to-registers)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg-l) (to-reg-h))
@@ -246,6 +283,7 @@
               (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
 
 (defun move-struct-to-registers (value size-dwords node block next-reg)
+  "Implements C.12, copying small composite types to registers."
   (let ((temp-tn (sb-c:make-representation-tn
                   (primitive-type-or-lose 'system-area-pointer)
                   sap-reg-sc-number)))
@@ -426,16 +464,19 @@
               (invoke-alien-type-method :result-tn type state))
             values)))
 
-(defun natural-alignment (type)
-  "Find the natural alignment of a type."
-  (declare (ignore type))
-  (error "TODO"))
-
 (defun make-call-out-tns (type)
   (let* ((arg-state (make-arg-state)))
     ;; Create TNs
-    (collect ((arg-tns))
+    (collect ((arg-tns)
+              (preprocess-tns))
       (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
+        ;; Stage B
+        (loop for i from 0
+              for arg-type in (alien-fun-type-arg-types type)
+              do
+                (let ((p (pre-padding-and-extension arg-type arg-state)))
+                  (when p (preprocess-tns p))))
+        ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do
@@ -449,7 +490,8 @@
               (arg-tns)
               (invoke-alien-type-method :result-tn
                                         (alien-fun-type-result-type type)
-                                        (make-result-state))))))
+                                        (make-result-state))
+              (preprocess-tns)))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
