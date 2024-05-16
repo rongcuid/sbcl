@@ -473,9 +473,7 @@
         ;; Stage B
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do
-                (let ((p (pre-padding-and-extension arg-type arg-state)))
-                  (when p (preprocess-tns p))))
+              do (preprocess-tns (pre-padding-and-extension arg-type arg-state)))
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
