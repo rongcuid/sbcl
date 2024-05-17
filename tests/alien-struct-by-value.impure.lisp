@@ -53,46 +53,46 @@
       (small-align-8-mutate m)
       ;; Test struct has not changed
       (test-members))))
-;;;; Large struct, alignment 8
-;(define-alien-type nil
-;    (struct large-align-8
-;            (m0 (integer 64)) (m4 (integer 64)) (m8 (integer 64)) (m12 (integer 64))
-;            (m1 (integer 64)) (m5 (integer 64)) (m9 (integer 64)) (m13 (integer 64))
-;            (m2 (integer 64)) (m6 (integer 64)) (m10 (integer 64)) (m14 (integer 64))
-;            (m3 (integer 64)) (m7 (integer 64)) (m11 (integer 64)) (m15 (integer 64))))
-;(defmacro def-large-align-8-get (i)
-;  (let ((lisp-name (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
-;    `(define-alien-routine ,lisp-name (integer 64) (m (struct large-align-8)))))
-;(defmacro defs-large-align-8-get ()
-;  "Test functions for each member"
-;  (let ((defs (loop for i upto 15 collect `(def-large-align-8-get ,i))))
-;    `(progn ,@defs)))
-;(defs-large-align-8-get)
-;(define-alien-routine large-align-8-mutate void (m (struct large-align-8)))
-;(with-test (:name :struct-by-value-large-align-8-args)
-;  (with-alien ((m (struct large-align-8)))
-;    (macrolet ((set-members ()
-;                 "Sets member mN's value to N"
-;                 (loop for i upto 15
-;                       collect (let ((memb (sb-int:symbolicate "M" i)))
-;                                 `(setf (slot m ',memb) ,i))
-;                         into setfs
-;                       finally (return `(progn ,@setfs))))
-;               (test-members ()
-;                 "Test that each member has correct value"
-;                 (loop for i upto 15
-;                       collect (let ((f (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
-;                                 `(assert (= ,i (,f m))))
-;                         into tests
-;                       finally (return `(progn ,@tests)))))
-;      ;; Initialize struct
-;      (set-members)
-;      ;; Test that struct is correctly passed
-;      (test-members)
-;      ;; Call a C function that mutates struct locally
-;      (large-align-8-mutate m)
-;      ;; Test that the original struct is not modified
-;      (test-members))))
+;;; Large struct, alignment 8
+(define-alien-type nil
+    (struct large-align-8
+            (m0 (integer 64)) (m4 (integer 64)) (m8 (integer 64)) (m12 (integer 64))
+            (m1 (integer 64)) (m5 (integer 64)) (m9 (integer 64)) (m13 (integer 64))
+            (m2 (integer 64)) (m6 (integer 64)) (m10 (integer 64)) (m14 (integer 64))
+            (m3 (integer 64)) (m7 (integer 64)) (m11 (integer 64)) (m15 (integer 64))))
+(defmacro def-large-align-8-get (i)
+  (let ((lisp-name (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
+    `(define-alien-routine ,lisp-name (integer 64) (m (struct large-align-8)))))
+(defmacro defs-large-align-8-get ()
+  "Test functions for each member"
+  (let ((defs (loop for i upto 15 collect `(def-large-align-8-get ,i))))
+    `(progn ,@defs)))
+(defs-large-align-8-get)
+(define-alien-routine large-align-8-mutate void (m (struct large-align-8)))
+(with-test (:name :struct-by-value-large-align-8-args)
+  (with-alien ((m (struct large-align-8)))
+    (macrolet ((set-members ()
+                 "Sets member mN's value to N"
+                 (loop for i upto 15
+                       collect (let ((memb (sb-int:symbolicate "M" i)))
+                                 `(setf (slot m ',memb) ,i))
+                         into setfs
+                       finally (return `(progn ,@setfs))))
+               (test-members ()
+                 "Test that each member has correct value"
+                 (loop for i upto 15
+                       collect (let ((f (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
+                                 `(assert (= ,i (,f m))))
+                         into tests
+                       finally (return `(progn ,@tests)))))
+      ;; Initialize struct
+      (set-members)
+      ;; Test that struct is correctly passed
+      (test-members)
+      ;; Call a C function that mutates struct locally
+      (large-align-8-mutate m)
+      ;; Test that the original struct is not modified
+      (test-members))))
 
 ;;; Clean up
 (delete-file "alien-struct-by-value.so")

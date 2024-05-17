@@ -155,7 +155,7 @@
 ;;;;    - Affects B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
 ;;;; - When passing an argument with 16 byte alignment, it can start in odd-numbered xN register.
 ;;;; - Caller, instead of callee, perform signed/zero extension of arguments fewer than 32 bits.
-;;;;    - NOTE: this means caller must not leave padding bits unspecified
+;;;;    - NOTE: this means caller must not leave unused bits unspecified
 ;;;; - Functions may ignore params containing empty struct types.
 ;;;;    - This is unspecified by AAPCS64
 ;;;;
@@ -185,7 +185,9 @@
   ;; NSRN
   (fp-registers 0)
   ;; NSAA = SP + stack-frame-size
-  (stack-frame-size 0))
+  (stack-frame-size 0)
+  ;; If Stage B performs a copy, where they are
+  (fpoffs nil))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -201,39 +203,74 @@
        index))
 
 ;;;; Stage B
-;(define-vop (copy-struct-to-stack)
-;  (:args (x :scs (sap))
-;         (fp :scs (any-reg)))
-;  (:info size offset)
-;  (:generator 0))
-;(defun copy-struct-to-stack (value size node block nsp)
-;  "B.4")
+;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
+(define-vop (copy-to-stack)
+  (:args (from-ptr :scs (sap-reg))
+         (fp :scs (any-reg)))
+  (:info size fpoff)
+  (:temporary (:scs (non-descriptor-reg)) src temp)
+  (:generator
+   0
+   ;; Temporarily hold the source addr
+   (inst mov src from-ptr)
+   ;; Copy data
+   (let ((chunks '(8 4 2 1)))
+     (do ((remaining size)
+          (soff 0))
+         ((<= remaining 0))
+       (let ((chunk (find-if (lambda (x) (<= x remaining)) chunks))
+             (src-addr (@ src (load-store-offset soff)))
+             (dst-addr (@ fp (load-store-offset (+ fpoff soff)))))
+         (ecase chunk
+           (8
+            (inst ldr temp src-addr)
+            (inst str temp dst-addr))
+           (4
+            (inst ldr (32-bit-reg temp) src-addr)
+            (inst str (32-bit-reg temp) dst-addr))
+           (2
+            (inst ldrh temp src-addr)
+            (inst strh temp dst-addr))
+           (1
+            (inst ldrb temp src-addr)
+            (inst strb temp dst-addr)))
+         (setf remaining (- remaining chunk))
+         (setf soff (+ soff chunk)))))
+   ))
+(defun copy-struct-to-stack (sap size fpoff node block nsp)
+  "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
+  (let ((ptr-tn (sb-c:make-representation-tn
+                 (primitive-type-or-lose 'system-area-pointer)
+                 sap-reg-sc-number)))
+    (sb-c::emit-move node block (sb-c::lvar-tn node block sap) ptr-tn)
+    (sb-c::vop copy-to-stack node block ptr-tn nsp size fpoff)))
 
 (defun pre-padding-and-extension (type state)
-  "Registers Stage B operation for one argument."
-  (declare (ignore type state))
-;  (let* ((bits (alien-type-bits type))
-;         (size (ceil bits n-byte-bits))
-;         (words (ceil bits n-word-bits))
-;         (guessed-align (guess-alignment bits))
-;         (actual-align (alien-type-alignment type)))
-;    ;; Stage B matches the first rule for each argument, or pass argument unmodified.
-;    ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
-;    (cond
-;      ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
-;      ((alien-record-type-p type)
-;       ;; FIXME: Check alignment for Darwin
-;       (when (> 16 size)
-;         (let ((stack-size (align-up size 8)))
-;           (setf (arg-state-stack-frame-size state)
-;                 (+ stack-size (arg-state-stack-frame-size state)))))
-;       (lambda (value node block nsp)
-;         (copy-struct-to-memory value size offset node block nsp)))
-;      ((/= guessed-align actual-align)
-;       (error "WIP: B.6"))
-;      ;; Unmodified
-;      (t nil)))
-      )
+  "Registers Stage B operation for one argument. Returns:
+- NIL if unmodified
+- PREPROCESS-TN and FPOFF
+
+PREPROCESS-TN is a functional TN to be executed before any argument is copied. ~
+FPOFF is the frame pointer offset."
+  (let* ((bits (alien-type-bits type))
+         (size (ceiling bits n-byte-bits))
+         ;(words (ceil bits n-word-bits))
+         (actual-align (alien-type-alignment type))
+         (fpoff (align-up size actual-align))
+         (alloc-size (align-up size n-word-bytes)))
+    ;; Stage B matches the first rule for each argument, or pass argument unmodified.
+    ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
+    (cond
+      ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
+      ((alien-record-type-p type)
+       ;; FIXME: Check alignment for Darwin
+       (when (> 16 size)
+         (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
+         (let ((preprocess (lambda (value node block nsp)
+                             (copy-struct-to-stack value size fpoff node block nsp))))
+           (values preprocess fpoff))))
+      ;; Unmodified
+      (t nil))))
 
 ;;;; Stage C
 (define-vop (move-word-arg-stack)
@@ -344,7 +381,7 @@
          (move-struct-to-registers value size-dwords node block reg-args)))
       ;; Otherwise, pass by stack
       (t
-       (error "WIP")
+       (error "WIP: record-arg-small by stack")
        ;; C.13, set NGRA to 8
        (setf (arg-state-num-register-args state) +max-register-args+)
        ;; C.14 Align NSAA
@@ -473,7 +510,10 @@
         ;; Stage B
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do (preprocess-tns (pre-padding-and-extension arg-type arg-state)))
+              do (multiple-value-bind (pp fpoff)
+                     (pre-padding-and-extension arg-type arg-state)
+                   (preprocess-tns pp)
+                   (push (arg-state-fpoffs arg-state) fpoff)))
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
@@ -482,7 +522,9 @@
               (when (eql i variadic)
                 (setf (arg-state-num-register-args arg-state) +max-register-args+
                       (arg-state-fp-registers arg-state) +max-register-args+))
-              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))))
+              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))
+              ;; Pop the FPOFFS list so its head is always current argument
+              (pop (arg-state-fpoffs arg-state))))
       (values (make-normal-tn *fixnum-primitive-type*)
               (arg-state-stack-frame-size arg-state)
               (arg-tns)
