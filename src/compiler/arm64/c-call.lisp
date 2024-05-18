@@ -152,7 +152,6 @@
 ;;;; - Function arguments may consume slots on stack that are not multiple of 8 bytes.
 ;;;;    - If total number of bytes used for stack arguments is not multiple of 8:
 ;;;;        - Pad to multiple of 8 bytes.
-;;;;    - Affects B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
 ;;;; - When passing an argument with 16 byte alignment, it can start in odd-numbered xN register.
 ;;;; - Caller, instead of callee, perform signed/zero extension of arguments fewer than 32 bits.
 ;;;;    - NOTE: this means caller must not leave unused bits unspecified
@@ -166,7 +165,6 @@
 ;;;;    - Assign each variadic argument to appropriate 8-byte stack slots.
 ;;;; - In essense, Mac OS's ``va_list'' is represented by a ``char *'' instead of a structure
 ;;;;    - NOTE: that's paraphrased from Mac documentation. I think it's more like ``uint64_t *'' -- Rongcui
-;;;; - TODO: verify whether slotting follows the AAPCS64 rules or the Mac OS rules
 ;;;;
 ;;;; Ref:
 ;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
@@ -397,7 +395,10 @@ NOTE: Quad, or 128-bit ints are not supported."
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (defun record-arg-small (type state)
-  "Records <= 16 bytes: B.4, C.12. Pass by registers if possible."
+  "Records <= 16 bytes: B.4, C.12. Pass by registers if possible.
+
+Implementation notes:
+- For empty struct, it generates a no-op. This might not be portable."
   (let ((reg-args (arg-state-num-register-args state))
         (size (ceiling (alien-type-bits type) n-byte-bits))
         (size-dwords (ceiling (alien-type-bits type) n-word-bits))
@@ -490,9 +491,9 @@ NOTE: Quad, or 128-bit ints are not supported."
       ((<= size 16) (record-arg-small type state))
       (t (record-arg-large type state)))))
 
-(define-alien-type-method (sb-alien::record :result-tn) (type state)
-  (declare (ignore type state))
-  (error "WIP arm64 struct value return."))
+;(define-alien-type-method (sb-alien::record :result-tn) (type state)
+;  (declare (ignore type state))
+;  (error "WIP arm64 struct value return."))
 ;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
@@ -604,6 +605,11 @@ Implementation notes:
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do (arg-tns (assign-arguments arg-type arg-state #+darwin (eql i variadic)))))
+      ;; On darwin, total stack size is padded to multiples of 8 bytes
+      #+darwin
+      (let ((frame-size (arg-state-stack-frame-size arg-state)))
+        (setf (arg-state-stack-frame-size arg-state)
+              (align-up frame-size 8)))
       (values (make-normal-tn *fixnum-primitive-type*)
               (arg-state-stack-frame-size arg-state)
               (arg-tns)
