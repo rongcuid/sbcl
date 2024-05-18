@@ -322,8 +322,19 @@
 - NIL if unmodified
 - PREPROCESS-TN and FPOFF
 
-PREPROCESS-TN is a functional TN to be executed before any argument is copied. ~
-FPOFF is the frame pointer offset."
+PREPROCESS-TN is a functional TN to emit instructions for the preprocessing step. ~
+FPOFF is the frame pointer offset for the replaced argument.
+
+Implementation notes:
+
+- Does not support pure scalable types (B.1, B.3)
+- Does not support unknown-sized composite types (B.2)
+- For alignment-adjusted types (B.6):
+    - Fundamental types are not explicitely modified, as they will be copied in Stage C
+    - For composite types, we always align to adjusted alignment, for the following reasons:
+        - At this stage, it is easier to implement as we do not have an easy way to extract natural alignment
+        - The only safe alignment adjustment is to increase alignment
+        - It's thus safe to use adjusted alignment for the copy (though it wastes some space)"
   (let* ((bits (alien-type-bits type))
          (size (ceiling bits n-byte-bits))
          (actual-align (round (alien-type-alignment type) n-byte-bits))
@@ -334,7 +345,6 @@ FPOFF is the frame pointer offset."
     (cond
       ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
       ((and (alien-record-type-p type) (> size 16))
-       ;; FIXME: Check alignment for Darwin
        (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
        (let ((preprocess (lambda (value node block nsp)
                            (copy-struct-to-stack value size fpoff node block nsp))))
@@ -539,9 +549,24 @@ FPOFF is the frame pointer offset."
               (invoke-alien-type-method :result-tn type state))
             values)))
 
+(defun assign-arguments (type state #+darwin variadic-p)
+  "Stage C: Assignment of current argument to registers and stack.
+Returns:
+- Register-wired TN if argument is simply copied to registers.
+- Function to be called by backend if more complex operation is required."
+  ;; TODO: verify that variadic is actually supported on ARM64
+  #+darwin ; In Darwin, variadic args is passed on stack slots
+  (when variadic-p
+    (setf (arg-state-num-register-args state) +max-register-args+
+          (arg-state-fp-registers state) +max-register-args+))
+  ;; Invoke
+  (let ((assignment (invoke-alien-type-method :arg-tn type state)))
+    ;; Pop the FPOFFS list so its head is always current argument
+    (pop (arg-state-fpoffs state))
+    assignment))
+
 (defun make-call-out-tns (type)
   (let* ((arg-state (make-arg-state)))
-    ;; Create TNs
     (collect ((arg-tns)
               (preprocess-tns))
       (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
@@ -555,14 +580,7 @@ FPOFF is the frame pointer offset."
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do
-              #+darwin ; In Darwin, variadic args is passed on stack slots
-              (when (eql i variadic)
-                (setf (arg-state-num-register-args arg-state) +max-register-args+
-                      (arg-state-fp-registers arg-state) +max-register-args+))
-              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))
-              ;; Pop the FPOFFS list so its head is always current argument
-              (pop (arg-state-fpoffs arg-state))))
+              do (arg-tns (assign-arguments arg-type arg-state #+darwin (eql i variadic)))))
       (values (make-normal-tn *fixnum-primitive-type*)
               (arg-state-stack-frame-size arg-state)
               (arg-tns)
