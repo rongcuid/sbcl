@@ -202,9 +202,9 @@
                       nl7-offset)
        index))
 
-;;;; Stage B
-;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
-(define-vop (copy-to-stack)
+;;;; VOPs used for argument parsing
+;;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
+(define-vop (move-to-stack)
   (:args (from-ptr :scs (sap-reg))
          (fp :scs (any-reg)))
   (:info size fpoff)
@@ -215,6 +215,7 @@
    (inst mov src from-ptr)
    ;; Copy data
    (let ((chunks '(8 4 2 1)))
+     ;; Unrolls copy loop
      (do ((remaining size)
           (soff 0))
          ((<= remaining 0))
@@ -237,20 +238,85 @@
          (setf remaining (- remaining chunk))
          (setf soff (+ soff chunk)))))
    ))
-(define-vop (load-stack-ptr)
-  (:args (fp :scs (any-reg)))
-  (:info fpoff)
-  (:results (addr))
-  (:generator 0
-              (inst add addr fp fpoff)))
+
 (defun copy-struct-to-stack (sap size fpoff node block nsp)
   "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
   (let ((ptr-tn (sb-c:make-representation-tn
                  (primitive-type-or-lose 'system-area-pointer)
                  sap-reg-sc-number)))
     (sb-c::emit-move node block (sb-c::lvar-tn node block sap) ptr-tn)
-    (sb-c::vop copy-to-stack node block ptr-tn nsp size fpoff)))
+    (sb-c::vop move-to-stack node block ptr-tn nsp size fpoff)))
 
+;;; Loads a pointer to a stack offset
+(define-vop (load-stack-ptr)
+  (:args (fp :scs (any-reg)))
+  (:info fpoff)
+  (:results (addr))
+  (:generator 0
+              (inst add addr fp fpoff)))
+
+;;; Copies a dword/word/half-word/byte to a stack location
+(define-vop (move-word-arg-stack)
+  (:args (x :scs (signed-reg unsigned-reg single-reg))
+         (fp :scs (any-reg)))
+  (:info size offset)
+  (:generator 0
+    (let ((addr (@ fp (load-store-offset offset))))
+      (ecase size
+        (1
+         (inst strb x addr))
+        (2
+         (inst strh x addr))
+        (4
+         (inst str (if (sc-is x single-reg)
+                       x
+                       (32-bit-reg x))
+               addr))))))
+
+(defun move-to-stack-location (value size offset prim-type sc node block nsp)
+  "Moves a dword/word/half-word/byte value to stack location."
+  (let ((temp-tn (sb-c:make-representation-tn
+                  (primitive-type-or-lose prim-type)
+                  sc)))
+    (sb-c::emit-move node
+                     block
+                     (sb-c::lvar-tn node block value)
+                     temp-tn)
+    (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
+
+;;; Move a struct of size 1 to 8 to register
+(define-vop (move-struct-single-dword-to-register)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg))
+  (:generator 0
+   (inst ldr to-reg (@ from-ptr))))
+
+;;; Move a struct of size 9 to 16 to register
+(define-vop (move-struct-double-dword-to-registers)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg-l) (to-reg-h))
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:generator 0
+              (inst mov temp from-ptr)
+              (inst ldr to-reg-l (@ temp))
+              (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
+
+(defun move-struct-to-registers (value size-dwords node block next-reg)
+  "C.12. Copy small composite types to registers."
+  (let ((temp-tn (sb-c:make-representation-tn
+                  (primitive-type-or-lose 'system-area-pointer)
+                  sap-reg-sc-number)))
+    (sb-c::emit-move node block (sb-c::lvar-tn node block value) temp-tn)
+    (ecase size-dwords
+      (1
+       (let ((reg-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg)))
+           (sb-c::vop move-struct-single-dword-to-register node block temp-tn reg-tn)))
+      (2
+       (let ((reg-l-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg))
+             (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
+         (sb-c::vop move-struct-double-dword-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
+
+;;;; Stage B
 (defun pre-padding-and-extension (type state)
   "Registers Stage B operation for one argument. Returns:
 - NIL if unmodified
@@ -277,64 +343,6 @@ FPOFF is the frame pointer offset."
       (t nil))))
 
 ;;;; Stage C
-(define-vop (move-word-arg-stack)
-  (:args (x :scs (signed-reg unsigned-reg single-reg))
-         (fp :scs (any-reg)))
-  (:info size offset)
-  (:generator 0
-    (let ((addr (@ fp (load-store-offset offset))))
-      (ecase size
-        (1
-         (inst strb x addr))
-        (2
-         (inst strh x addr))
-        (4
-         (inst str (if (sc-is x single-reg)
-                       x
-                       (32-bit-reg x))
-               addr))))))
-
-(defun move-to-stack-location (value size offset prim-type sc node block nsp)
-  (let ((temp-tn (sb-c:make-representation-tn
-                  (primitive-type-or-lose prim-type)
-                  sc)))
-    (sb-c::emit-move node
-                     block
-                     (sb-c::lvar-tn node block value)
-                     temp-tn)
-    (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
-
-;; Moving a struct of size 1 to 8 to register
-(define-vop (move-struct-single-dword-to-register)
-  (:args (from-ptr :scs (sap-reg)))
-  (:results (to-reg))
-  (:generator 0
-   (inst ldr to-reg (@ from-ptr))))
-
-;; Moving a struct of size 9 to 16 to register
-(define-vop (move-struct-double-dword-to-registers)
-  (:args (from-ptr :scs (sap-reg)))
-  (:results (to-reg-l) (to-reg-h))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:generator 0
-              (inst mov temp from-ptr)
-              (inst ldr to-reg-l (@ temp))
-              (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
-
-(defun move-struct-to-registers (value size-dwords node block next-reg)
-  "Implements C.12, copying small composite types to registers."
-  (let ((temp-tn (sb-c:make-representation-tn
-                  (primitive-type-or-lose 'system-area-pointer)
-                  sap-reg-sc-number)))
-    (sb-c::emit-move node block (sb-c::lvar-tn node block value) temp-tn)
-    (ecase size-dwords
-      (1
-       (let ((reg-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg)))
-           (sb-c::vop move-struct-single-dword-to-register node block temp-tn reg-tn)))
-      (2
-       (let ((reg-l-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg))
-             (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
-         (sb-c::vop move-struct-double-dword-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
 
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
