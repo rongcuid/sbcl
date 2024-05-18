@@ -19,40 +19,40 @@
                                   "-o" "alien-struct-by-value.so"
                                   "alien-struct-by-value.c")))
 (load-shared-object (truename "alien-struct-by-value.so"))
-;;;; Tiny struct, alignment 8
-;(define-alien-type nil (struct tiny-align-8 (m0 (integer 64))))
-;(define-alien-routine tiny-align-8-get-m0 (integer 64) (m (struct tiny-align-8)))
-;(define-alien-routine tiny-align-8-mutate void (m (struct tiny-align-8)))
-;(with-test (:name :struct-by-value-tiny-align-8-args)
-;  (with-alien ((m (struct tiny-align-8)))
-;    ;; Initialize struct
-;    (setf (slot m 'm0) 42)
-;    (flet ((test-members ()
-;             (assert (= 42 (tiny-align-8-get-m0 m)))))
-;      ;; Test struct passing
-;      (test-members)
-;      ;; Call a function that mutates struct
-;      (tiny-align-8-mutate m)
-;      ;; Test struct has not changed
-;      (test-members))))
-;;;; Small struct, alignment 8
-;(define-alien-type nil (struct small-align-8 (m0 (integer 64)) (m1 (integer 64))))
-;(define-alien-routine small-align-8-get-m0 (integer 64) (m (struct small-align-8)))
-;(define-alien-routine small-align-8-get-m1 (integer 64) (m (struct small-align-8)))
-;(define-alien-routine small-align-8-mutate void (m (struct small-align-8)))
-;(with-test (:name :struct-by-value-small-align-8-args)
-;  (with-alien ((m (struct small-align-8)))
-;    ;; Initialize struct
-;    (setf (slot m 'm0) 0) (setf (slot m 'm1) 1)
-;    (flet ((test-members ()
-;             (assert (= 0 (small-align-8-get-m0 m)))
-;             (assert (= 1 (small-align-8-get-m1 m)))))
-;      ;; Test struct passing
-;      (test-members)
-;      ;; Call a function that mutates struct
-;      (small-align-8-mutate m)
-;      ;; Test struct has not changed
-;      (test-members))))
+;;; Tiny struct, alignment 8
+(define-alien-type nil (struct tiny-align-8 (m0 (integer 64))))
+(define-alien-routine tiny-align-8-get-m0 (integer 64) (m (struct tiny-align-8)))
+(define-alien-routine tiny-align-8-mutate void (m (struct tiny-align-8)))
+(with-test (:name :struct-by-value-tiny-align-8-args)
+  (with-alien ((m (struct tiny-align-8)))
+    ;; Initialize struct
+    (setf (slot m 'm0) 42)
+    (flet ((test-members ()
+             (assert (= 42 (tiny-align-8-get-m0 m)))))
+      ;; Test struct passing
+      (test-members)
+      ;; Call a function that mutates struct
+      (tiny-align-8-mutate m)
+      ;; Test struct has not changed
+      (test-members))))
+;;; Small struct, alignment 8
+(define-alien-type nil (struct small-align-8 (m0 (integer 64)) (m1 (integer 64))))
+(define-alien-routine small-align-8-get-m0 (integer 64) (m (struct small-align-8)))
+(define-alien-routine small-align-8-get-m1 (integer 64) (m (struct small-align-8)))
+(define-alien-routine small-align-8-mutate void (m (struct small-align-8)))
+(with-test (:name :struct-by-value-small-align-8-args)
+  (with-alien ((m (struct small-align-8)))
+    ;; Initialize struct
+    (setf (slot m 'm0) 0) (setf (slot m 'm1) 1)
+    (flet ((test-members ()
+             (assert (= 0 (small-align-8-get-m0 m)))
+             (assert (= 1 (small-align-8-get-m1 m)))))
+      ;; Test struct passing
+      (test-members)
+      ;; Call a function that mutates struct
+      (small-align-8-mutate m)
+      ;; Test struct has not changed
+      (test-members))))
 ;;; Large struct, alignment 8
 (define-alien-type nil
     (struct large-align-8

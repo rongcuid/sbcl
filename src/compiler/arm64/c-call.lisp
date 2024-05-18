@@ -237,12 +237,12 @@
          (setf remaining (- remaining chunk))
          (setf soff (+ soff chunk)))))
    ))
-(define-vop (load-from-stack)
+(define-vop (load-stack-ptr)
   (:args (fp :scs (any-reg)))
   (:info fpoff)
   (:results (addr))
   (:generator 0
-              (inst ldr addr (@ fp (load-store-offset fpoff)))))
+              (inst add addr fp fpoff)))
 (defun copy-struct-to-stack (sap size fpoff node block nsp)
   "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
   (let ((ptr-tn (sb-c:make-representation-tn
@@ -411,7 +411,7 @@ FPOFF is the frame pointer offset."
        (lambda (value node block nsp)
          (declare (ignore value))
          (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
-           (sb-c::vop load-from-stack node block nsp fpoff arg-tn))))
+           (sb-c::vop load-stack-ptr node block nsp fpoff arg-tn))))
       (t
        ;; C.13
        (setf (arg-state-num-register-args state) +max-register-args+)
@@ -423,7 +423,7 @@ FPOFF is the frame pointer offset."
            (let ((addr-tn (sb-c:make-representation-tn
                            (primitive-type-or-lose 'system-area-pointer)
                            sap-reg-sc-number)))
-             (sb-c::vop load-from-stack node block nsp fpoff addr-tn)
+             (sb-c::vop load-stack-ptr node block nsp fpoff addr-tn)
              (move-to-stack-location addr-tn n-word-bytes frame-size
                                      'system-area-pointer
                                      sap-reg-sc-number
