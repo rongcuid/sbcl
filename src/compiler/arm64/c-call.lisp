@@ -239,7 +239,7 @@
          (setf soff (+ soff chunk)))))
    ))
 
-(defun copy-struct-to-stack (sap size fpoff node block nsp)
+(defun move-struct-to-stack (sap size fpoff node block nsp)
   "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
   (let ((ptr-tn (sb-c:make-representation-tn
                  (primitive-type-or-lose 'system-area-pointer)
@@ -347,7 +347,7 @@ Implementation notes:
       ((and (alien-record-type-p type) (> size 16))
        (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
        (let ((preprocess (lambda (value node block nsp)
-                           (copy-struct-to-stack value size fpoff node block nsp))))
+                           (move-struct-to-stack value size fpoff node block nsp))))
          (values preprocess fpoff)))
       ;; Unmodified
       (t nil))))
@@ -355,7 +355,10 @@ Implementation notes:
 ;;;; Stage C
 
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
-  "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
+  "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17).
+
+NOTE: Quad, or 128-bit ints are not supported."
+  (assert (<= size 8) (size) "Integer argument of size ~A > 8 bytes is not supported." size)
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+) ; C.9
            (setf (arg-state-num-register-args state) (1+ reg-args))
@@ -374,6 +377,7 @@ Implementation notes:
 
 (defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass floats by AAPCS64: FP register (C.1) or stack (C.5, C.6)"
+  (assert (<= size 8) (size) "Float argument of size ~A > 8 bytes is not supported." size)
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+) ; C.1
            (setf (arg-state-fp-registers state) (1+ reg-args))
@@ -395,7 +399,13 @@ Implementation notes:
 (defun record-arg-small (type state)
   "Records <= 16 bytes: B.4, C.12. Pass by registers if possible."
   (let ((reg-args (arg-state-num-register-args state))
-        (size-dwords (ceiling (alien-type-bits type) n-word-bits)))
+        (size (ceiling (alien-type-bits type) n-byte-bits))
+        (size-dwords (ceiling (alien-type-bits type) n-word-bits))
+        (alignment #-darwin n-word-bytes
+                   #+darwin (ceiling (alien-type-alignment type) n-byte-bits)))
+    ;; FIXME: spec supports it, need to implement.
+    (assert (<= 8 alignment)
+            (alignment) "Struct alignment ~A > 8 bytes is unsupported" alignment)
     (cond
       ;; C.12, if we can fit the argument in register, copy to consecutive registers
       ((< size-dwords (- +max-register-args+ reg-args))
@@ -403,23 +413,22 @@ Implementation notes:
        (lambda (value node block nsp)
          (declare (ignore nsp))
          (move-struct-to-registers value size-dwords node block reg-args)))
-      ;; Otherwise, pass by stack
       (t
-       (error "WIP: record-arg-small by stack")
+       ;; Otherwise, pass by stack
        ;; C.13, set NGRA to 8
        (setf (arg-state-num-register-args state) +max-register-args+)
-       ;; C.14 Align NSAA
-       (let* ((frame-size (align-up (arg-state-stack-frame-size state) 8))
-              (offset (truncate frame-size 8)))
-         (setf (arg-state-stack-frame-size state) (+ frame-size size-dwords))
-         (loop for off from offset upto (+ offset size-dwords)
-               collect (make-wired-tn* 'unsigned-byte-64 unsigned-stack-sc-number offset)))))))
+       ;; C.14, C.15.
+       (let* ((fpoff (align-up (arg-state-stack-frame-size state) alignment)))
+         (setf (arg-state-stack-frame-size state) (+ fpoff size))
+         (lambda (value node block nsp)
+           (move-struct-to-stack value size fpoff node block nsp)))))))
 (defun record-arg-large (type state)
   "Records > 16 bytes are copied to stack and passed by pointer."
   (declare (ignore type))
   (let* ((fpoff (first (arg-state-fpoffs state)))
          (reg-args (arg-state-num-register-args state))
          (pass-by-reg (< reg-args +max-register-args+)))
+    ;; Basically INT-ARG, except that it uses the FPOFF from Stage B.
     (cond
       (pass-by-reg
        ;; C.9
@@ -447,13 +456,14 @@ Implementation notes:
                                      node block nsp))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
- (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
-             #-darwin n-word-bytes))
-   (if (alien-integer-type-signed type)
-       (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number
-                size)
-       (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number
-                size))))
+  ;; Darwin allows an argument to take a stack slot of < 8 bytes.
+  (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
+              #-darwin n-word-bytes))
+    (if (alien-integer-type-signed type)
+        (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number
+                 size)
+        (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number
+                 size))))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
@@ -461,6 +471,7 @@ Implementation notes:
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
+  ;; Darwin allows single-float to take a 4-byte slot on stack
   (float-arg state 'single-float single-reg-sc-number single-stack-sc-number #+darwin 4))
 
 (define-alien-type-method (double-float :arg-tn) (type state)
@@ -553,7 +564,15 @@ Implementation notes:
   "Stage C: Assignment of current argument to registers and stack.
 Returns:
 - Register-wired TN if argument is simply copied to registers.
-- Function to be called by backend if more complex operation is required."
+- Function to be called by backend if more complex operation is required.
+
+Implementation notes:
+- Due to the backend architecture of SBCL, assignments are implemented in methods of each type.
+    - Check DEFINE-ALIEN-TYPE-METHOD (type :ARG-TN) for more info.
+- Scalable, Vector, half-float, quad-float, quad-int types are not supported.
+- FIXME: On C.14, we use adjusted alignment as natural alignment, which can be problematic
+
+FIXME: I don't think variadic functions are implemented correctly. Need to verify. -- Rongcui"
   ;; TODO: verify that variadic is actually supported on ARM64
   #+darwin ; In Darwin, variadic args is passed on stack slots
   (when variadic-p
@@ -566,6 +585,10 @@ Returns:
     assignment))
 
 (defun make-call-out-tns (type)
+  "Entry point of alien backend.
+
+Implementation notes:
+- Stage A is implicit when ARG-STATE is initialized."
   (let* ((arg-state (make-arg-state)))
     (collect ((arg-tns)
               (preprocess-tns))
