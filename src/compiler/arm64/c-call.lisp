@@ -47,7 +47,7 @@
 ;;;;    - Allocate to LSBs of v[NSRN] and increment NSRN.
 ;;;; 2. If HFA/HVA and there are enough SIMD and FP registers (NSRN + N members <= 8):
 ;;;;    - Allocate to SIMD and FP registers, one per member, and increase NSRN by N.
-;;;; 3. If HFA/HVA, then set NSRA to 8 and round up size of argument to next multiple of 8 bytes.
+;;;; 3. If HFA/HVA, then set NSRN to 8 and round up size of argument to next multiple of 8 bytes.
 ;;;; 4. If NFA/HVA, quad-float, or short vector type:
 ;;;;    - If natural alignment <= 8, round up NSAA to next multiple of 8.
 ;;;;    - If natural alignment >= 16, round up NSAA to next multiple of 16.
@@ -237,6 +237,12 @@
          (setf remaining (- remaining chunk))
          (setf soff (+ soff chunk)))))
    ))
+(define-vop (load-from-stack)
+  (:args (fp :scs (any-reg)))
+  (:info fpoff)
+  (:results (addr))
+  (:generator 0
+              (inst ldr addr (@ fp (load-store-offset fpoff)))))
 (defun copy-struct-to-stack (sap size fpoff node block nsp)
   "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
   (let ((ptr-tn (sb-c:make-representation-tn
@@ -254,7 +260,7 @@ PREPROCESS-TN is a functional TN to be executed before any argument is copied. ~
 FPOFF is the frame pointer offset."
   (let* ((bits (alien-type-bits type))
          (size (ceiling bits n-byte-bits))
-         ;(words (ceil bits n-word-bits))
+                                        ;(words (ceil bits n-word-bits))
          (actual-align (alien-type-alignment type))
          (fpoff (align-up size actual-align))
          (alloc-size (align-up size n-word-bytes)))
@@ -262,13 +268,12 @@ FPOFF is the frame pointer offset."
     ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
     (cond
       ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
-      ((alien-record-type-p type)
+      ((and (alien-record-type-p type) (> size 16))
        ;; FIXME: Check alignment for Darwin
-       (when (> 16 size)
-         (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
-         (let ((preprocess (lambda (value node block nsp)
-                             (copy-struct-to-stack value size fpoff node block nsp))))
-           (values preprocess fpoff))))
+       (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
+       (let ((preprocess (lambda (value node block nsp)
+                           (copy-struct-to-stack value size fpoff node block nsp))))
+         (values preprocess fpoff)))
       ;; Unmodified
       (t nil))))
 
@@ -301,7 +306,6 @@ FPOFF is the frame pointer offset."
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
 ;; Moving a struct of size 1 to 8 to register
-;; FIXME: zero the padded bytes
 (define-vop (move-struct-single-dword-to-register)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg))
@@ -309,7 +313,6 @@ FPOFF is the frame pointer offset."
    (inst ldr to-reg (@ from-ptr))))
 
 ;; Moving a struct of size 9 to 16 to register
-;; FIXME: zero the padded bytes
 (define-vop (move-struct-double-dword-to-registers)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg-l) (to-reg-h))
@@ -341,6 +344,7 @@ FPOFF is the frame pointer offset."
            (setf (arg-state-num-register-args state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
           (t ; C.13 and below
+           (setf (arg-state-num-register-args state) +max-register-args+)
            (let ((frame-size (align-up (arg-state-stack-frame-size state) size))) ; C.14
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
              (cond #+darwin ; On Darwin, integer can consume non-8-byte slots; C.17
@@ -357,7 +361,10 @@ FPOFF is the frame pointer offset."
     (cond ((< reg-args +max-register-args+) ; C.1
            (setf (arg-state-fp-registers state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc reg-args))
-          (t ; C.5 and below
+          (t
+           ;; C.3
+           (setf (arg-state-fp-registers state) +max-register-args+)
+           ;; C.5 and below
            (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
              (cond #+darwin ; On Darwin, floats can consume non-8-byte slots; C.6
@@ -390,13 +397,37 @@ FPOFF is the frame pointer offset."
          (setf (arg-state-stack-frame-size state) (+ frame-size size-dwords))
          (loop for off from offset upto (+ offset size-dwords)
                collect (make-wired-tn* 'unsigned-byte-64 unsigned-stack-sc-number offset)))))))
-
 (defun record-arg-large (type state)
+  "Records > 16 bytes are copied to stack and passed by pointer."
   (declare (ignore type))
-  ;; FIXME: we need a copy, not the original. Will fix later.
-  ;; Structs >16B are passed by pointer. SBCL already holds struct as SAP.
-  (warn "FIXME: Large structs pass by value does not not copy yet.")
-  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
+  (let* ((fpoff (first (arg-state-fpoffs state)))
+         (reg-args (arg-state-num-register-args state))
+         (pass-by-reg (< reg-args +max-register-args+)))
+    (cond
+      (pass-by-reg
+       ;; C.9
+       (setf (arg-state-num-register-args state) (1+ reg-args))
+       ;; Copy argument to register
+       (lambda (value node block nsp)
+         (declare (ignore value))
+         (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
+           (sb-c::vop load-from-stack node block nsp fpoff arg-tn))))
+      (t
+       ;; C.13
+       (setf (arg-state-num-register-args state) +max-register-args+)
+       ;; C.14 passing pointer by stack.
+       (let ((frame-size (align-up (arg-state-stack-frame-size state) n-word-bytes)))
+         (setf (arg-state-stack-frame-size state) (+ frame-size n-word-bytes))
+         (lambda (value node block nsp)
+           (declare (ignore value))
+           (let ((addr-tn (sb-c:make-representation-tn
+                           (primitive-type-or-lose 'system-area-pointer)
+                           sap-reg-sc-number)))
+             (sb-c::vop load-from-stack node block nsp fpoff addr-tn)
+             (move-to-stack-location addr-tn n-word-bytes frame-size
+                                     'system-area-pointer
+                                     sap-reg-sc-number
+                                     node block nsp))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
  (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
@@ -513,7 +544,7 @@ FPOFF is the frame pointer offset."
               do (multiple-value-bind (pp fpoff)
                      (pre-padding-and-extension arg-type arg-state)
                    (preprocess-tns pp)
-                   (push (arg-state-fpoffs arg-state) fpoff)))
+                   (push fpoff (arg-state-fpoffs arg-state))))
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
