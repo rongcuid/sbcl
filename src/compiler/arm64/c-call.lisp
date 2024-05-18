@@ -260,9 +260,8 @@ PREPROCESS-TN is a functional TN to be executed before any argument is copied. ~
 FPOFF is the frame pointer offset."
   (let* ((bits (alien-type-bits type))
          (size (ceiling bits n-byte-bits))
-                                        ;(words (ceil bits n-word-bits))
-         (actual-align (alien-type-alignment type))
-         (fpoff (align-up size actual-align))
+         (actual-align (round (alien-type-alignment type) n-byte-bits))
+         (fpoff (align-up (arg-state-stack-frame-size state) actual-align))
          (alloc-size (align-up size n-word-bytes)))
     ;; Stage B matches the first rule for each argument, or pass argument unmodified.
     ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
