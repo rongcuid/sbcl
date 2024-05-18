@@ -1,4 +1,4 @@
-;;;; VOPs and other machine-specific support routines for call-out to C
+;;;; VOPs and other machine-specific support routines for call-out to C.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -9,6 +9,170 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
+;;;; ARM64 follows calling convention described in [AAPCS64].
+;;;; Mac OS X is based on the same ABI, but have some modifications [MACABI].
+;;;; Both calling convention are summarized below for reference and for the case
+;;;; when original document is difficult to find.
+;;;; Notice that this documentation is added after the implementation,
+;;;; thus specific details such as notation, names, etc. may differ.
+;;;;
+;;;; AAPCS64 argument passing is performed in the following stages:
+;;;;
+;;;; Stage A: Initialization, performed exactly once.
+;;;; 1. Set Next General Purpose Register Number (NGRN) to zero.
+;;;; 2. Set Next SIMD and FP Register Number (NSRN) to zero.
+;;;; 3. Set Next Scalable Predicate Register Number (NPRN) to zero (not applicable).
+;;;; 4. Set Next Stacked Argument Address (NSAA) set to current SP.
+;;;;
+;;;; Stage B: Pre-padding and extension.
+;;;;    Match first rule for each argument, or pass unmodified if no match.
+;;;; 1. If argument is pure scalable type, pass unmodified.
+;;;; 2. If Composite Type whose size CANNOT be determined by BOTH caller and callee,
+;;;;    copy to memory and replace by pointer (doesn't exist in C)
+;;;; 3. If HFA or HVA, pass unmodified.
+;;;; 4. If Composite Type with size > 16 bytes, copy to memory and replace by pointer.
+;;;; 5. If Composite Type, round up to nearest multiples of 8 bytes.
+;;;; 6. If alignment-adjusted type, pass a copy of the value such that:
+;;;;    - For Fundamental Type, aligned to natural alignment of that type.
+;;;;    - For Composite Type:
+;;;;        * If natural alignment <= 8 bytes, align to 8 bytes.
+;;;;        * If natural alignment >= 16 bytes, align to 16 bytes
+;;;;    - Alignment of copy is used for applying marshaling rules (not applicable)
+;;;;
+;;;; Stage C: Assignment of arguments to registers and stack.
+;;;;    Match each rule for each argument until argument has been allocated.
+;;;;    When assigned to register, unused bits have unspecified value.
+;;;;    When assigned to stack, padding bytes have unspecified value.
+;;;; 1. If argument is half-, single-, double-, quad- float or short vector type and NSRN < 8:
+;;;;    - Allocate to LSBs of v[NSRN] and increment NSRN.
+;;;; 2. If HFA/HVA and there are enough SIMD and FP registers (NSRN + N members <= 8):
+;;;;    - Allocate to SIMD and FP registers, one per member, and increase NSRN by N.
+;;;; 3. If HFA/HVA, then set NSRN to 8 and round up size of argument to next multiple of 8 bytes.
+;;;; 4. If NFA/HVA, quad-float, or short vector type:
+;;;;    - If natural alignment <= 8, round up NSAA to next multiple of 8.
+;;;;    - If natural alignment >= 16, round up NSAA to next multiple of 16.
+;;;; 5. If half- or single- float, set size of argument to 8 bytes, remaining bytes unspecified.
+;;;; 6. If HFA, HVA, half-, single-, double-, quad-float, or short vector type:
+;;;;    - Allocate and copy to memory at adjusted NSAA; increment NSAA by size.
+;;;; 7. If argument is pure scalable type consist of NV scalable vector types and NP scalable predicate types, if argument is named, if NSRN+NV <= 8, and if NPRN+NP <= 4:
+;;;;    - Allocate Scalable Vector Types to z[NSRN]...z[NSRN+NV-1] inclusive; increment NSRN by NV.
+;;;;    - Allocate Scalable Predicate Types to p[NPRN]...p[NPRN+NP-1] inclusive; increment NPRN by NP
+;;;; 8. If Pure Scalable Type that has not been allocated by rules above:
+;;;;    - Copy to memory and replace by pointer, then allocate according to rules below.
+;;;; 9. If integral or pointer type, size <= 8 bytes, and NGRN < 8:
+;;;;    - Allocate to LSBs in x[NGRN] and increment NGRN by 1.
+;;;; 10. If argument has alignment of 16 bytes, round up NGRN to next even number.
+;;;; 11. If integral type, size = 16, and NGRN < 7:
+;;;;    - Allocate lower-address dword to x[NGRN] and high-address dword x[NGRN+1].
+;;;;    - Increment NGRN by 2.
+;;;; 12. If Composite Type and size in double words <= 8-NGRN:
+;;;;    - Allocate to consecutive GPR starting at x[NGRN], as if loaded from dword-aligned address with LDR instructions.
+;;;;    - Increment NGRN by registers used.
+;;;; 13. NGRA is set to 8.
+;;;; 14. NSAA is rounded up to max(8, Natural Alignment of Type).
+;;;; 15. If Composite Type:
+;;;;    - Allocate to memory at adjusted NSAA. Increment NSAA by size.
+;;;; 16. If size < 8 bytes, set size to 8 bytes.
+;;;; 17. Allocate to adjusted NSAA and increment NSAA by size.
+;;;;
+;;;; AAPCS64 return is performed as following:
+;;;;
+;;;; 1. If return type T is such that a function `void func(T arg)' requires passing T in a register:
+;;;;    - Return result in the same registers as it would use for such argument.
+;;;; 2. Otherwise:
+;;;;    - Reserve memory of sufficient size and alignment.
+;;;;    - Pass the address as additional argument in x8.
+;;;;    - Note that x8 is not preserved by callee.
+;;;;
+;;;; AAPCS64 contains additional specification on variadic arguments:
+;;;; - Varargs consist of ``named arguments'' and ``anonymous arguments''
+;;;; - Regular function calls are like varargs with only named arguments
+;;;; - In unprototyped and variadic C, ``__fp16'' and ``single float'' are converted to double
+;;;;
+;;;; Prologue of a function accepting varargs and which invokes ``va_start'' is expected to
+;;;; save the incoming argument registers to two register save areas in its own stack frame:
+;;;; - One area holding GP registers xn-x7
+;;;; - One area holding FP/SIMD registers vn-v7
+;;;; - Only those beyond named parameters need to be saved.
+;;;; - If a function is known to never accept a certain class of registers, that save area may be omitted.
+;;;; - In each area, registers are saved in ascending order.
+;;;; - For memory format of FP/SIMD save area, registers must be saved as if each is saved using integer STR instruction for the entire register.
+;;;;
+;;;; The ``va_list'' argument is passed as the following structure:
+;;;;
+;;;; ```
+;;;; typedef struct  va_list {
+;;;;    void * stack; // next stack param
+;;;;    void * gr_top; // end of GP arg reg save area
+;;;;    void * vr_top; // end of FP/SIMD arg reg save area
+;;;;    int gr_offs; // offset from  gr_top to next GP register arg
+;;;;    int vr_offs; // offset from  vr_top to next FP/SIMD register arg
+;;;;} va_list;
+;;;; '''
+;;;;
+;;;; The ``va_start'' macro initializes fields of ``va_list'' argument as:
+;;;; - Let ``named_gr'' be the number of GP registers known to hold named incoming args
+;;;; - Let ``named_vr'' be the number of FP/SIMD registers known to hold named incoming args
+;;;; - Set ``stack'' to:
+;;;;    - Addr following last (highest addressed) named argument on stack, rounded up to next multiple of 8 bytes.
+;;;;    - Or if no named arguments, value of stack pointer when function is entered.
+;;;; - Set ``gr_top'' to:
+;;;;    - Addr of the byte immediately following GP register save area, aligned to 16 bytes
+;;;; - Set ``vr_top'' to:
+;;;;    - Addr of the byte immediately following FP/SIMD register save area, aligned to 16 bytes
+;;;; - Set ``gr_offs'' to (0 - ((8 - named_gr)) * 8)
+;;;; - Set ``vr_offs'' to (0 - ((8 - named_vr)) * 16)
+;;;; - If it's known that ``va_list'' is never used to access FP/SIMD registers:
+;;;;    - No FP/SIMD registers need to be saved
+;;;;    - ``vr_top'' and ``vr_offs'' are 0.
+;;;;    - If GP register save area is immediately below stack pointer on entry:
+;;;;        - ``stack'' can be set address of the anonymous argument in GP arg save area
+;;;;        - ``gr_top'' and ``gr_offs'' are 0.
+;;;; - The optimization above for FP/SIMD register cannot be used for GP registers.
+;;;;
+;;;; Mac OS X (Darwin) [MACABI] uses the arm64 calling convention, except for a few deviations.
+;;;;
+;;;; Registers:
+;;;; - Register x18 is reserved and should not be used.
+;;;; - Frame pointer (x29, FP) must always address a valid frame record.
+;;;;    - Some functions (leaf, tail call, etc.) may opt not to create an entries in the list
+;;;;
+;;;; Data types:
+;;;; - wchar_t is signed 32 bit type
+;;;; - char is signed
+;;;; - long is 64 bit
+;;;; - __fp16 uses IEEE754-2008 format
+;;;; - long double is IEEE754 double-float, instead of quad-float
+;;;;
+;;;; Stack red zone:
+;;;; - 128 bytes below SP is ``red zone'' which is not touched by the OS
+;;;; - If function calls itself, caller must assume callee can modify this zone
+;;;;
+;;;; Argument passing:
+;;;; - Function arguments may consume slots on stack that are not multiple of 8 bytes.
+;;;;    - If total number of bytes used for stack arguments is not multiple of 8:
+;;;;        - Pad to multiple of 8 bytes.
+;;;;    - Affects B.5, B.6 (TODO: TEST BOTH -- Rongcui), C.4, C.14, C.16
+;;;; - When passing an argument with 16 byte alignment, it can start in odd-numbered xN register.
+;;;; - Caller, instead of callee, perform signed/zero extension of arguments fewer than 32 bits.
+;;;;    - NOTE: this means caller must not leave unused bits unspecified
+;;;; - Functions may ignore params containing empty struct types.
+;;;;    - This is unspecified by AAPCS64
+;;;;
+;;;; Variadic function:
+;;;; - Arguments are initialized as Stage A and Stage B
+;;;; - When assigning register and stack slots, follow these rules for each variadic arg:
+;;;;    - Round up NSRN to the next multiple of 8 bytes.
+;;;;    - Assign each variadic argument to appropriate 8-byte stack slots.
+;;;; - In essense, Mac OS's ``va_list'' is represented by a ``char *'' instead of a structure
+;;;;    - NOTE: that's paraphrased from Mac documentation. I think it's more like ``uint64_t *'' -- Rongcui
+;;;; - TODO: verify whether slotting follows the AAPCS64 rules or the Mac OS rules
+;;;;
+;;;; Ref:
+;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
+;;;; [MACABI] Writing ARM64 code for Apple platforms, https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+
+
 (in-package "SB-VM")
 
 (defconstant +number-stack-alignment-mask+ (1- (* n-word-bytes 2)))
@@ -16,9 +180,14 @@
 (defconstant +max-register-args+ 8)
 
 (defstruct arg-state
+  ;; NGRN
   (num-register-args 0)
+  ;; NSRN
   (fp-registers 0)
-  (stack-frame-size 0))
+  ;; NSAA = SP + stack-frame-size
+  (stack-frame-size 0)
+  ;; If Stage B performs a copy, where they are
+  (fpoffs nil))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -33,6 +202,82 @@
                       nl7-offset)
        index))
 
+;;;; Stage B
+;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
+(define-vop (copy-to-stack)
+  (:args (from-ptr :scs (sap-reg))
+         (fp :scs (any-reg)))
+  (:info size fpoff)
+  (:temporary (:scs (non-descriptor-reg)) src temp)
+  (:generator
+   0
+   ;; Temporarily hold the source addr
+   (inst mov src from-ptr)
+   ;; Copy data
+   (let ((chunks '(8 4 2 1)))
+     (do ((remaining size)
+          (soff 0))
+         ((<= remaining 0))
+       (let ((chunk (find-if (lambda (x) (<= x remaining)) chunks))
+             (src-addr (@ src (load-store-offset soff)))
+             (dst-addr (@ fp (load-store-offset (+ fpoff soff)))))
+         (ecase chunk
+           (8
+            (inst ldr temp src-addr)
+            (inst str temp dst-addr))
+           (4
+            (inst ldr (32-bit-reg temp) src-addr)
+            (inst str (32-bit-reg temp) dst-addr))
+           (2
+            (inst ldrh temp src-addr)
+            (inst strh temp dst-addr))
+           (1
+            (inst ldrb temp src-addr)
+            (inst strb temp dst-addr)))
+         (setf remaining (- remaining chunk))
+         (setf soff (+ soff chunk)))))
+   ))
+(define-vop (load-stack-ptr)
+  (:args (fp :scs (any-reg)))
+  (:info fpoff)
+  (:results (addr))
+  (:generator 0
+              (inst add addr fp fpoff)))
+(defun copy-struct-to-stack (sap size fpoff node block nsp)
+  "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
+  (let ((ptr-tn (sb-c:make-representation-tn
+                 (primitive-type-or-lose 'system-area-pointer)
+                 sap-reg-sc-number)))
+    (sb-c::emit-move node block (sb-c::lvar-tn node block sap) ptr-tn)
+    (sb-c::vop copy-to-stack node block ptr-tn nsp size fpoff)))
+
+(defun pre-padding-and-extension (type state)
+  "Registers Stage B operation for one argument. Returns:
+- NIL if unmodified
+- PREPROCESS-TN and FPOFF
+
+PREPROCESS-TN is a functional TN to be executed before any argument is copied. ~
+FPOFF is the frame pointer offset."
+  (let* ((bits (alien-type-bits type))
+         (size (ceiling bits n-byte-bits))
+                                        ;(words (ceil bits n-word-bits))
+         (actual-align (alien-type-alignment type))
+         (fpoff (align-up size actual-align))
+         (alloc-size (align-up size n-word-bytes)))
+    ;; Stage B matches the first rule for each argument, or pass argument unmodified.
+    ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
+    (cond
+      ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
+      ((and (alien-record-type-p type) (> size 16))
+       ;; FIXME: Check alignment for Darwin
+       (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
+       (let ((preprocess (lambda (value node block nsp)
+                           (copy-struct-to-stack value size fpoff node block nsp))))
+         (values preprocess fpoff)))
+      ;; Unmodified
+      (t nil))))
+
+;;;; Stage C
 (define-vop (move-word-arg-stack)
   (:args (x :scs (signed-reg unsigned-reg single-reg))
          (fp :scs (any-reg)))
@@ -60,37 +305,129 @@
                      temp-tn)
     (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
 
+;; Moving a struct of size 1 to 8 to register
+(define-vop (move-struct-single-dword-to-register)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg))
+  (:generator 0
+   (inst ldr to-reg (@ from-ptr))))
+
+;; Moving a struct of size 9 to 16 to register
+(define-vop (move-struct-double-dword-to-registers)
+  (:args (from-ptr :scs (sap-reg)))
+  (:results (to-reg-l) (to-reg-h))
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:generator 0
+              (inst mov temp from-ptr)
+              (inst ldr to-reg-l (@ temp))
+              (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
+
+(defun move-struct-to-registers (value size-dwords node block next-reg)
+  "Implements C.12, copying small composite types to registers."
+  (let ((temp-tn (sb-c:make-representation-tn
+                  (primitive-type-or-lose 'system-area-pointer)
+                  sap-reg-sc-number)))
+    (sb-c::emit-move node block (sb-c::lvar-tn node block value) temp-tn)
+    (ecase size-dwords
+      (1
+       (let ((reg-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg)))
+           (sb-c::vop move-struct-single-dword-to-register node block temp-tn reg-tn)))
+      (2
+       (let ((reg-l-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number next-reg))
+             (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
+         (sb-c::vop move-struct-double-dword-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
+
 (defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
+  "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17)"
   (let ((reg-args (arg-state-num-register-args state)))
-    (cond ((< reg-args +max-register-args+)
+    (cond ((< reg-args +max-register-args+) ; C.9
            (setf (arg-state-num-register-args state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
-          (t
-           (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
+          (t ; C.13 and below
+           (setf (arg-state-num-register-args state) +max-register-args+)
+           (let ((frame-size (align-up (arg-state-stack-frame-size state) size))) ; C.14
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
-             (cond #+darwin
+             (cond #+darwin ; On Darwin, integer can consume non-8-byte slots; C.17
                    ((/= size n-word-bytes)
                     (lambda (value node block nsp)
                       (move-to-stack-location value size frame-size
                                               prim-type reg-sc node block nsp)))
-                   (t
+                   (t ; C.16, C.17
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
+  "Pass floats by AAPCS64: FP register (C.1) or stack (C.5, C.6)"
   (let ((reg-args (arg-state-fp-registers state)))
-    (cond ((< reg-args +max-register-args+)
+    (cond ((< reg-args +max-register-args+) ; C.1
            (setf (arg-state-fp-registers state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc reg-args))
           (t
+           ;; C.3
+           (setf (arg-state-fp-registers state) +max-register-args+)
+           ;; C.5 and below
            (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
              (setf (arg-state-stack-frame-size state) (+ frame-size size))
-             (cond #+darwin
+             (cond #+darwin ; On Darwin, floats can consume non-8-byte slots; C.6
                    ((/= size n-word-bytes)
                     (lambda (value node block nsp)
                       (move-to-stack-location value size frame-size
                                               prim-type reg-sc node block nsp)))
-                   (t
+                   (t ; C.5, C.6
                     (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
+
+(defun record-arg-small (type state)
+  "Records <= 16 bytes: B.4, C.12. Pass by registers if possible."
+  (let ((reg-args (arg-state-num-register-args state))
+        (size-dwords (ceiling (alien-type-bits type) n-word-bits)))
+    (cond
+      ;; C.12, if we can fit the argument in register, copy to consecutive registers
+      ((< size-dwords (- +max-register-args+ reg-args))
+       (setf (arg-state-num-register-args state) (+ size-dwords reg-args))
+       (lambda (value node block nsp)
+         (declare (ignore nsp))
+         (move-struct-to-registers value size-dwords node block reg-args)))
+      ;; Otherwise, pass by stack
+      (t
+       (error "WIP: record-arg-small by stack")
+       ;; C.13, set NGRA to 8
+       (setf (arg-state-num-register-args state) +max-register-args+)
+       ;; C.14 Align NSAA
+       (let* ((frame-size (align-up (arg-state-stack-frame-size state) 8))
+              (offset (truncate frame-size 8)))
+         (setf (arg-state-stack-frame-size state) (+ frame-size size-dwords))
+         (loop for off from offset upto (+ offset size-dwords)
+               collect (make-wired-tn* 'unsigned-byte-64 unsigned-stack-sc-number offset)))))))
+(defun record-arg-large (type state)
+  "Records > 16 bytes are copied to stack and passed by pointer."
+  (declare (ignore type))
+  (let* ((fpoff (first (arg-state-fpoffs state)))
+         (reg-args (arg-state-num-register-args state))
+         (pass-by-reg (< reg-args +max-register-args+)))
+    (cond
+      (pass-by-reg
+       ;; C.9
+       (setf (arg-state-num-register-args state) (1+ reg-args))
+       ;; Copy argument to register
+       (lambda (value node block nsp)
+         (declare (ignore value))
+         (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
+           (sb-c::vop load-stack-ptr node block nsp fpoff arg-tn))))
+      (t
+       ;; C.13
+       (setf (arg-state-num-register-args state) +max-register-args+)
+       ;; C.14 passing pointer by stack.
+       (let ((frame-size (align-up (arg-state-stack-frame-size state) n-word-bytes)))
+         (setf (arg-state-stack-frame-size state) (+ frame-size n-word-bytes))
+         (lambda (value node block nsp)
+           (declare (ignore value))
+           (let ((addr-tn (sb-c:make-representation-tn
+                           (primitive-type-or-lose 'system-area-pointer)
+                           sap-reg-sc-number)))
+             (sb-c::vop load-stack-ptr node block nsp fpoff addr-tn)
+             (move-to-stack-location addr-tn n-word-bytes frame-size
+                                     'system-area-pointer
+                                     sap-reg-sc-number
+                                     node block nsp))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
  (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
@@ -112,7 +449,23 @@
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
   (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
-;;;
+
+(define-alien-type-method (sb-alien::record :arg-tn) (type state)
+  (let* ((bits (alien-type-bits type))
+         (size (truncate (or bits 0) n-byte-bits)))
+    (cond
+      ;; Darwin specifies that empty records are ignored.
+      ;; However, notice that empty structs are not portable.
+      #+darwin
+      ((zerop size)
+       (lambda (value node block nsp) (declare (ignore value node block nsp))))
+      ((<= size 16) (record-arg-small type state))
+      (t (record-arg-large type state)))))
+
+(define-alien-type-method (sb-alien::record :result-tn) (type state)
+  (declare (ignore type state))
+  (error "WIP arm64 struct value return."))
+;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
     (foldable flushable movable))
@@ -180,23 +533,36 @@
             values)))
 
 (defun make-call-out-tns (type)
-  (let ((arg-state (make-arg-state)))
-    (collect ((arg-tns))
+  (let* ((arg-state (make-arg-state)))
+    ;; Create TNs
+    (collect ((arg-tns)
+              (preprocess-tns))
       (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
+        ;; Stage B
+        (loop for i from 0
+              for arg-type in (alien-fun-type-arg-types type)
+              do (multiple-value-bind (pp fpoff)
+                     (pre-padding-and-extension arg-type arg-state)
+                   (preprocess-tns pp)
+                   (push fpoff (arg-state-fpoffs arg-state))))
+        ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do
-              #+darwin
+              #+darwin ; In Darwin, variadic args is passed on stack slots
               (when (eql i variadic)
                 (setf (arg-state-num-register-args arg-state) +max-register-args+
                       (arg-state-fp-registers arg-state) +max-register-args+))
-              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))))
+              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))
+              ;; Pop the FPOFFS list so its head is always current argument
+              (pop (arg-state-fpoffs arg-state))))
       (values (make-normal-tn *fixnum-primitive-type*)
               (arg-state-stack-frame-size arg-state)
               (arg-tns)
               (invoke-alien-type-method :result-tn
                                         (alien-fun-type-result-type type)
-                                        (make-result-state))))))
+                                        (make-result-state))
+              (preprocess-tns)))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
