@@ -59,6 +59,32 @@ struct small_align_8 {
 };
 long long small_align_8_get_m0(struct small_align_8 m) { return m.m0; }
 long long small_align_8_get_m1(struct small_align_8 m) { return m.m1; }
+/** On ARM64, m is passed on X2 and X3. */
+long long small_align_8_get_m0_1(long long _i0, long long _i1, struct small_align_8 m) {
+  (void) _i0; (void) _i1;
+  return m.m0;
+}
+/** On ARM64, m is passed on X2 and X3 if not Darwin, otherwise X1 and X2.*/
+long long small_align_8_get_m0_2(long long _i0, struct small_align_8 m) {
+  (void) _i0;
+  return m.m0;
+}
+/** On ARM64, m is passed on stack.*/
+long long small_align_8_get_m0_3(long long _i0, long long _i1, long long _i2, long long _i3,
+                                 long long _i4, long long _i5, long long _i6, long long _i7,
+                                 struct small_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  return m.m0;
+}
+/** On ARM64, m is passed on stack, even on Darwin.*/
+long long small_align_8_get_m0_4(long long _i0, long long _i1, long long _i2, long long _i3,
+                                 long long _i4, long long _i5, long long _i6,
+                                 struct small_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6;
+  return m.m0;
+}
 void small_align_8_mutate(volatile struct small_align_8 m) {
   m.m0++;
   m.m1++;

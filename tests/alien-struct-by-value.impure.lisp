@@ -13,6 +13,7 @@
 ;;;; more information.
 (in-package :cl-user)
 ;;;; Bug 313202: C struct pass/return by value
+(defconstant +magic-number+ 42)
 ;;; Compile and load shared library
 (unless (probe-file "alien-struct-by-value.so")
   (sb-ext:run-program "/bin/sh" '("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
@@ -49,15 +50,15 @@
 (with-test (:name :struct-by-value-tiny-align-8-args)
   (with-alien ((m (struct tiny-align-8)))
     ;; Initialize struct
-    (setf (slot m 'm0) 42)
+    (setf (slot m 'm0) +magic-number+)
     (flet ((test-members ()
-             (assert (= 42 (tiny-align-8-get-m0 m)))
-             (assert (= 42 (tiny-align-8-get-m0-1 0 m)))
-             (assert (= 42 (tiny-align-8-get-m0-2 0 m)))
-             (assert (= 42 (tiny-align-8-get-m0-3 0 1 2 3 4 5 6 7 m)))
-             (assert (= 42 (tiny-align-8-get-m0-4 0 1 2 3 4 5 6 7 m)))
-             (assert (= 42 (tiny-align-8-get-m0-5 0 1 2 3 4 5 6 7 8 m)))
-             (assert (= 42 (tiny-align-8-get-m0-6 0 1 2 3 4 5 6 7 8 m)))))
+             (assert (= +magic-number+ (tiny-align-8-get-m0 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-1 0 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-2 0 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-3 0 1 2 3 4 5 6 7 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-4 0 1 2 3 4 5 6 7 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-5 0 1 2 3 4 5 6 7 8 m)))
+             (assert (= +magic-number+ (tiny-align-8-get-m0-6 0 1 2 3 4 5 6 7 8 m)))))
       ;; Test struct passing
       (test-members)
       ;; Call a function that mutates struct
@@ -68,14 +69,32 @@
 (define-alien-type nil (struct small-align-8 (m0 (integer 64)) (m1 (integer 64))))
 (defar small-align-8-get-m0 (integer 64) (m (struct small-align-8)))
 (defar small-align-8-get-m1 (integer 64) (m (struct small-align-8)))
+(defar small-align-8-get-m0-1 (integer 64)
+  (i0 long-long) (i1 long-long)
+  (m (struct small-align-8)))
+(defar small-align-8-get-m0-2 (integer 64)
+  (i0 long-long)
+  (m (struct small-align-8)))
+(defar small-align-8-get-m0-3 (integer 64)
+  (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
+  (i4 long-long) (i5 long-long) (i6 long-long) (i7 long-long)
+  (m (struct small-align-8)))
+(defar small-align-8-get-m0-4 (integer 64)
+  (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
+  (i4 long-long) (i5 long-long) (i6 long-long)
+  (m (struct small-align-8)))
 (defar small-align-8-mutate void (m (struct small-align-8)))
 (with-test (:name :struct-by-value-small-align-8-args)
   (with-alien ((m (struct small-align-8)))
     ;; Initialize struct
-    (setf (slot m 'm0) 0) (setf (slot m 'm1) 1)
+    (setf (slot m 'm0) +magic-number+) (setf (slot m 'm1) (1+ +magic-number+))
     (flet ((test-members ()
-             (assert (= 0 (small-align-8-get-m0 m)))
-             (assert (= 1 (small-align-8-get-m1 m)))))
+             (assert (= +magic-number+ (small-align-8-get-m0 m)))
+             (assert (= (1+ +magic-number+) (small-align-8-get-m1 m)))
+             (assert (= +magic-number+ (small-align-8-get-m0-1 0 1 m)))
+             (assert (= +magic-number+ (small-align-8-get-m0-2 0 m)))
+             (assert (= +magic-number+ (small-align-8-get-m0-3 0 1 2 3 4 5 6 7 m)))
+             (assert (= +magic-number+ (small-align-8-get-m0-4 0 1 2 3 4 5 6 m)))))
       ;; Test struct passing
       (test-members)
       ;; Call a function that mutates struct
