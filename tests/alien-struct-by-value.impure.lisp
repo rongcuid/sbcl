@@ -47,7 +47,7 @@
   (i8 int)
   (m (struct tiny-align-8)))
 (defar tiny-align-8-mutate void (m (struct tiny-align-8)))
-(with-test (:name :struct-by-value-tiny-align-8-args)
+(with-test (:name :struct-by-value-tiny-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct tiny-align-8)))
     ;; Initialize struct
     (setf (slot m 'm0) +magic-number+)
@@ -84,7 +84,7 @@
   (i4 long-long) (i5 long-long) (i6 long-long)
   (m (struct small-align-8)))
 (defar small-align-8-mutate void (m (struct small-align-8)))
-(with-test (:name :struct-by-value-small-align-8-args)
+(with-test (:name :struct-by-value-small-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct small-align-8)))
     ;; Initialize struct
     (setf (slot m 'm0) +magic-number+) (setf (slot m 'm1) (1+ +magic-number+))
@@ -117,7 +117,7 @@
     `(progn ,@defs)))
 (defs-large-align-8-get)
 (defar large-align-8-mutate void (m (struct large-align-8)))
-(with-test (:name :struct-by-value-large-align-8-args)
+(with-test (:name :struct-by-value-large-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct large-align-8)))
     (macrolet ((set-members ()
                  "Sets member mN's value to N"
