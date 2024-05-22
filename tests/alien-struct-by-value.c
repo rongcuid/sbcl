@@ -2,6 +2,51 @@ struct tiny_align_8 {
   long long m0;
 };
 long long tiny_align_8_get_m0(struct tiny_align_8 m) { return m.m0; }
+/** On ARM64, m gets passed on X2.*/
+long long tiny_align_8_get_m0_1(long long _i0, struct tiny_align_8 m) {
+  (void) _i0;
+  return m.m0;
+}
+/** On ARM64, m gets passed on X2.*/
+long long tiny_align_8_get_m0_2(int _i0, struct tiny_align_8 m) {
+  (void) _i0;
+  return m.m0;
+}
+/** On ARM64, m gets passed on stack.*/
+long long tiny_align_8_get_m0_3(long long _i0, long long _i1, long long _i2, long long _i3,
+                                long long _i4, long long _i5, long long _i6, long long _i7,
+                                struct tiny_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  return m.m0;
+}
+/** On ARM64, m gets passed on stack.*/
+long long tiny_align_8_get_m0_4(int _i0, int _i1, int _i2, int _i3,
+                                int _i4, int _i5, int _i6, int _i7,
+                                struct tiny_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  return m.m0;
+}
+/** On ARM64, m gets passed on stack.*/
+long long tiny_align_8_get_m0_5(long long _i0, long long _i1, long long _i2, long long _i3,
+                                long long _i4, long long _i5, long long _i6, long long _i7,
+                                long long _i8, struct tiny_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  (void) _i8;
+  return m.m0;
+}
+/** On ARM64, m gets passed on stack.*/
+long long tiny_align_8_get_m0_6(long long _i0, long long _i1, long long _i2, long long _i3,
+                                long long _i4, long long _i5, long long _i6, long long _i7,
+                                int _i8, struct tiny_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  (void) _i8;
+  return m.m0;
+}
+/** Nothing should change.*/
 void tiny_align_8_mutate(volatile struct tiny_align_8 m) {
   m.m0++;
 }
