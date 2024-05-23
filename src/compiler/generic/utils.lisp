@@ -264,8 +264,8 @@
         (s character-widetag character)
         (s other-pointer-lowtag
            (if permit-nil
-               (specifier-type '(not (or cons . #1=(#+64-bit fixnum single-float function cons instance character))))
-               (specifier-type '(not (or list . #1#)))))
+               (specifier-type '(or null sb-c::other-pointer))
+               (specifier-type 'sb-c::other-pointer)))
         (let ((set-bit (logand lowtag-mask (logandc2 lowtag set)))
               (clear-bit (logandc2 lowtag-mask (logior lowtag clear))))
           (cond ((plusp set-bit)
@@ -441,7 +441,7 @@
 
 ;;; Convert # of "big digits" (= words, sometimes called "limbs") to a header value.
 (defmacro bignum-header-for-length (n)
-  (logior (ash n n-widetag-bits) bignum-widetag))
+  `(logior (ash ,n n-widetag-bits) bignum-widetag))
 
 (defmacro id-bits-offset ()
   (let ((slot (get-dsd-index layout sb-kernel::id-word0)))

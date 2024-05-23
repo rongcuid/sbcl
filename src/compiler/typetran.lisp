@@ -67,14 +67,17 @@
         (abort-ir1-transform)
         expansion)))
 
-(progn
-  (defun type-other-pointer-p (type)
-    (csubtypep type (specifier-type '(not #1=(or fixnum #+64-bit single-float
-                                                 list function instance character
-                                                 extended-sequence)))))
+(sb-xc:deftype other-pointer ()
+  '(or array
+    (and number (not (or fixnum #+64-bit single-float)))
+    fdefn (and symbol (not null))
+    weak-pointer system-area-pointer code-component))
 
-  (defun type-not-other-pointer-p (type)
-    (csubtypep type (specifier-type '#1#))))
+(defun type-other-pointer-p (type)
+  (csubtypep type (specifier-type 'other-pointer)))
+
+(defun type-not-other-pointer-p (type)
+  (csubtypep type (specifier-type '(not other-pointer))))
 
 ;;; If the lvar OBJECT definitely is or isn't of the specified
 ;;; type, then return T or NIL as appropriate. Otherwise quietly
@@ -183,7 +186,7 @@
                              (cond ((and (type-not-other-pointer-p diff)
                                          (type-other-pointer-p type))
                                     `(%other-pointer-p object))
-                                   ((and (type-other-pointer-p type)
+                                   ((and (type-other-pointer-p diff)
                                          (type-not-other-pointer-p type))
                                     `(not (%other-pointer-p object)))))))))
               (t
@@ -396,6 +399,13 @@
              ((type= type (specifier-type '(or word sb-vm:signed-word)))
               `(or (typep ,object 'sb-vm:signed-word)
                    (typep ,object 'word)))
+             ((and (vop-existsp :translate unsigned-byte-x-p)
+                   (eql (numeric-type-class type) 'integer)
+                   (eql low 0)
+                   (integerp high)
+                   (= (logcount (1+ high)) 1)
+                   (zerop (rem (integer-length high) sb-vm:n-word-bits)))
+              `(unsigned-byte-x-p ,object ,(integer-length high)))
              (t
               `(and (typep ,object ',base)
                     ,(transform-numeric-bound-test object type base)))))
@@ -1638,17 +1648,24 @@
   ((value) (sb-vm:signed-word) * :important nil)
   `(>= value 0))
 
+(when-vop-existsp (:translate unsigned-byte-x-p)
+  (deftransform unsigned-byte-x-p
+      ((value x) (t t) * :important nil :node node)
+    (ir1-transform-type-predicate value (specifier-type `(unsigned-byte ,(lvar-value x))) node))
+
+  (deftransform unsigned-byte-x-p
+      ((value x) ((integer * #.most-positive-word) t) * :important nil)
+    `(#+64-bit unsigned-byte-64-p #-64-bit unsigned-byte-32-p x)))
+
 (deftransform %other-pointer-p ((object))
-  (let ((this-type
-          (specifier-type '(or fixnum
-                            #+64-bit single-float
-                            function
-                            list
-                            instance
-                            character))))
-    (cond ((not (types-equal-or-intersect this-type (lvar-type object))))
-          ((csubtypep (lvar-type object) this-type)
+  (let ((type (lvar-type object)))
+    (cond ((not (types-equal-or-intersect type (specifier-type 'other-pointer)))
            nil)
+          ((or (csubtypep type (specifier-type 'other-pointer))
+               ;; It doesn't negate to this type, so check both
+               (csubtypep type (specifier-type '(not (or fixnum #+64-bit single-float
+                                                                list function instance character)))))
+           t)
           ((give-up-ir1-transform)))))
 
 ;;; BIGNUMP is simpler than INTEGERP, so if we can rule out FIXNUM then ...

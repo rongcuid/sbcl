@@ -2268,9 +2268,9 @@
   `(define-instruction ,name (segment rn rm)
      (:printer fp-compare ((op ,op)))
      (:printer fp-compare ((op ,op) (z 1) (type 0))
-               '(:name :tab rn ", " $0f0))
+               '(:name :tab rn ", " 0f0))
      (:printer fp-compare ((op ,op) (z 1) (type 1))
-               '(:name :tab rn ", " $0d0))
+               '(:name :tab rn ", " 0d0))
      (:emitter
       (assert (or (eql rm 0)
                   (eq (tn-sc rn)
@@ -3562,9 +3562,9 @@
               (or
                (memq (vop-name vop) safe-vops)
                (and vop
-                    (memq (car (sb-c::vop-parse-translate
-                                (sb-c::vop-parse-or-lose (vop-name vop))))
-                          safe-translates))
+                    (loop for fun in safe-translates
+                          thereis (memq (sb-c::vop-info vop)
+                                        (sb-c::fun-info-templates (sb-c::fun-info-or-lose fun)))))
                (and (not safe-vops)
                     (not safe-translates))))))))
 

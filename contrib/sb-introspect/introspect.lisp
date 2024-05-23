@@ -181,8 +181,10 @@ constant pool."
                               vop
                               (gethash (sb-c::vop-info-name vop)
                                        sb-c::*backend-parsed-vops*))
-          for name = (sb-c::vop-parse-name vop-parse)
-          for loc = (sb-c::vop-parse-source-location vop-parse)
+          for name = (and vop-parse
+                          (sb-c::vop-parse-name vop-parse))
+          for loc = (and vop-parse
+                         (sb-c::vop-parse-source-location vop-parse))
           when loc
           collect (let ((source (translate-source-location loc)))
                     (setf (definition-source-description source)
@@ -455,8 +457,8 @@ If an unsupported TYPE is requested, the function will return NIL.
                (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
     (make-definition-source
      :pathname
-     (when (stringp (debug-source-namestring debug-source))
-       (parse-namestring (debug-source-namestring debug-source)))
+     (when (stringp (sb-c::debug-source-namestring debug-source))
+       (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
      (if tlf
          (elt (sb-c::debug-source-start-positions debug-source) tlf))
@@ -467,7 +469,7 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (declare (ignore cond))
                       (sb-c::compiled-debug-fun-blocks
                        (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
-     :file-write-date (debug-source-created debug-source)
+     :file-write-date (sb-c::debug-source-created debug-source)
      :plist (sb-c::debug-source-plist debug-source))))
 
 (defun translate-source-location (location)

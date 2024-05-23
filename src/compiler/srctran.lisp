@@ -603,12 +603,11 @@
     (%make-interval (normalize-bound low)
                     (normalize-bound high))))
 
-;; Some backends have no float traps
+;; Some backends (and the host) have no float traps
 (declaim (inline bad-float-p))
 (defun bad-float-p (value)
   (declare (ignorable value))
-  #+(and (or arm (and arm64 (not darwin)) riscv)
-         (not sb-xc-host))
+  #+(or arm (and arm64 (not darwin)) riscv sb-xc-host)
   (or (and (floatp value)
            (float-infinity-or-nan-p value))
       (and (complex-float-p value)
@@ -621,10 +620,6 @@
 (defun bound-func (f x strict)
   (declare (type function f))
   (when x
-    #+sb-xc-host
-    (when (and (eql f #'log)
-               (zerop x))
-      (return-from bound-func))
     (handler-case
         (let ((bound (funcall f (type-bound-number x))))
           (unless (bad-float-p bound)
@@ -1183,8 +1178,8 @@
                              ;; to watch out for positive or negative infinity.
                              (cond ((floatp (type-bound-number x))
                                     (if y-low-p
-                                        (sb-xc:- (float-sign (type-bound-number x) $0.0))
-                                        (float-sign (type-bound-number x) $0.0)))
+                                        (sb-xc:- (float-sign (type-bound-number x) 0.0))
+                                        (float-sign (type-bound-number x) 0.0)))
                                    ((and integer
                                          (not (interval-contains-p 0 top)))
                                     '(0))
@@ -3726,7 +3721,7 @@
 (deftransform floor ((number divisor) ((real (0) (1)) (integer (0) *)) * :important nil)
   `(values 0 number))
 
-(deftransform truncate ((number divisor) ((and (real (-1) (1)) (not (eql $-0d0)) (not (eql $-0f0)))
+(deftransform truncate ((number divisor) ((and (real (-1) (1)) (not (eql -0d0)) (not (eql -0f0)))
                                           (and integer (not (eql 0))))
                         * :important nil)
   `(values 0 number))
@@ -4303,7 +4298,7 @@
           ((= val -1/2) '(/ (sqrt x)))
           (t (give-up-ir1-transform)))))
 
-(deftransform expt ((x y) ((constant-arg (member -1 $-1.0 $-1.0d0)) integer) *)
+(deftransform expt ((x y) ((constant-arg (member -1 -1.0 -1.0d0)) integer) *)
   "recode as an ODDP check"
   (let ((val (lvar-value x)))
     (if (eql -1 val)
