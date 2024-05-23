@@ -300,18 +300,13 @@
 (define-vop (move-struct-single-dword-to-register)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg))
-  (:generator 0
-   (inst ldr to-reg (@ from-ptr))))
+  (:generator 0 (inst ldr to-reg (@ from-ptr))))
 
 ;;; Move a struct of size 9 to 16 to register
 (define-vop (move-struct-double-dword-to-registers)
   (:args (from-ptr :scs (sap-reg)))
   (:results (to-reg-l) (to-reg-h))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:generator 0
-              (inst mov temp from-ptr)
-              (inst ldr to-reg-l (@ temp))
-              (inst ldr to-reg-h (@ temp 8))))
+  (:generator 0 (inst ldp to-reg-l to-reg-h (@ from-ptr))))
 
 (defun move-struct-to-registers (value size-dwords node block next-reg)
   "C.12. Copy small composite types to registers."
@@ -336,7 +331,7 @@
   (:generator
    0
    (inst add addr fp from-fpoff)
-   (inst str addr (@ fp (load-store-offset to-fpoff)))))
+   (inst str addr (@ fp to-fpoff))))
 
 ;;;; Stage B
 (defun pre-padding-and-extension (type ppoff)
