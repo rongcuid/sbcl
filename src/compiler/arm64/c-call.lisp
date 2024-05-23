@@ -376,8 +376,10 @@ This allows copied data to reside after the last argument.
       ((and (alien-record-type-p type) (> size 16))
        (let ((pp (lambda (fpoff)
                   (lambda (value node block nsp)
+                    (declare (ignore value node block nsp))
                     (format t "EMIT PP: FPOFF = ~A PPOFF = ~A~%" fpoff ppoff)
-                    (move-struct-to-stack value size (+ fpoff ppoff) node block nsp)))))
+                    ;;(move-struct-to-stack value size (+ fpoff ppoff) node block nsp)
+                    ))))
          (values pp ppoff alloc-size)))
       ;; Unmodified
       (t nil))))
@@ -632,7 +634,6 @@ Implementation notes:
             (deferred-tns nil)
             #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
         ;; Stage B
-        (format t ">> B~%")
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               for (pp ppoff size) = (multiple-value-list
@@ -642,11 +643,10 @@ Implementation notes:
               do
               (push pp (pp-state-pps (arg-state-pp-state arg-state)))
               (push ppoff (pp-state-ppoffs (arg-state-pp-state arg-state)))
-              (setf (pp-state-ppoff (arg-state-pp-state arg-state)) (+ ppoff size)))
+              (when pp
+                (setf (pp-state-ppoff (arg-state-pp-state arg-state)) (+ ppoff size))))
         (pp-state-flip (arg-state-pp-state arg-state))
-        (format t "<< B, PP-STATE ~A~%" (arg-state-pp-state arg-state))
         ;; Stage C
-        (format t ">> C~%")
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do (multiple-value-bind (tn deferred-tn)
@@ -656,12 +656,10 @@ Implementation notes:
         ;; Reverse stage C lists so they are FIFO
         (setf tns (nreverse tns))
         (setf deferred-tns (nreverse deferred-tns))
-        (format t "<< C~%")
         ;; Now Stage C is done, generate preprocesses knowing how much stack is needed.
         ;; We are pedantic and align to the maximum possible requirement.
         (setf (arg-state-stack-frame-size arg-state)
               (align-up (arg-state-stack-frame-size arg-state) 16))
-        (format t ">> D~%")
         ;; Run deferred operations
         (let ((fpoff (arg-state-stack-frame-size arg-state)))
           ;; Generate preprocess-tns by applying FPOFF.
@@ -672,7 +670,6 @@ Implementation notes:
               for deferred in deferred-tns
               do (arg-tns
                   (if tn tn (funcall deferred fpoff)))))
-        (format t "<< D~%")
         ;; Deferred operations are done. Update frame size to account for it.
         (setf (arg-state-stack-frame-size arg-state)
               (+ (arg-state-stack-frame-size arg-state) (pp-state-ppoff (arg-state-pp-state arg-state)))))
