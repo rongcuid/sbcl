@@ -215,15 +215,17 @@
 
 ;;;; VOPs used for argument parsing
 ;;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
+;;; Essentially performs the following C operation:
+;;; memcpy(fp + fpoff, from_ptr, size)
 (define-vop (move-to-stack)
-  (:args (from-ptr :scs (sap-reg))
-         (fp :scs (any-reg)))
+  (:args (from-ptr :scs (sap-reg)) ;; NL2
+         (fp :scs (any-reg))) ;; NL1
   (:info size fpoff)
-  (:temporary (:scs (non-descriptor-reg)) src temp)
+  (:temporary (:scs (non-descriptor-reg)) temp) ;; NL0
   (:generator
    0
    ;; Temporarily hold the source addr
-   (inst mov src from-ptr)
+   ;;(inst mov src from-ptr)
    ;; Copy data
    (let ((chunks '(8 4 2 1)))
      ;; Unrolls copy loop
@@ -231,8 +233,8 @@
           (soff 0))
          ((<= remaining 0))
        (let ((chunk (find-if (lambda (x) (<= x remaining)) chunks))
-             (src-addr (@ src (load-store-offset soff)))
-             (dst-addr (@ fp (load-store-offset (+ fpoff soff)))))
+             (src-addr (@ from-ptr soff))
+             (dst-addr (@ fp (+ fpoff soff))))
          (ecase chunk
            (8
             (inst ldr temp src-addr)
@@ -247,8 +249,7 @@
             (inst ldrb temp src-addr)
             (inst strb temp dst-addr)))
          (setf remaining (- remaining chunk))
-         (setf soff (+ soff chunk)))))
-   ))
+         (setf soff (+ soff chunk)))))))
 
 (defun move-struct-to-stack (sap size fpoff node block nsp)
   "B.4. Copies a struct at SAP of SIZE and ALIGMENT to NSP+FPOFF."
@@ -310,7 +311,7 @@
   (:generator 0
               (inst mov temp from-ptr)
               (inst ldr to-reg-l (@ temp))
-              (inst ldr to-reg-h (@ temp (load-store-offset 8)))))
+              (inst ldr to-reg-h (@ temp 8))))
 
 (defun move-struct-to-registers (value size-dwords node block next-reg)
   "C.12. Copy small composite types to registers."
@@ -376,10 +377,7 @@ This allows copied data to reside after the last argument.
       ((and (alien-record-type-p type) (> size 16))
        (let ((pp (lambda (fpoff)
                   (lambda (value node block nsp)
-                    (declare (ignore value node block nsp))
-                    (format t "EMIT PP: FPOFF = ~A PPOFF = ~A~%" fpoff ppoff)
-                    ;;(move-struct-to-stack value size (+ fpoff ppoff) node block nsp)
-                    ))))
+                    (move-struct-to-stack value size (+ fpoff ppoff) node block nsp)))))
          (values pp ppoff alloc-size)))
       ;; Unmodified
       (t nil))))
