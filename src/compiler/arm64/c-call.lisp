@@ -354,7 +354,7 @@ This allows copied data to reside after the last argument.
          (size (ceiling bits n-byte-bits))
          (actual-align (round (alien-type-alignment type) n-byte-bits))
          (sboff (align-up (arg-state-sboff state) actual-align))
-         (alloc-size (align-up size n-word-bytes)))
+         (alloc-size (align-up size (max actual-align n-word-bytes))))
     ;; Stage B matches the first rule for each argument, or pass argument unmodified.
     ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
     (cond
