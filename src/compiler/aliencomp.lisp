@@ -644,8 +644,7 @@
       ;; or to pass large structs. These operations must be performed before passing arguments.
       (loop for tn in #-arm preprocess-tns #+arm (reverse preprocess-tns)
             for arg in args
-            ;do (when tn (funcall tn arg call block nsp))
-            )
+            do (when tn (funcall tn arg call block nsp)))
 
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).

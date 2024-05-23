@@ -143,9 +143,8 @@
              `(progn
                 ,@basics
                 (assert (= +magic-number+ (large-align-8-get-m0-1 0 m)))
-                ;(assert (= +magic-number+ (large-align-8-get-m0-2
-                ;                           0 1 2 3 4 5 6 7 m)))
-                ))))
+                (assert (= +magic-number+ (large-align-8-get-m0-2
+                                           0 1 2 3 4 5 6 7 m)))))))
       ;; Initialize struct
       (set-members)
       ;; Test that struct is correctly passed
