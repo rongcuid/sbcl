@@ -340,24 +340,19 @@
 (defun pre-padding-and-extension (type ppoff)
   "Registers Stage B operation for one argument. Returns:
 - NIL if unmodified
-- PREPROCESS-TN-BUILDER
+- PREPROCESS-TN-GENERATOR
 
-TODO update docs
-
-PREPROCESS-TN-BUILDER is a function that takes a single argument, FPOFF, to generate ~
-a functional TN to emit instructions for the preprocessing step. ~
-PPOFF, the offset from FPOFF, is written to state.
+PREPROCESS-TN-GENERATOR is a function that takes a single argument, FPOFF, ~
+to generate a functional TN to emit instructions for the preprocessing step. ~
 FPOFF is the beginning of the first argument copied by Stage B.
 Argument will be copied to FP + FPOFF + PPOFF.
 
 Implementation notes:
 
-- PREPROCESS-TN-BUILDER defers the code generation of Stage B after Stage C. ~
-This allows copied data to reside after the last argument.
 - Does not support pure scalable types (B.1, B.3)
 - Does not support unknown-sized composite types (B.2)
 - For alignment-adjusted types (B.6):
-    - Fundamental types are not explicitely modified, as they will be copied in Stage C
+    - Fundamental types are not explicitely modified, as they will be copied in Stage C.
     - For composite types, we always align to adjusted alignment, for the following reasons:
         - At this stage, it is easier to implement as we do not have an easy way to extract natural alignment
         - The only safe alignment adjustment is to increase alignment
@@ -400,7 +395,8 @@ This allows copied data to reside after the last argument.
   "Pass ints by AAPCS64: GP register (C.9) or stack (C.13, C.14, C.16, C.17).
 
 NOTE: Quad, or 128-bit ints are not supported."
-  (assert (<= size 8) (size) "Integer argument of size ~A > 8 bytes is not supported." size)
+  (assert (<= size 8) (size)
+          "SBCL BUG: Integer argument of size ~A > 8 bytes is not supported." size)
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+) ; C.9
            (setf (arg-state-num-register-args state) (1+ reg-args))
@@ -419,7 +415,8 @@ NOTE: Quad, or 128-bit ints are not supported."
 
 (defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
   "Pass floats by AAPCS64: FP register (C.1) or stack (C.5, C.6)"
-  (assert (<= size 8) (size) "Float argument of size ~A > 8 bytes is not supported." size)
+  (assert (<= size 8) (size)
+          "SBCL BUG: Float argument of size ~A > 8 bytes is not supported." size)
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+) ; C.1
            (setf (arg-state-fp-registers state) (1+ reg-args))
@@ -449,8 +446,8 @@ Implementation notes:
         (alignment #-darwin n-word-bytes
                    #+darwin (ceiling (alien-type-alignment type) n-byte-bits)))
     ;; FIXME: spec supports it, need to implement.
-    (assert (<= 8 alignment)
-            (alignment) "Struct alignment ~A > 8 bytes is unsupported" alignment)
+    (assert (<= 8 alignment) (alignment)
+            "SBCL BUG: Struct alignment ~A > 8 bytes is unsupported" alignment)
     (cond
       ;; C.12, if we can fit the argument in register, copy to consecutive registers
       ((< size-dwords (- +max-register-args+ reg-args))
@@ -469,10 +466,8 @@ Implementation notes:
            (move-struct-to-stack value size fpoff node block nsp)))))))
 (defun record-arg-large (type state)
   "Records > 16 bytes are copied to stack and passed by pointer. ~
-Returns TN-GENERATOR, which is a function taking FPOFF and returns a functional TN.
-
-Implementation Note:
-- The generation of functional TN is deferred until we know how much stack is required for passing arguments"
+Returns TN-GENERATOR, a function taking FPOFF and returns a functional TN. ~
+TN-GENERATOR is executed after Stage C, when FPOFF is known. "
   (declare (ignore type))
   (let* ((ppoff (first (pp-state-ppoffs (arg-state-pp-state state))))
          (reg-args (arg-state-num-register-args state))
@@ -618,10 +613,8 @@ Implementation notes:
 - Due to the backend architecture of SBCL, assignments are implemented in methods of each type.
     - Check DEFINE-ALIEN-TYPE-METHOD (type :ARG-TN) for more info.
 - Scalable, Vector, half-float, quad-float, quad-int types are not supported.
-- FIXME: On C.14, we use adjusted alignment as natural alignment, which can be problematic
 
 FIXME: I don't think variadic functions are implemented correctly. Need to verify. -- Rongcui"
-  ;; TODO: verify that variadic is actually supported on ARM64
   #+darwin ; In Darwin, variadic args is passed on stack slots
   (when variadic-p
     (setf (arg-state-num-register-args state) +max-register-args+
@@ -632,7 +625,14 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
     (pop (pp-state-ppoffs (arg-state-pp-state state)))
     (values tn deferred)))
 
-(defun stage-c (arg-types arg-state variadic)
+(defun stage-c (arg-types arg-state #+darwin variadic)
+  "Stage C of AAPCS64. Returns (VALUES TNS DEFERS).
+
+TNS and DEFERS are two lists of same length. For each pair of elements from the two lists:
+- If element from TNS is not NIL, then TN is resolved.
+- If element from TNS is NIL, then the element from DEFERS is used to resolve TN after Stage C.
+
+See ASSIGN-ARGUMENTS for more info."
   ;; FIXME: check whether variadic functions actually work
   (collect ((tns) (defers))
     (loop for i from 0 for arg-type in arg-types
@@ -642,10 +642,29 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
     (values (tns) (defers))))
 
 (defun make-call-out-tns (type)
-  "Entry point of alien backend.
+  "Entry point of alien backend, implements AAPCS64 argument passing, including for Darwin.
 
-Implementation notes:
-- Stage A is implicit when ARG-STATE is initialized."
+Stack Layout:
+
+|FP Arguments passed by stack |FPOFF Arguments copied by Stage B |PPOFF
+
+FP is the Frame Pointer. Arguments passed by stack are appended directly below FP.
+FPOFF (Frame Pointer OFFset) is the end of the last stack argument. ~
+Arguments copied by Stage B are appended after FPOFF
+PPOFF (Pre-Process OFFset) is the end of the last argument copied by stage B
+
+Algorithm:
+
+- Stage A is implicit when ARG-STATE is initialized.
+- Stage B generates each arg's preprocess operations relative to FPOFF, which is not known yet.
+- Stage C generates each arg's TN, which may not be known yet if it depends on FPOFF.
+- After Stage C, FPOFF is known.
+- Generate preprocess operations with FPOFF.
+- Generate TNs with FPOFF.
+
+NOTE:
+- Struct value return is not implemented yet.
+- Variadic arg may or may not work."
   (let ((arg-state (make-arg-state))
         (tns nil)
         (defers nil)

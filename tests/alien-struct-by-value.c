@@ -135,6 +135,16 @@ long long large_align_8_get_m0_2(long long _i0, long long _i1, long long _i2, lo
   return m.m0;
 }
 
+/** On ARM64, m is passed as pointer on stack.*/
+long long large_align_8_get_m0_3(long long _i0, long long _i1, long long _i2, long long _i3,
+                                 long long _i4, long long _i5, long long _i6, long long _i7,
+                                 int _i8, struct large_align_8 m) {
+  (void) _i0; (void) _i1; (void) _i2; (void) _i3;
+  (void) _i4; (void) _i5; (void) _i6; (void) _i7;
+  (void) _i8;
+  return m.m0;
+}
+
 /** Mutates the input struct. Volatile to avoid compiler optimizing away the mutation.*/
 void large_align_8_mutate(volatile struct large_align_8 m) {
   m.m0++;

@@ -123,6 +123,11 @@
   (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
   (i4 long-long) (i5 long-long) (i6 long-long) (i7 long-long)
   (m (struct large-align-8)))
+(defar large-align-8-get-m0-3 (integer 64)
+  (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
+  (i4 long-long) (i5 long-long) (i6 long-long) (i7 long-long)
+  (i8 int)
+  (m (struct large-align-8)))
 (defar large-align-8-mutate void (m (struct large-align-8)))
 (with-test (:name :struct-by-value-large-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct large-align-8)))
@@ -143,7 +148,9 @@
                 ,@basics
                 (assert (= +magic-number+ (large-align-8-get-m0-1 0 m)))
                 (assert (= +magic-number+ (large-align-8-get-m0-2
-                                           0 1 2 3 4 5 6 7 m)))))))
+                                           0 1 2 3 4 5 6 7 m)))
+                (assert (= +magic-number+ (large-align-8-get-m0-3
+                                           0 1 2 3 4 5 6 7 8 m)))))))
       ;; Initialize struct
       (set-members)
       ;; Test that struct is correctly passed
