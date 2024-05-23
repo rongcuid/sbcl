@@ -629,6 +629,12 @@
         (stack-pointer (make-stack-pointer-tn)))
     (multiple-value-bind (nsp stack-frame-size arg-tns result-tns preprocess-tns)
         (make-call-out-tns type)
+      ;; Either there's no preprocess step, or there's one for each argument
+      (assert (or (not preprocess-tns) (= (length arg-tns) (length preprocess-tns)))
+              (arg-tns preprocess-tns)
+              "SBCL BUG: (%ALIEN-FUNCALL) ~
+length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
+              (length arg-tns) (length preprocess-tns))
       #+x86
       (vop set-fpu-word-for-c call block)
       ;; Save the stack pointer, it will get aligned and subtracting

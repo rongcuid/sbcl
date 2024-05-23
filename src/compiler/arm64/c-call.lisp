@@ -633,13 +633,12 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
     (values tn deferred)))
 
 (defun stage-c (arg-types arg-state variadic)
+  ;; FIXME: check whether variadic functions actually work
   (collect ((tns) (defers))
-      (loop for i from 0
-              for arg-type in arg-types
-              do (multiple-value-bind (tn defer)
-                     (assign-arguments arg-type arg-state #+darwin (eql i variadic))
-                   (tns tn)
-                   (defers defer)))
+    (loop for i from 0 for arg-type in arg-types
+          do (multiple-value-bind (tn defer)
+                 (assign-arguments arg-type arg-state #+darwin (eql i variadic))
+               (tns tn) (defers defer)))
     (values (tns) (defers))))
 
 (defun make-call-out-tns (type)
@@ -647,35 +646,33 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
 
 Implementation notes:
 - Stage A is implicit when ARG-STATE is initialized."
-  (let* ((arg-state (make-arg-state)))
+  (let ((arg-state (make-arg-state))
+        (tns nil)
+        (defers nil)
+        #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
+    ;; Stage B, updating arg-state-pp-state with preprocessing emitters.
+    (stage-b (alien-fun-type-arg-types type) (arg-state-pp-state arg-state))
+    ;; Stage C, generating TNs and deferred TNs
+    (setf (values tns defers) (stage-c (alien-fun-type-arg-types type) arg-state variadic))
+    ;; Now we know how much stack Stage C takes, we know where Stage B copies can go.
+    ;; We are pedantic and align to the maximum possible requirement.
+    (setf (arg-state-stack-frame-size arg-state)
+          (align-up (arg-state-stack-frame-size arg-state) 16))
+    ;; Finally, collect all the TNs and preprocess emitters.
     (collect ((arg-tns)
               (preprocess-tns))
-      (let ((tns nil)
-            (defers nil)
-            #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
-        ;; Stage B
-        (stage-b (alien-fun-type-arg-types type) (arg-state-pp-state arg-state))
-        ;; Stage C
-        (multiple-value-bind (ts ds)
-            (stage-c (alien-fun-type-arg-types type) arg-state variadic)
-          (setf tns ts) (setf defers ds))
-        ;; Now Stage C is done, generate preprocesses knowing how much stack is needed.
-        ;; We are pedantic and align to the maximum possible requirement.
-        (setf (arg-state-stack-frame-size arg-state)
-              (align-up (arg-state-stack-frame-size arg-state) 16))
-        ;; Run deferred operations
-        (let ((fpoff (arg-state-stack-frame-size arg-state)))
-          ;; Generate preprocess-tns by applying FPOFF.
-          (dolist (pp (pp-state-pps (arg-state-pp-state arg-state)))
-            (preprocess-tns (if pp (funcall pp fpoff))))
-          ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
-          (loop for tn in tns
+      (let ((fpoff (arg-state-stack-frame-size arg-state)))
+        ;; Apply FPOFF to preprocess operations
+        (dolist (pp (pp-state-pps (arg-state-pp-state arg-state)))
+          (preprocess-tns (if pp (funcall pp fpoff))))
+        ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
+        (loop for tn in tns
               for defer in defers
               do (arg-tns
                   (if tn tn (funcall defer fpoff)))))
-        ;; Deferred operations are done. Update frame size to account for it.
-        (setf (arg-state-stack-frame-size arg-state)
-              (+ (arg-state-stack-frame-size arg-state) (pp-state-ppoff (arg-state-pp-state arg-state)))))
+      ;; Deferred operations are done. Update frame size to account for it.
+      (setf (arg-state-stack-frame-size arg-state)
+            (+ (arg-state-stack-frame-size arg-state) (pp-state-ppoff (arg-state-pp-state arg-state))))
       ;; On darwin, total stack size is padded to multiples of 8 bytes
       #+darwin
       (let ((frame-size (arg-state-stack-frame-size arg-state)))
