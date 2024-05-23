@@ -358,21 +358,26 @@ Implementation notes:
         - The only safe alignment adjustment is to increase alignment
         - It's thus safe to use adjusted alignment for the copy (though it wastes some space)"
   (declare (type integer ppoff))
-  (let* ((bits (alien-type-bits type))
-         (size (ceiling bits n-byte-bits))
-         (actual-align (round (alien-type-alignment type) n-byte-bits))
-         (ppoff (align-up ppoff actual-align))
-         (alloc-size (align-up size (max actual-align n-word-bytes))))
-    ;; Stage B matches the first rule for each argument, or pass argument unmodified.
-    ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
+  (let ((bits (alien-type-bits type)))
     (cond
-      ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
-      ((and (alien-record-type-p type) (> size 16))
-       (let ((pp (lambda (fpoff)
-                  (lambda (value node block nsp)
-                    (move-struct-to-stack value size (+ fpoff ppoff) node block nsp)))))
-         (values pp ppoff alloc-size)))
-      ;; Unmodified
+      ;; If sized
+      (bits
+       (let* ((size (ceiling bits n-byte-bits))
+              (actual-align (round (alien-type-alignment type) n-byte-bits))
+              (ppoff (align-up ppoff actual-align))
+              (alloc-size (align-up size (max actual-align n-word-bytes))))
+         ;; Stage B matches the first rule for each argument, or pass argument unmodified.
+         ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
+         (cond
+           ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
+           ((and (alien-record-type-p type) (> size 16))
+            (let ((pp (lambda (fpoff)
+                        (lambda (value node block nsp)
+                          (move-struct-to-stack value size (+ fpoff ppoff) node block nsp)))))
+              (values pp ppoff alloc-size)))
+           ;; Unmodified
+           (t nil))))
+      ;; For whatever reason, function (FUN) types have no size.
       (t nil))))
 
 (defun stage-b (arg-types pp-state)
@@ -386,7 +391,10 @@ Implementation notes:
         do
            (push pp (pp-state-pps pp-state))
            (push ppoff (pp-state-ppoffs pp-state))
-           (when pp (setf (pp-state-ppoff pp-state) (+ ppoff size))))
+           (when pp
+             (assert (and (integerp ppoff) (integerp size)) (ppoff size)
+                     "SBCL BUG: STAGE-B PPOFF (~A) and SIZE (~A) are not integers" ppoff size)
+             (setf (pp-state-ppoff pp-state) (+ ppoff size))))
   (pp-state-flip pp-state))
 
 ;;;; Stage C
