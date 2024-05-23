@@ -102,8 +102,7 @@
   boolean
   (foldable flushable no-verify-arg-count))
 
-(defknown (sb-impl::instance-sxhash sb-impl::%instance-sxhash)
-    (instance) hash-code (flushable))
+(defknown sb-impl::instance-sxhash (instance) hash-code (flushable))
 ;;; SXHASH values on numbers and strings are predictable, therefore the next batch
 ;;; of functions are flushable. Perhaps not entirely obviously, symbol hashes are
 ;;; predictable because we hash by name.
@@ -758,7 +757,7 @@
   (movable foldable flushable))
 
 (defknown (%sin %cos %tanh %sin-quick %cos-quick)
-  (double-float) (double-float $-1.0d0 $1.0d0)
+  (double-float) (double-float -1.0d0 1.0d0)
   (movable foldable flushable))
 
 (defknown (%asin %atan)
@@ -768,23 +767,23 @@
   (movable foldable flushable))
 
 (defknown (%acos)
-  (double-float) (double-float $0.0d0 #.(coerce pi 'double-float))
+  (double-float) (double-float 0.0d0 #.(coerce pi 'double-float))
   (movable foldable flushable))
 
 (defknown (%cosh)
-  (double-float) (double-float $1.0d0)
+  (double-float) (double-float 1.0d0)
   (movable foldable flushable))
 
 (defknown (%acosh %exp %sqrt)
-  (double-float) (double-float $0.0d0)
+  (double-float) (double-float 0.0d0)
   (movable foldable flushable))
 
 (defknown %expm1
-  (double-float) (double-float $-1d0)
+  (double-float) (double-float -1d0)
   (movable foldable flushable))
 
 (defknown (%hypot)
-  (double-float double-float) (double-float $0d0)
+  (double-float double-float) (double-float 0d0)
   (movable foldable flushable))
 
 (defknown (%pow)

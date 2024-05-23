@@ -211,11 +211,12 @@
       `(%cas-symbol-global-value symbol old new)
       (sb-c::give-up-ir1-transform)))
 
+(defmacro symbol-value-slot-ea (sym)    ; SYM is a TN
+  `(ea (- (* symbol-value-slot n-word-bytes) other-pointer-lowtag)
+       ,sym))
+
 (macrolet ((access-wired-tls-val (sym) ; SYM is a symbol
              `(thread-tls-ea (load-time-tls-offset ,sym)))
-           (symbol-value-slot-ea (sym) ; SYM is a TN
-             `(ea (- (* symbol-value-slot n-word-bytes) other-pointer-lowtag)
-                  ,sym))
            (load-oldval ()
              `(if (sc-is old immediate)
                   (inst mov rax (encode-value-if-immediate old))
@@ -287,12 +288,12 @@
   #+sb-thread
   (progn
     ;; This code is tested by 'codegen.impure.lisp'
-    (defun emit-symeval (value symbol symbol-reg check-boundp vop)
+    (defun emit-symeval (value symbol symbol-ref symbol-reg check-boundp vop)
       (let* ((known-symbol-p (sc-is symbol constant immediate))
              (known-symbol (and known-symbol-p (tn-value symbol))))
         ;; In order from best to worst.
         (cond
-          ((symbol-always-has-tls-value-p known-symbol (sb-c::vop-node vop))
+          ((symbol-always-has-tls-value-p symbol-ref (sb-c::vop-node vop))
            (setq symbol-reg nil)
            (inst mov value (access-wired-tls-val known-symbol)))
           (t
@@ -359,6 +360,7 @@
       (:translate symbol-value)
       (:policy :fast-safe)
       (:args (symbol :scs (descriptor-reg constant immediate) :to (:result 1)))
+      (:arg-refs symbol-ref)
       ;; TODO: use no temp if the symbol is known to be thread-local
       ;; (probably IR1 should go SYMBOL-VALUE -> SYMBOL-TLS-VALUE)
       (:temporary (:sc descriptor-reg) symbol-reg)
@@ -367,7 +369,7 @@
       (:save-p :compute-only)
       (:variant-vars check-boundp)
       (:variant t)
-      (:generator 9 (emit-symeval value symbol symbol-reg check-boundp vop)))
+      (:generator 9 (emit-symeval value symbol symbol-ref symbol-reg check-boundp vop)))
 
     (define-vop (fast-symbol-value symbol-value)
     ;; KLUDGE: not really fast, in fact, because we're going to have to
@@ -577,6 +579,21 @@
     (storew tls-index bsp (- binding-symbol-slot binding-size))
     (inst mov (thread-tls-ea tls-index) val)))
 
+(defun bind (bsp symbol tmp)
+  (inst mov bsp (* binding-size n-word-bytes))
+  (inst xadd (thread-slot-ea thread-binding-stack-pointer-slot) bsp)
+  (let* ((tls-index (load-time-tls-offset symbol))
+         (tls-cell (thread-tls-ea tls-index)))
+    ;; Too bad we can't use "XCHG [thread + disp], val" to write new value
+    ;; and read the old value in one step. It will violate the constraints
+    ;; prescribed in the internal documentation on special binding.
+    (inst mov tmp tls-cell)
+    (storew tmp bsp binding-value-slot)
+    ;; Indices are small enough to be written as :DWORDs which avoids
+    ;; a REX prefix if 'bsp' happens to be any of the low 8 registers.
+    (inst mov :dword (ea (ash binding-symbol-slot word-shift) bsp) tls-index)
+    (values tls-cell tmp)))
+
 (define-vop (bind) ; bind a known symbol
   (:args (val :scs (any-reg descriptor-reg)
               :load-if (not (let ((imm (encode-value-if-immediate val)))
@@ -585,19 +602,27 @@
   (:temporary (:sc unsigned-reg) bsp tmp)
   (:info symbol)
   (:generator 10
-    (inst mov bsp (* binding-size n-word-bytes))
-    (inst xadd (thread-slot-ea thread-binding-stack-pointer-slot) bsp)
-    (let* ((tls-index (load-time-tls-offset symbol))
-           (tls-cell (thread-tls-ea tls-index)))
-      ;; Too bad we can't use "XCHG [thread + disp], val" to write new value
-      ;; and read the old value in one step. It will violate the constraints
-      ;; prescribed in the internal documentation on special binding.
-      (inst mov tmp tls-cell)
-      (storew tmp bsp binding-value-slot)
-      ;; Indices are small enough to be written as :DWORDs which avoids
-      ;; a REX prefix if 'bsp' happens to be any of the low 8 registers.
-      (inst mov :dword (ea (ash binding-symbol-slot word-shift) bsp) tls-index)
-      (inst mov :qword tls-cell (encode-value-if-immediate val))))))
+    (inst mov :qword (bind bsp symbol tmp) (encode-value-if-immediate val))))
+
+(define-vop (rebind)
+  (:temporary (:sc unsigned-reg) bsp tls-value)
+  (:temporary (:sc descriptor-reg
+               :unused-if (eq (immediate-constant-sc symbol) immediate-sc-number))
+              symbol-reg)
+  (:info symbol)
+  (:node-var node)
+  (:vop-var vop)
+  (:generator 10
+    (multiple-value-bind (tls-cell tls-value) (bind bsp symbol tls-value)
+      (unless (symbol-always-has-tls-value-p symbol node)
+        (unless (eq (tn-kind symbol-reg) :unused)
+          (load-constant vop (emit-constant symbol) symbol-reg))
+        (inst cmp tls-value no-tls-value-marker)
+        (inst cmov :e tls-value
+              (if (eq (tn-kind symbol-reg) :unused)
+                  (symbol-slot-ea symbol symbol-value-slot)
+                  (symbol-value-slot-ea symbol-reg)))
+        (inst mov tls-cell tls-value))))))
 
 #-sb-thread
 (define-vop (dynbind)
