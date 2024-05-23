@@ -314,6 +314,16 @@
              (reg-h-tn (make-wired-tn* 'unsigned-byte-64 unsigned-reg-sc-number (1+ next-reg))))
          (sb-c::vop move-struct-double-dword-to-registers node block temp-tn reg-l-tn reg-h-tn))))))
 
+;;; Passing a large struct at FP+FROM as a pointer by stack at FP+TO.
+(define-vop (pass-large-struct-by-stack)
+  (:args (fp :scs (any-reg)))
+  (:info from-fpoff to-fpoff)
+  (:temporary (:scs (non-descriptor-reg)) addr)
+  (:generator
+   0
+   (inst add addr fp from-fpoff)
+   (inst str addr (@ fp (load-store-offset to-fpoff)))))
+
 ;;;; Stage B
 (defun pre-padding-and-extension (type state)
   "Registers Stage B operation for one argument. Returns:
@@ -430,6 +440,7 @@ Implementation notes:
          (reg-args (arg-state-num-register-args state))
          (pass-by-reg (< reg-args +max-register-args+)))
     ;; Basically INT-ARG, except that it uses the FPOFF from Stage B.
+    (assert fpoff (fpoff) "SBCL BUG: FPOFF of NIL is invalid")
     (cond
       (pass-by-reg
        ;; C.9
@@ -443,18 +454,11 @@ Implementation notes:
        ;; C.13
        (setf (arg-state-num-register-args state) +max-register-args+)
        ;; C.14 passing pointer by stack.
-       (let ((frame-size (align-up (arg-state-stack-frame-size state) n-word-bytes)))
-         (setf (arg-state-stack-frame-size state) (+ frame-size n-word-bytes))
+       (let ((arg-fpoff (align-up (arg-state-stack-frame-size state) n-word-bytes)))
+         (setf (arg-state-stack-frame-size state) (+ arg-fpoff n-word-bytes))
          (lambda (value node block nsp)
            (declare (ignore value))
-           (let ((addr-tn (sb-c:make-representation-tn
-                           (primitive-type-or-lose 'system-area-pointer)
-                           sap-reg-sc-number)))
-             (sb-c::vop load-stack-ptr node block nsp fpoff addr-tn)
-             (move-to-stack-location addr-tn n-word-bytes frame-size
-                                     'system-area-pointer
-                                     sap-reg-sc-number
-                                     node block nsp))))))))
+           (sb-c::vop pass-large-struct-by-stack node block nsp fpoff arg-fpoff)))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   ;; Darwin allows an argument to take a stack slot of < 8 bytes.
@@ -601,6 +605,8 @@ Implementation notes:
                      (pre-padding-and-extension arg-type arg-state)
                    (preprocess-tns pp)
                    (push fpoff (arg-state-fpoffs arg-state))))
+        ;; Reverse the fpoffs list so it's FIFO
+        (setf (arg-state-fpoffs arg-state) (nreverse (arg-state-fpoffs arg-state)))
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)

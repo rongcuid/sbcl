@@ -116,23 +116,34 @@
   (let ((defs (loop for i upto 15 collect `(def-large-align-8-get ,i))))
     `(progn ,@defs)))
 (defs-large-align-8-get)
+(defar large-align-8-get-m0-1 (integer 64)
+  (i0 long-long)
+  (m (struct large-align-8)))
+(defar large-align-8-get-m0-2 (integer 64)
+  (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
+  (i4 long-long) (i5 long-long) (i6 long-long) (i7 long-long)
+  (m (struct large-align-8)))
 (defar large-align-8-mutate void (m (struct large-align-8)))
 (with-test (:name :struct-by-value-large-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct large-align-8)))
-    (macrolet ((set-members ()
-                 "Sets member mN's value to N"
-                 (loop for i upto 15
-                       collect (let ((memb (sb-int:symbolicate "M" i)))
-                                 `(setf (slot m ',memb) ,i))
-                         into setfs
-                       finally (return `(progn ,@setfs))))
-               (test-members ()
-                 "Test that each member has correct value"
-                 (loop for i upto 15
-                       collect (let ((f (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
-                                 `(assert (= ,i (,f m))))
-                         into tests
-                       finally (return `(progn ,@tests)))))
+    (macrolet
+        ((set-members ()
+           "Sets member mN's value to N"
+           (loop for i upto 15
+                 collect (let ((memb (sb-int:symbolicate "M" i)))
+                           `(setf (slot m ',memb) ,(+ i +magic-number+)))
+                   into setfs
+                 finally (return `(progn ,@setfs))))
+         (test-members ()
+           "Test that each member has correct value"
+           (let ((basics (loop for i upto 15
+                               collect (let ((f (sb-int:symbolicate "LARGE-ALIGN-8-GET-M" i)))
+                                         `(assert (= ,(+ i +magic-number+) (,f m)))))))
+             `(progn
+                ,@basics
+                (assert (= +magic-number+ (large-align-8-get-m0-1 0 m)))
+                (assert (= +magic-number+ (large-align-8-get-m0-2
+                                           0 1 2 3 4 5 6 7 m)))))))
       ;; Initialize struct
       (set-members)
       ;; Test that struct is correctly passed
