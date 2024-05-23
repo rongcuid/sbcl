@@ -167,7 +167,7 @@
 ;;;;    - NOTE: that's paraphrased from Mac documentation. I think it's more like ``uint64_t *'' -- Rongcui
 ;;;;
 ;;;; Ref:
-;;;; [AAPCS64] Procedure Call Standard for the Arm® 64-bit Architecture (AArch64), 2023Q3, ARM
+;;;; [AAPCS64] Procedure Call Standard for the Arm(R) 64-bit Architecture (AArch64), 2023Q3, ARM
 ;;;; [MACABI] Writing ARM64 code for Apple platforms, https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
 
 
@@ -221,13 +221,13 @@
   (:args (from-ptr :scs (sap-reg)) ;; NL2
          (fp :scs (any-reg))) ;; NL1
   (:info size fpoff)
-  (:temporary (:scs (non-descriptor-reg)) temp) ;; NL0
+  (:temporary (:scs (non-descriptor-reg)) temp temp-h) ;; NL0
   (:generator
    0
    ;; Temporarily hold the source addr
    ;;(inst mov src from-ptr)
    ;; Copy data
-   (let ((chunks '(8 4 2 1)))
+   (let ((chunks '(16 8 4 2 1)))
      ;; Unrolls copy loop
      (do ((remaining size)
           (soff 0))
@@ -236,6 +236,9 @@
              (src-addr (@ from-ptr soff))
              (dst-addr (@ fp (+ fpoff soff))))
          (ecase chunk
+           (16
+            (inst ldp temp temp-h src-addr)
+            (inst stp temp temp-h dst-addr))
            (8
             (inst ldr temp src-addr)
             (inst str temp dst-addr))
@@ -376,6 +379,20 @@ This allows copied data to reside after the last argument.
          (values pp ppoff alloc-size)))
       ;; Unmodified
       (t nil))))
+
+(defun stage-b (arg-types pp-state)
+  "Stage B."
+  (loop for i from 0
+        for arg-type in arg-types
+        for (pp ppoff size) = (multiple-value-list
+                               (pre-padding-and-extension
+                                arg-type
+                                (pp-state-ppoff pp-state)))
+        do
+           (push pp (pp-state-pps pp-state))
+           (push ppoff (pp-state-ppoffs pp-state))
+           (when pp (setf (pp-state-ppoff pp-state) (+ ppoff size))))
+  (pp-state-flip pp-state))
 
 ;;;; Stage C
 
@@ -615,6 +632,16 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
     (pop (pp-state-ppoffs (arg-state-pp-state state)))
     (values tn deferred)))
 
+(defun stage-c (arg-types arg-state variadic)
+  (collect ((tns) (defers))
+      (loop for i from 0
+              for arg-type in arg-types
+              do (multiple-value-bind (tn defer)
+                     (assign-arguments arg-type arg-state #+darwin (eql i variadic))
+                   (tns tn)
+                   (defers defer)))
+    (values (tns) (defers))))
+
 (defun make-call-out-tns (type)
   "Entry point of alien backend.
 
@@ -624,31 +651,14 @@ Implementation notes:
     (collect ((arg-tns)
               (preprocess-tns))
       (let ((tns nil)
-            (deferred-tns nil)
+            (defers nil)
             #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
         ;; Stage B
-        (loop for i from 0
-              for arg-type in (alien-fun-type-arg-types type)
-              for (pp ppoff size) = (multiple-value-list
-                                     (pre-padding-and-extension
-                                      arg-type
-                                      (pp-state-ppoff (arg-state-pp-state arg-state))))
-              do
-              (push pp (pp-state-pps (arg-state-pp-state arg-state)))
-              (push ppoff (pp-state-ppoffs (arg-state-pp-state arg-state)))
-              (when pp
-                (setf (pp-state-ppoff (arg-state-pp-state arg-state)) (+ ppoff size))))
-        (pp-state-flip (arg-state-pp-state arg-state))
+        (stage-b (alien-fun-type-arg-types type) (arg-state-pp-state arg-state))
         ;; Stage C
-        (loop for i from 0
-              for arg-type in (alien-fun-type-arg-types type)
-              do (multiple-value-bind (tn deferred-tn)
-                     (assign-arguments arg-type arg-state #+darwin (eql i variadic))
-                   (push tn tns)
-                   (push deferred-tn deferred-tns)))
-        ;; Reverse stage C lists so they are FIFO
-        (setf tns (nreverse tns))
-        (setf deferred-tns (nreverse deferred-tns))
+        (multiple-value-bind (ts ds)
+            (stage-c (alien-fun-type-arg-types type) arg-state variadic)
+          (setf tns ts) (setf defers ds))
         ;; Now Stage C is done, generate preprocesses knowing how much stack is needed.
         ;; We are pedantic and align to the maximum possible requirement.
         (setf (arg-state-stack-frame-size arg-state)
@@ -657,12 +667,12 @@ Implementation notes:
         (let ((fpoff (arg-state-stack-frame-size arg-state)))
           ;; Generate preprocess-tns by applying FPOFF.
           (dolist (pp (pp-state-pps (arg-state-pp-state arg-state)))
-            (when pp (preprocess-tns (funcall pp fpoff))))
+            (preprocess-tns (if pp (funcall pp fpoff))))
           ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
           (loop for tn in tns
-              for deferred in deferred-tns
+              for defer in defers
               do (arg-tns
-                  (if tn tn (funcall deferred fpoff)))))
+                  (if tn tn (funcall defer fpoff)))))
         ;; Deferred operations are done. Update frame size to account for it.
         (setf (arg-state-stack-frame-size arg-state)
               (+ (arg-state-stack-frame-size arg-state) (pp-state-ppoff (arg-state-pp-state arg-state)))))

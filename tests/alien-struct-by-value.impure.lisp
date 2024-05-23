@@ -22,7 +22,10 @@
 (load-shared-object (truename "alien-struct-by-value.so"))
 ;;; This forces DEFINE-ALIEN-ROUTINE to be evaluated at runtime so errors can be caught
 (defmacro defar (&body args)
-  `(eval '(define-alien-routine ,@args)))
+  `(progn
+     (format t "DEFINE-ALIEN-ROUTINE ~A~%" ',(first args))
+     (eval '(define-alien-routine ,@args))
+     (disassemble ',(first args))))
 ;;; Tiny struct, alignment 8
 (define-alien-type nil (struct tiny-align-8 (m0 (integer 64))))
 (defar tiny-align-8-get-m0 (integer 64) (m (struct tiny-align-8)))
@@ -119,7 +122,6 @@
 (defar large-align-8-get-m0-1 (integer 64)
   (i0 long-long)
   (m (struct large-align-8)))
-(disassemble 'large-align-8-get-m0-1)
 (defar large-align-8-get-m0-2 (integer 64)
   (i0 long-long) (i1 long-long) (i2 long-long) (i3 long-long)
   (i4 long-long) (i5 long-long) (i6 long-long) (i7 long-long)
