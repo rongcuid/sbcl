@@ -177,17 +177,28 @@
 
 (defconstant +max-register-args+ 8)
 
+(defstruct pp-state
+  ;; List of preprocess lambdas
+  (pps nil)
+  ;; Stage B copy offset
+  (ppoff 0)
+  ;; Stage B copy offset for each argument
+  (ppoffs nil))
+
+(defun pp-state-flip (pp-state)
+  "At the end of Stage B, the state is reversed. Flip it back for processing."
+  (declare (type pp-state pp-state))
+  (setf (pp-state-pps pp-state) (nreverse (pp-state-pps pp-state)))
+  (setf (pp-state-ppoffs pp-state) (nreverse (pp-state-ppoffs pp-state))))
+
 (defstruct arg-state
+  (pp-state (make-pp-state))
   ;; NGRN
   (num-register-args 0)
   ;; NSRN
   (fp-registers 0)
   ;; NSAA = SP + stack-frame-size
-  (stack-frame-size 0)
-  ;; Stage B argument offset
-  (sboff 0)
-  ;; If Stage B performs a copy, where they are
-  (sboffs nil))
+  (stack-frame-size 0))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -327,16 +338,18 @@
    (inst str addr (@ fp (load-store-offset to-fpoff)))))
 
 ;;;; Stage B
-(defun pre-padding-and-extension (type state)
+(defun pre-padding-and-extension (type ppoff)
   "Registers Stage B operation for one argument. Returns:
 - NIL if unmodified
-- PREPROCESS-TN-BUILDER and SBOFF
+- PREPROCESS-TN-BUILDER
+
+TODO update docs
 
 PREPROCESS-TN-BUILDER is a function that takes a single argument, FPOFF, to generate ~
 a functional TN to emit instructions for the preprocessing step. ~
-SBOFF is the offset from FPOFF.
+PPOFF, the offset from FPOFF, is written to state.
 FPOFF is the beginning of the first argument copied by Stage B.
-Argument will be copied to FP + FPOFF + SBOFF.
+Argument will be copied to FP + FPOFF + PPOFF.
 
 Implementation notes:
 
@@ -350,22 +363,22 @@ This allows copied data to reside after the last argument.
         - At this stage, it is easier to implement as we do not have an easy way to extract natural alignment
         - The only safe alignment adjustment is to increase alignment
         - It's thus safe to use adjusted alignment for the copy (though it wastes some space)"
+  (declare (type integer ppoff))
   (let* ((bits (alien-type-bits type))
          (size (ceiling bits n-byte-bits))
          (actual-align (round (alien-type-alignment type) n-byte-bits))
-         (sboff (align-up (arg-state-sboff state) actual-align))
+         (ppoff (align-up ppoff actual-align))
          (alloc-size (align-up size (max actual-align n-word-bytes))))
     ;; Stage B matches the first rule for each argument, or pass argument unmodified.
     ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
     (cond
       ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
       ((and (alien-record-type-p type) (> size 16))
-       (setf (arg-state-sboff state) (+ sboff alloc-size))
-       (let ((preprocess
-               (lambda (fpoff)
-                (lambda (value node block nsp)
-                 (move-struct-to-stack value size (+ fpoff sboff) node block nsp)))))
-         (values preprocess sboff)))
+       (let ((pp (lambda (fpoff)
+                  (lambda (value node block nsp)
+                    (format t "EMIT PP: FPOFF = ~A PPOFF = ~A~%" fpoff ppoff)
+                    (move-struct-to-stack value size (+ fpoff ppoff) node block nsp)))))
+         (values pp ppoff alloc-size)))
       ;; Unmodified
       (t nil))))
 
@@ -449,7 +462,7 @@ Returns TN-GENERATOR, which is a function taking FPOFF and returns a functional 
 Implementation Note:
 - The generation of functional TN is deferred until we know how much stack is required for passing arguments"
   (declare (ignore type))
-  (let* ((sboff (first (arg-state-sboffs state)))
+  (let* ((ppoff (first (pp-state-ppoffs (arg-state-pp-state state))))
          (reg-args (arg-state-num-register-args state))
          (pass-by-reg (< reg-args +max-register-args+)))
     ;; Basically INT-ARG, except that it uses the offset computed from Stage B.
@@ -462,7 +475,7 @@ Implementation Note:
            (declare (ignore value))
            ;; Copy argument to register
            (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
-             (sb-c::vop load-stack-ptr node block nsp (+ fpoff sboff) arg-tn)))))
+             (sb-c::vop load-stack-ptr node block nsp (+ fpoff ppoff) arg-tn)))))
       (t
        ;; C.13
        (setf (arg-state-num-register-args state) +max-register-args+)
@@ -474,7 +487,7 @@ Implementation Note:
            (lambda (value node block nsp)
              (declare (ignore value))
              (sb-c::vop pass-large-struct-by-stack node block nsp
-                        (+ fpoff sboff) arg-fpoff))))))))
+                        (+ fpoff ppoff) arg-fpoff))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   ;; Darwin allows an argument to take a stack slot of < 8 bytes.
@@ -603,8 +616,8 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
           (arg-state-fp-registers state) +max-register-args+))
   ;; Invoke
   (multiple-value-bind (tn deferred) (invoke-alien-type-method :arg-tn type state)
-    ;; Pop the SBOFFS list so its head is always current argument
-    (pop (arg-state-sboffs state))
+    ;; Pop the PPOFFS list so its head is always current argument
+    (pop (pp-state-ppoffs (arg-state-pp-state state)))
     (values tn deferred)))
 
 (defun make-call-out-tns (type)
@@ -615,21 +628,25 @@ Implementation notes:
   (let* ((arg-state (make-arg-state)))
     (collect ((arg-tns)
               (preprocess-tns))
-      (let ((preprocesses nil)
-            (tns nil)
+      (let ((tns nil)
             (deferred-tns nil)
             #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
         ;; Stage B
+        (format t ">> B~%")
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do (multiple-value-bind (pp sboff)
-                     (pre-padding-and-extension arg-type arg-state)
-                   (push pp preprocesses)
-                   (push sboff (arg-state-sboffs arg-state))))
-        ;; Reverse stage B lists so they are FIFO
-        (setf (arg-state-sboffs arg-state) (nreverse (arg-state-sboffs arg-state)))
-        (setf preprocesses (nreverse preprocesses))
+              for (pp ppoff size) = (multiple-value-list
+                                     (pre-padding-and-extension
+                                      arg-type
+                                      (pp-state-ppoff (arg-state-pp-state arg-state))))
+              do
+              (push pp (pp-state-pps (arg-state-pp-state arg-state)))
+              (push ppoff (pp-state-ppoffs (arg-state-pp-state arg-state)))
+              (setf (pp-state-ppoff (arg-state-pp-state arg-state)) (+ ppoff size)))
+        (pp-state-flip (arg-state-pp-state arg-state))
+        (format t "<< B, PP-STATE ~A~%" (arg-state-pp-state arg-state))
         ;; Stage C
+        (format t ">> C~%")
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
               do (multiple-value-bind (tn deferred-tn)
@@ -639,21 +656,26 @@ Implementation notes:
         ;; Reverse stage C lists so they are FIFO
         (setf tns (nreverse tns))
         (setf deferred-tns (nreverse deferred-tns))
+        (format t "<< C~%")
         ;; Now Stage C is done, generate preprocesses knowing how much stack is needed.
         ;; We are pedantic and align to the maximum possible requirement.
         (setf (arg-state-stack-frame-size arg-state)
               (align-up (arg-state-stack-frame-size arg-state) 16))
-        ;; Generate preprocess-tns by applying FPOFF
-        (dolist (pp preprocesses)
-          (when pp (preprocess-tns (funcall pp (arg-state-stack-frame-size arg-state)))))
-        ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
-        (loop for tn in tns
+        (format t ">> D~%")
+        ;; Run deferred operations
+        (let ((fpoff (arg-state-stack-frame-size arg-state)))
+          ;; Generate preprocess-tns by applying FPOFF.
+          (dolist (pp (pp-state-pps (arg-state-pp-state arg-state)))
+            (when pp (preprocess-tns (funcall pp fpoff))))
+          ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
+          (loop for tn in tns
               for deferred in deferred-tns
               do (arg-tns
-                  (if tn tn (funcall deferred (arg-state-stack-frame-size arg-state)))))
+                  (if tn tn (funcall deferred fpoff)))))
+        (format t "<< D~%")
         ;; Deferred operations are done. Update frame size to account for it.
         (setf (arg-state-stack-frame-size arg-state)
-              (+ (arg-state-stack-frame-size arg-state) (arg-state-sboff arg-state))))
+              (+ (arg-state-stack-frame-size arg-state) (pp-state-ppoff (arg-state-pp-state arg-state)))))
       ;; On darwin, total stack size is padded to multiples of 8 bytes
       #+darwin
       (let ((frame-size (arg-state-stack-frame-size arg-state)))
