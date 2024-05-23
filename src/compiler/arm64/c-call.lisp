@@ -184,8 +184,10 @@
   (fp-registers 0)
   ;; NSAA = SP + stack-frame-size
   (stack-frame-size 0)
+  ;; Stage B argument offset
+  (sboff 0)
   ;; If Stage B performs a copy, where they are
-  (fpoffs nil))
+  (sboffs nil))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -328,13 +330,18 @@
 (defun pre-padding-and-extension (type state)
   "Registers Stage B operation for one argument. Returns:
 - NIL if unmodified
-- PREPROCESS-TN and FPOFF
+- PREPROCESS-TN-BUILDER and SBOFF
 
-PREPROCESS-TN is a functional TN to emit instructions for the preprocessing step. ~
-FPOFF is the frame pointer offset for the replaced argument.
+PREPROCESS-TN-BUILDER is a function that takes a single argument, FPOFF, to generate ~
+a functional TN to emit instructions for the preprocessing step. ~
+SBOFF is the offset from FPOFF.
+FPOFF is the beginning of the first argument copied by Stage B.
+Argument will be copied to FP + FPOFF + SBOFF.
 
 Implementation notes:
 
+- PREPROCESS-TN-BUILDER defers the code generation of Stage B after Stage C. ~
+This allows copied data to reside after the last argument.
 - Does not support pure scalable types (B.1, B.3)
 - Does not support unknown-sized composite types (B.2)
 - For alignment-adjusted types (B.6):
@@ -346,17 +353,19 @@ Implementation notes:
   (let* ((bits (alien-type-bits type))
          (size (ceiling bits n-byte-bits))
          (actual-align (round (alien-type-alignment type) n-byte-bits))
-         (fpoff (align-up (arg-state-stack-frame-size state) actual-align))
+         (sboff (align-up (arg-state-sboff state) actual-align))
          (alloc-size (align-up size n-word-bytes)))
     ;; Stage B matches the first rule for each argument, or pass argument unmodified.
     ;; Does not support HFA, HVA, scalable types, unknown-sized composite types.
     (cond
       ;; B.4 and B.5. B.5 is implicit as it's padded in Stage C.
       ((and (alien-record-type-p type) (> size 16))
-       (setf (arg-state-stack-frame-size state) (+ fpoff alloc-size))
-       (let ((preprocess (lambda (value node block nsp)
-                           (move-struct-to-stack value size fpoff node block nsp))))
-         (values preprocess fpoff)))
+       (setf (arg-state-sboff state) (+ sboff alloc-size))
+       (let ((preprocess
+               (lambda (fpoff)
+                (lambda (value node block nsp)
+                 (move-struct-to-stack value size (+ fpoff sboff) node block nsp)))))
+         (values preprocess sboff)))
       ;; Unmodified
       (t nil))))
 
@@ -434,31 +443,38 @@ Implementation notes:
          (lambda (value node block nsp)
            (move-struct-to-stack value size fpoff node block nsp)))))))
 (defun record-arg-large (type state)
-  "Records > 16 bytes are copied to stack and passed by pointer."
+  "Records > 16 bytes are copied to stack and passed by pointer. ~
+Returns TN-GENERATOR, which is a function taking FPOFF and returns a functional TN.
+
+Implementation Note:
+- The generation of functional TN is deferred until we know how much stack is required for passing arguments"
   (declare (ignore type))
-  (let* ((fpoff (first (arg-state-fpoffs state)))
+  (let* ((sboff (first (arg-state-sboffs state)))
          (reg-args (arg-state-num-register-args state))
          (pass-by-reg (< reg-args +max-register-args+)))
-    ;; Basically INT-ARG, except that it uses the FPOFF from Stage B.
-    (assert fpoff (fpoff) "SBCL BUG: FPOFF of NIL is invalid")
+    ;; Basically INT-ARG, except that it uses the offset computed from Stage B.
     (cond
       (pass-by-reg
        ;; C.9
        (setf (arg-state-num-register-args state) (1+ reg-args))
-       ;; Copy argument to register
-       (lambda (value node block nsp)
-         (declare (ignore value))
-         (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
-           (sb-c::vop load-stack-ptr node block nsp fpoff arg-tn))))
+       (lambda (fpoff)
+         (lambda (value node block nsp)
+           (declare (ignore value))
+           ;; Copy argument to register
+           (let ((arg-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number reg-args)))
+             (sb-c::vop load-stack-ptr node block nsp (+ fpoff sboff) arg-tn)))))
       (t
        ;; C.13
        (setf (arg-state-num-register-args state) +max-register-args+)
        ;; C.14 passing pointer by stack.
-       (let ((arg-fpoff (align-up (arg-state-stack-frame-size state) n-word-bytes)))
+       (let (;; The offset where this argument is passed with
+             (arg-fpoff (align-up (arg-state-stack-frame-size state) n-word-bytes)))
          (setf (arg-state-stack-frame-size state) (+ arg-fpoff n-word-bytes))
-         (lambda (value node block nsp)
-           (declare (ignore value))
-           (sb-c::vop pass-large-struct-by-stack node block nsp fpoff arg-fpoff)))))))
+         (lambda (fpoff) ; This FPOFF is the beginning of Stage B copies
+           (lambda (value node block nsp)
+             (declare (ignore value))
+             (sb-c::vop pass-large-struct-by-stack node block nsp
+                        (+ fpoff sboff) arg-fpoff))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   ;; Darwin allows an argument to take a stack slot of < 8 bytes.
@@ -493,7 +509,8 @@ Implementation notes:
       ((zerop size)
        (lambda (value node block nsp) (declare (ignore value node block nsp))))
       ((<= size 16) (record-arg-small type state))
-      (t (record-arg-large type state)))))
+      ;; NOTE: We use the second return to signify that the TN is deferred
+      (t (values nil (record-arg-large type state))))))
 
 ;(define-alien-type-method (sb-alien::record :result-tn) (type state)
 ;  (declare (ignore type state))
@@ -567,9 +584,10 @@ Implementation notes:
 
 (defun assign-arguments (type state #+darwin variadic-p)
   "Stage C: Assignment of current argument to registers and stack.
-Returns:
-- Register-wired TN if argument is simply copied to registers.
-- Function to be called by backend if more complex operation is required.
+Returns (VALUES TN DEFERRED), where:
+- TN is wired TN if argument is simply copied to register or stack.
+- TN is function to be called by backend if more complex operation is required.
+- TN is NIL and DEFERRED is a function generating a TN after the end of Stage C
 
 Implementation notes:
 - Due to the backend architecture of SBCL, assignments are implemented in methods of each type.
@@ -584,10 +602,10 @@ FIXME: I don't think variadic functions are implemented correctly. Need to verif
     (setf (arg-state-num-register-args state) +max-register-args+
           (arg-state-fp-registers state) +max-register-args+))
   ;; Invoke
-  (let ((assignment (invoke-alien-type-method :arg-tn type state)))
-    ;; Pop the FPOFFS list so its head is always current argument
-    (pop (arg-state-fpoffs state))
-    assignment))
+  (multiple-value-bind (tn deferred) (invoke-alien-type-method :arg-tn type state)
+    ;; Pop the SBOFFS list so its head is always current argument
+    (pop (arg-state-sboffs state))
+    (values tn deferred)))
 
 (defun make-call-out-tns (type)
   "Entry point of alien backend.
@@ -597,20 +615,45 @@ Implementation notes:
   (let* ((arg-state (make-arg-state)))
     (collect ((arg-tns)
               (preprocess-tns))
-      (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
+      (let ((preprocesses nil)
+            (tns nil)
+            (deferred-tns nil)
+            #+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
         ;; Stage B
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do (multiple-value-bind (pp fpoff)
+              do (multiple-value-bind (pp sboff)
                      (pre-padding-and-extension arg-type arg-state)
-                   (preprocess-tns pp)
-                   (push fpoff (arg-state-fpoffs arg-state))))
-        ;; Reverse the fpoffs list so it's FIFO
-        (setf (arg-state-fpoffs arg-state) (nreverse (arg-state-fpoffs arg-state)))
+                   (push pp preprocesses)
+                   (push sboff (arg-state-sboffs arg-state))))
+        ;; Reverse stage B lists so they are FIFO
+        (setf (arg-state-sboffs arg-state) (nreverse (arg-state-sboffs arg-state)))
+        (setf preprocesses (nreverse preprocesses))
         ;; Stage C
         (loop for i from 0
               for arg-type in (alien-fun-type-arg-types type)
-              do (arg-tns (assign-arguments arg-type arg-state #+darwin (eql i variadic)))))
+              do (multiple-value-bind (tn deferred-tn)
+                     (assign-arguments arg-type arg-state #+darwin (eql i variadic))
+                   (push tn tns)
+                   (push deferred-tn deferred-tns)))
+        ;; Reverse stage C lists so they are FIFO
+        (setf tns (nreverse tns))
+        (setf deferred-tns (nreverse deferred-tns))
+        ;; Now Stage C is done, generate preprocesses knowing how much stack is needed.
+        ;; We are pedantic and align to the maximum possible requirement.
+        (setf (arg-state-stack-frame-size arg-state)
+              (align-up (arg-state-stack-frame-size arg-state) 16))
+        ;; Generate preprocess-tns by applying FPOFF
+        (dolist (pp preprocesses)
+          (when pp (preprocess-tns (funcall pp (arg-state-stack-frame-size arg-state)))))
+        ;; Generate stage C. If not normal TN (i.e. is deferred), generate deferred.
+        (loop for tn in tns
+              for deferred in deferred-tns
+              do (arg-tns
+                  (if tn tn (funcall deferred (arg-state-stack-frame-size arg-state)))))
+        ;; Deferred operations are done. Update frame size to account for it.
+        (setf (arg-state-stack-frame-size arg-state)
+              (+ (arg-state-stack-frame-size arg-state) (arg-state-sboff arg-state))))
       ;; On darwin, total stack size is padded to multiples of 8 bytes
       #+darwin
       (let ((frame-size (arg-state-stack-frame-size arg-state)))
