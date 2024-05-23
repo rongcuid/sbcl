@@ -612,9 +612,7 @@ Returns (VALUES TN DEFERRED), where:
 Implementation notes:
 - Due to the backend architecture of SBCL, assignments are implemented in methods of each type.
     - Check DEFINE-ALIEN-TYPE-METHOD (type :ARG-TN) for more info.
-- Scalable, Vector, half-float, quad-float, quad-int types are not supported.
-
-FIXME: I don't think variadic functions are implemented correctly. Need to verify. -- Rongcui"
+- Scalable, Vector, half-float, quad-float, quad-int types are not supported."
   #+darwin ; In Darwin, variadic args is passed on stack slots
   (when variadic-p
     (setf (arg-state-num-register-args state) +max-register-args+
@@ -633,7 +631,6 @@ TNS and DEFERS are two lists of same length. For each pair of elements from the 
 - If element from TNS is NIL, then the element from DEFERS is used to resolve TN after Stage C.
 
 See ASSIGN-ARGUMENTS for more info."
-  ;; FIXME: check whether variadic functions actually work
   (collect ((tns) (defers))
     (loop for i from 0 for arg-type in arg-types
           do (multiple-value-bind (tn defer)
@@ -663,8 +660,7 @@ Algorithm:
 - Generate TNs with FPOFF.
 
 NOTE:
-- Struct value return is not implemented yet.
-- Variadic arg may or may not work."
+- Struct value return is not implemented yet."
   (let ((arg-state (make-arg-state))
         (tns nil)
         (defers nil)
