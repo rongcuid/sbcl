@@ -218,10 +218,10 @@
 ;;; Essentially performs the following C operation:
 ;;; memcpy(fp + fpoff, from_ptr, size)
 (define-vop (move-to-stack)
-  (:args (from-ptr :scs (sap-reg)) ;; NL2
-         (fp :scs (any-reg))) ;; NL1
+  (:args (from-ptr :scs (sap-reg))
+         (fp :scs (any-reg)))
   (:info size fpoff)
-  (:temporary (:scs (non-descriptor-reg)) temp temp-h) ;; NL0
+  (:temporary (:scs (non-descriptor-reg)) temp temp-h)
   (:generator
    0
    ;; Temporarily hold the source addr
@@ -540,9 +540,6 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
       ;; NOTE: We use the second return to signify that the TN is deferred
       (t (values nil (record-arg-large type state))))))
 
-;(define-alien-type-method (sb-alien::record :result-tn) (type state)
-;  (declare (ignore type state))
-;  (error "WIP arm64 struct value return."))
 ;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
@@ -609,6 +606,35 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
     (mapcar (lambda (type)
               (invoke-alien-type-method :result-tn type state))
             values)))
+
+(define-vop (push-result-struct)
+  (:results (ptr))
+  (:generator
+   1
+   (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset)))
+     (inst str x0-tn (@ csp-tn n-word-bytes :post-index))
+     (move ptr csp-tn))))
+
+(define-alien-type-method (sb-alien::record :result-tn) (type state)
+  (declare (ignore state))
+  (let* ((bits (alien-type-bits type))
+         (bytes (truncate bits n-byte-bits)))
+    (cond
+      ;; For a tiny struct, pass by X0
+      ((<= bytes 8)
+       (lambda (node block nsp lvar)
+         (declare (ignore nsp))
+         ;; We store the pointer at X1
+         (let* ((ptr-tn (make-wired-tn*
+                         'system-area-pointer
+                         sap-reg-sc-number
+                         (result-reg-offset 1))))
+           (sb-c::vop push-result-struct node block ptr-tn)
+           (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
+      ((<= bytes 16)
+       (error "WIP arm64 struct return double word"))
+      (t
+       (error "WIP arm64 struct return stack")))))
 
 (defun assign-arguments (type state #+darwin variadic-p)
   "Stage C: Assignment of current argument to registers and stack.

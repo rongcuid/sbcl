@@ -51,6 +51,10 @@ void tiny_align_8_mutate(volatile struct tiny_align_8 m) {
   m.m0++;
 }
 
+struct tiny_align_8 tiny_align_8_ret_0() {
+  return (struct tiny_align_8) { .m0 = 42 };
+}
+
 /** A small structure with 8-byte alignment.
     SysV x86-64 and AAPCS64 will pass this by register.
 */
@@ -163,4 +167,11 @@ void large_align_8_mutate(volatile struct large_align_8 m) {
   m.m13++;
   m.m14++;
   m.m15++;
+}
+
+struct large_align_8 large_align_8_ret_0() {
+  return (struct large_align_8) {
+    .m0=42, .m1=43, .m2=44, .m3=45, .m4=46, .m5=47, .m6=48, .m7=49,
+    .m8=50, .m9=51, .m10=52, .m11=53, .m12=54, .m13=55, .m14=56, .m15=57,
+  };
 }

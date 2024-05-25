@@ -747,6 +747,9 @@ length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
                           (reference-tn-list (butlast result-tns 2) nil)
                           (reference-tn (car (last result-tns 2)) t))
            (move-lvar-result call block (list (car (last result-tns 2))) lvar))
+          #+arm64
+          ((functionp (car result-tns))
+           (funcall (car result-tns) call block nsp lvar))
           (t
            (move-lvar-result call block result-tns lvar)))))))
 
