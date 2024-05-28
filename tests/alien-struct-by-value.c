@@ -55,6 +55,10 @@ struct tiny_align_8 tiny_align_8_ret_0() {
   return (struct tiny_align_8) { .m0 = 42 };
 }
 
+struct tiny_align_8 tiny_align_8_ret_1(long long magic) {
+  return (struct tiny_align_8) { .m0 = magic+ 1 };
+}
+
 /** A small structure with 8-byte alignment.
     SysV x86-64 and AAPCS64 will pass this by register.
 */
