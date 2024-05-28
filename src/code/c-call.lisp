@@ -144,6 +144,7 @@
 (define-alien-type-method (record :arg-tn) (type state)
   (declare (ignore type state))
   (error "Passing structs by value is unsupported on this platform."))
+#-arm64
 (define-alien-type-method (record :result-tn) (type state)
   (declare (ignore type state))
   (error "Returning structs by value is unsupported on this platform."))

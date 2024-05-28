@@ -540,9 +540,6 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
       ;; NOTE: We use the second return to signify that the TN is deferred
       (t (values nil (record-arg-large type state))))))
 
-;(define-alien-type-method (sb-alien::record :result-tn) (type state)
-;  (declare (ignore type state))
-;  (error "WIP arm64 struct value return."))
 ;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
@@ -609,6 +606,83 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
     (mapcar (lambda (type)
               (invoke-alien-type-method :result-tn type state))
             values)))
+
+(define-vop (return-tiny-struct)
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset)))
+     (inst str x0-tn (@ nsp-tn (- 16) :pre-index))
+     (inst mov-sp ptr nsp-tn))))
+
+(define-vop (return-small-struct)
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset))
+         (x1-tn (make-wired-tn* 't any-reg-sc-number nl1-offset)))
+     (inst stp x0-tn x1-tn (@ nsp-tn (- 16) :pre-index))
+     (inst mov-sp ptr nsp-tn))))
+
+(define-vop (reserve-return-struct)
+  (:info size)
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (inst sub nsp-tn nsp-tn size)
+   (inst mov-sp ptr nsp-tn)))
+
+(define-vop (return-large-struct)
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (inst mov-sp ptr nsp-tn)))
+
+(defun return-large-struct (size)
+  "Return a large struct. We need to:
+- On entry, reserve enough stack space
+- Pass address (i.e. NSP) on X8
+- On exit, copy address to lisp"
+  (let* ((alloc-size (align-up size 16))
+         ;; On entry, allocate additional space to hold the returned struct.
+         ;; Copy its address to X8
+         (entry
+           (lambda (node block)
+             (let ((x8-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number nl8-offset)))
+              (sb-c::vop reserve-return-struct node block alloc-size x8-tn))))
+         ;; We DON'T deallocate the additional space because we need it to stay alive
+         ;; upon return.
+         (exit nil)
+         ;; NSP would now point to the structure
+         (result
+           (lambda (node block lvar)
+             (let ((ptr (make-wired-tn* 'system-area-pointer sap-reg-sc-number nl8-offset)))
+               (sb-c::vop return-large-struct node block ptr)
+             (sb-c::move-lvar-result node block (list ptr) lvar)))))
+    (values result entry exit)))
+
+(define-alien-type-method (sb-alien::record :result-tn) (type state)
+  (declare (ignore state))
+  (let* ((bits (alien-type-bits type))
+         (bytes (truncate bits n-byte-bits)))
+    (cond
+      ((<= bytes 8)
+       (lambda (node block lvar)
+         (let* ((ptr-tn (make-wired-tn*
+                         'system-area-pointer
+                         sap-reg-sc-number
+                         nl8-offset)))
+           (sb-c::vop return-tiny-struct node block ptr-tn)
+           (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
+      ((<= bytes 16)
+       (lambda (node block lvar)
+         (let* ((ptr-tn (make-wired-tn*
+                         'system-area-pointer
+                         sap-reg-sc-number
+                         nl8-offset)))
+           (sb-c::vop return-small-struct node block ptr-tn)
+           (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
+      (t (return-large-struct bytes)))))
 
 (defun assign-arguments (type state #+darwin variadic-p)
   "Stage C: Assignment of current argument to registers and stack.
@@ -702,13 +776,17 @@ NOTE:
       (let ((frame-size (arg-state-stack-frame-size arg-state)))
         (setf (arg-state-stack-frame-size arg-state)
               (align-up frame-size 8)))
-      (values (make-normal-tn *fixnum-primitive-type*)
-              (arg-state-stack-frame-size arg-state)
-              (arg-tns)
-              (invoke-alien-type-method :result-tn
-                                        (alien-fun-type-result-type type)
-                                        (make-result-state))
-              (preprocess-tns)))))
+      (multiple-value-bind (result-tn entry-hook exit-hook)
+          (invoke-alien-type-method :result-tn
+                                    (alien-fun-type-result-type type)
+                                    (make-result-state))
+        (values (make-normal-tn *fixnum-primitive-type*)
+                (arg-state-stack-frame-size arg-state)
+                (arg-tns)
+                result-tn
+                entry-hook
+                (preprocess-tns)
+                exit-hook)))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)

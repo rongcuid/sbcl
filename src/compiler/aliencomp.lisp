@@ -627,16 +627,18 @@
         (args #-arm args #+arm (reverse args))
         #+c-stack-is-control-stack
         (stack-pointer (make-stack-pointer-tn)))
-    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns preprocess-tns)
+    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns entry-hook arg-pps exit-hook)
         (make-call-out-tns type)
       ;; Either there's no preprocess step, or there's one for each argument
-      (assert (or (not preprocess-tns) (= (length arg-tns) (length preprocess-tns)))
-              (arg-tns preprocess-tns)
+      (assert (or (not arg-pps) (= (length arg-tns) (length arg-pps)))
+              (arg-tns arg-pps)
               "SBCL BUG: (%ALIEN-FUNCALL) ~
-length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
-              (length arg-tns) (length preprocess-tns))
+length of ARG-TNS (~A) is not the same as ARG-PPS (~A)"
+              (length arg-tns) (length arg-pps))
       #+x86
       (vop set-fpu-word-for-c call block)
+      ;; A function called before stack allocation
+      (when entry-hook (funcall entry-hook call block))
       ;; Save the stack pointer, it will get aligned and subtracting
       ;; the size will not restore the original value, and some
       ;; things, like SB-C::CALL-VARIABLE, use the stack pointer to
@@ -648,9 +650,9 @@ length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
       ;; Perform preprocess operations, which are either NIL or a TN function.
       ;; Some architectures such as ARM64 require copying arguments to adjust alignment
       ;; or to pass large structs. These operations must be performed before passing arguments.
-      (loop for tn in #-arm preprocess-tns #+arm (reverse preprocess-tns)
+      (loop for pp in #-arm arg-pps #+arm (reverse arg-pps)
             for arg in args
-            do (when tn (funcall tn arg call block nsp)))
+            do (when pp (funcall pp arg call block nsp)))
 
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).
@@ -738,6 +740,8 @@ length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
         (vop reset-stack-pointer call block stack-pointer)
         #+x86
         (vop set-fpu-word-for-lisp call block)
+        ;; A function called after stack allocation
+        (when exit-hook (funcall exit-hook call block))
         (cond
           #+arm-softfp
           ((and lvar
@@ -747,6 +751,9 @@ length of ARG-TNS (~A) is not the same as PREPROCESS-TNS (~A)"
                           (reference-tn-list (butlast result-tns 2) nil)
                           (reference-tn (car (last result-tns 2)) t))
            (move-lvar-result call block (list (car (last result-tns 2))) lvar))
+          #+arm64
+          ((functionp (car result-tns))
+           (funcall (car result-tns) call block lvar))
           (t
            (move-lvar-result call block result-tns lvar)))))))
 
