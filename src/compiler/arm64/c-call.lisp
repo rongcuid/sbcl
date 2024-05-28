@@ -721,16 +721,19 @@ See ASSIGN-ARGUMENTS for more info."
     (values (tns) (defers))))
 
 (defun make-call-out-tns (type)
-  "Entry point of alien backend, implements AAPCS64 argument passing, including for Darwin.
+  "Entry point of alien backend, implements AAPCS64 argument passing.
 
 Stack Layout:
 
 |FP Arguments passed by stack |FPOFF Arguments copied by Stage B |PPOFF
 
-FP is the Frame Pointer. Arguments passed by stack are appended directly below FP.
-FPOFF (Frame Pointer OFFset) is the end of the last stack argument. ~
-Arguments copied by Stage B are appended after FPOFF
-PPOFF (Pre-Process OFFset) is the end of the last argument copied by stage B
+FP is the Frame Pointer. Arguments passed by stack are appended directly below
+FP. FPOFF (Frame Pointer OFFset) is the end of the last stack argument. ~
+Arguments copied by Stage B are appended after FPOFF PPOFF (Pre-Process OFFset)
+is the end of the last argument copied by stage B
+
+When returning a structure, the structure data is allocated at the beginning of
+the number stack: |NSP returned structure
 
 Algorithm:
 
