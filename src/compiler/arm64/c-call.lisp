@@ -607,13 +607,24 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
               (invoke-alien-type-method :result-tn type state))
             values)))
 
-(define-vop (push-result-struct)
+(define-vop (return-tiny-struct)
+  (:args (nsp :scs (any-reg)))
   (:results (ptr :scs (sap-reg any-reg)))
   (:generator
    1
    (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset)))
-     (inst str x0-tn (@ nsp-tn (- n-word-bytes) :pre-index))
-     (inst mov-sp ptr nsp-tn))))
+     (inst str x0-tn (@ nsp (- 8) :pre-index))
+     (inst mov-sp ptr nsp))))
+
+(define-vop (return-small-struct)
+  (:args (nsp :scs (any-reg)))
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset))
+         (x1-tn (make-wired-tn* 't any-reg-sc-number nl1-offset)))
+     (inst stp x0-tn x1-tn (@ nsp (- 16) :pre-index))
+     (inst mov-sp ptr nsp))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore state))
@@ -623,16 +634,22 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
       ;; For a tiny struct, pass by X0
       ((<= bytes 8)
        (lambda (node block nsp lvar)
-         (declare (ignore nsp))
          ;; We store the pointer at X1
          (let* ((ptr-tn (make-wired-tn*
                          'system-area-pointer
                          sap-reg-sc-number
-                         (result-reg-offset 1))))
-           (sb-c::vop push-result-struct node block ptr-tn)
+                         nl1-offset))) ; FIXME: Don't hard code this
+           (sb-c::vop return-tiny-struct node block nsp ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       ((<= bytes 16)
-       (error "WIP arm64 struct return double word"))
+       (lambda (node block nsp lvar)
+         ;; We store the temporary pointer at X2
+         (let* ((ptr-tn (make-wired-tn*
+                         'system-area-pointer
+                         sap-reg-sc-number
+                         nl2-offset))) ; FIXME: Don't hard code this
+           (sb-c::vop return-small-struct node block nsp ptr-tn)
+           (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       (t
        (error "WIP arm64 struct return stack")))))
 

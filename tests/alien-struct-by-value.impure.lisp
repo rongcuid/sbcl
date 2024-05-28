@@ -89,6 +89,7 @@
   (i4 long-long) (i5 long-long) (i6 long-long)
   (m (struct small-align-8)))
 (defar small-align-8-mutate void (m (struct small-align-8)))
+(defar small-align-8-ret-0 (struct small-align-8))
 (with-test (:name :struct-pass-by-value-small-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct small-align-8)))
     ;; Initialize struct
@@ -106,6 +107,11 @@
       (small-align-8-mutate m)
       ;; Test struct has not changed
       (test-members))))
+(with-test (:name :struct-return-by-value-small-align-8-args :fails-on (not :arm64))
+  (with-alien ((m (struct small-align-8)))
+    (setf m (small-align-8-ret-0))
+    (assert (= 33 (slot m 'm0)))
+    (assert (= 34 (slot m 'm1)))))
 ;;; Large struct, alignment 8
 (define-alien-type nil
     (struct large-align-8
@@ -134,7 +140,7 @@
   (i8 int)
   (m (struct large-align-8)))
 (defar large-align-8-mutate void (m (struct large-align-8)))
-(defar large-align-8-ret-0 (struct large-align-8))
+;(defar large-align-8-ret-0 (struct large-align-8))
 (with-test (:name :struct-pass-by-value-large-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct large-align-8)))
     (macrolet
@@ -171,4 +177,4 @@
 ;    (assert (= 42 (slot m 'm0)))))
 
 ;;; Clean up
-(delete-file "alien-struct-pass-by-value.so")
+(delete-file "alien-struct-by-value.so")
