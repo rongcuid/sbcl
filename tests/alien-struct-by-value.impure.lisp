@@ -96,6 +96,7 @@
   (m (struct small-align-8)))
 (defar small-align-8-mutate void (m (struct small-align-8)))
 (defar small-align-8-ret-0 (struct small-align-8))
+(defar small-align-8-ret-1 (struct small-align-8) (m long-long))
 (with-test (:name :struct-pass-by-value-small-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct small-align-8)))
     ;; Initialize struct
@@ -117,7 +118,8 @@
   (with-alien ((m (struct small-align-8)))
     (setf m (small-align-8-ret-0))
     (assert (= 33 (slot m 'm0)))
-    (assert (= 34 (slot m 'm1)))))
+    (assert (= 34 (slot m 'm1)))
+    (setf m (small-align-8-ret-1 +magic-number+))))
 ;;; Large struct, alignment 8
 (define-alien-type nil
     (struct large-align-8
@@ -189,7 +191,7 @@
     (assert (= 52 (slot m 'm10))) (assert (= 53 (slot m 'm11)))
     (assert (= 54 (slot m 'm12))) (assert (= 55 (slot m 'm13)))
     (assert (= 56 (slot m 'm14))) (assert (= 57 (slot m 'm15)))
-    (setf m (large-align-8-ret-1 (1+ +magic-number+)))
+    (setf m (large-align-8-ret-1 43))
     (assert (= 43 (slot m 'm0))) (assert (= 44 (slot m 'm1)))
     (assert (= 45 (slot m 'm2))) (assert (= 46 (slot m 'm3)))
     (assert (= 47 (slot m 'm4))) (assert (= 48 (slot m 'm5)))

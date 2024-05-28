@@ -101,6 +101,10 @@ struct small_align_8 small_align_8_ret_0() {
   return (struct small_align_8) { .m0 = 33, .m1 = 34 };
 }
 
+struct small_align_8 small_align_8_ret_1(long long magic) {
+  return (struct small_align_8) { .m0 = magic, .m1 = magic + 1 };
+}
+
 /** A large structure with 8-byte alignment.
     This should be too big for any architecture to pass by registers.
 */
