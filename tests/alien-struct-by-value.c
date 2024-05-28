@@ -56,7 +56,7 @@ struct tiny_align_8 tiny_align_8_ret_0() {
 }
 
 struct tiny_align_8 tiny_align_8_ret_1(long long magic) {
-  return (struct tiny_align_8) { .m0 = magic+ 1 };
+  return (struct tiny_align_8) { .m0 = magic + 1 };
 }
 
 /** A small structure with 8-byte alignment.

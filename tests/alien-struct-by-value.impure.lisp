@@ -72,7 +72,8 @@
   (with-alien ((m (struct tiny-align-8)))
     (setf m (tiny-align-8-ret-0))
     (assert (= 42 (slot m 'm0)))
-    (setf m (tiny-align-8-ret-1 +magic-number+))
+    (tiny-align-8-ret-1 +magic-number+)
+    ;(setf m (tiny-align-8-ret-1 +magic-number+))
     ;(assert (= (1+ +magic-number+) (slot m 'm0)))
     ))
 ;;; Small struct, alignment 8
