@@ -182,3 +182,11 @@ struct large_align_8 large_align_8_ret_0() {
     .m8=50, .m9=51, .m10=52, .m11=53, .m12=54, .m13=55, .m14=56, .m15=57,
   };
 }
+struct large_align_8 large_align_8_ret_1(long long magic) {
+  return (struct large_align_8) {
+    .m0=magic+0, .m1=magic+1, .m2=magic+2, .m3=magic+3,
+    .m4=magic+4, .m5=magic+5, .m6=magic+6, .m7=magic+7,
+    .m8=magic+8, .m9=magic+9, .m10=magic+10, .m11=magic+11,
+    .m12=magic+12, .m13=magic+13, .m14=magic+14, .m15=magic+15,
+  };
+}
