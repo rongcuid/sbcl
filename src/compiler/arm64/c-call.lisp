@@ -608,28 +608,35 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
             values)))
 
 (define-vop (return-tiny-struct)
-  (:args (nsp :scs (any-reg)))
   (:results (ptr :scs (sap-reg any-reg)))
   (:generator
    1
    (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset)))
-     (inst str x0-tn (@ nsp (- 8) :pre-index))
-     (inst mov-sp ptr nsp))))
+     (inst str x0-tn (@ nsp-tn (- 8) :pre-index))
+     (inst mov-sp ptr nsp-tn))))
 
 (define-vop (return-small-struct)
-  (:args (nsp :scs (any-reg)))
   (:results (ptr :scs (sap-reg any-reg)))
   (:generator
    1
    (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset))
          (x1-tn (make-wired-tn* 't any-reg-sc-number nl1-offset)))
-     (inst stp x0-tn x1-tn (@ nsp (- 16) :pre-index))
-     (inst mov-sp ptr nsp))))
+     (inst stp x0-tn x1-tn (@ nsp-tn (- 16) :pre-index))
+     (inst mov-sp ptr nsp-tn))))
 
 (define-vop (reserve-return-large-struct)
-  (:args (nsp :scs (any-reg)))
   (:info size)
-  (:generator 1 (inst sub nsp nsp size)))
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (inst sub nsp-tn nsp-tn size)
+   (inst mov-sp ptr nsp-tn)))
+
+(define-vop (return-large-struct)
+  (:results (ptr :scs (sap-reg any-reg)))
+  (:generator
+   1
+   (inst mov-sp ptr nsp-tn)))
 
 (defun return-large-struct (size align)
   "Return a large struct. We need to:
@@ -640,17 +647,18 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
          ;; On entry, allocate additional space to hold the returned struct.
          ;; Copy its address to X8
          (entry
-           (lambda (node block nsp)
+           (lambda (node block)
              (let ((x8-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number nl8-offset)))
-               (sb-c::vop reserve-return-large-struct node block nsp alloc-size)
-               (sb-c::emit-move node block nsp x8-tn))))
+              (sb-c::vop reserve-return-large-struct node block alloc-size x8-tn))))
          ;; We DON'T deallocate the additional space because we need it to stay alive
          ;; upon return.
          (exit nil)
          ;; NSP would now point to the structure
          (result
-           (lambda (node block nsp lvar)
-             (sb-c::move-lvar-result node block (list nsp) lvar))))
+           (lambda (node block lvar)
+             (let ((ptr (make-wired-tn* 'system-area-pointer sap-reg-sc-number nl8-offset)))
+               (sb-c::vop return-large-struct node block ptr)
+             (sb-c::move-lvar-result node block (list ptr) lvar)))))
     (values result entry exit)))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
@@ -661,23 +669,23 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
     (cond
       ;; For a tiny struct, pass by X0
       ((<= bytes 8)
-       (lambda (node block nsp lvar)
+       (lambda (node block lvar)
          ;; We store the temporary pointer at X1
          (let* ((ptr-tn (make-wired-tn*
                          'system-area-pointer
                          sap-reg-sc-number
                          nl1-offset)))
-           (sb-c::vop return-tiny-struct node block nsp ptr-tn)
+           (sb-c::vop return-tiny-struct node block ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       ;; For a small struct, pass by X0 and X1
       ((<= bytes 16)
-       (lambda (node block nsp lvar)
+       (lambda (node block lvar)
          ;; We store the temporary pointer at X2
          (let* ((ptr-tn (make-wired-tn*
                          'system-area-pointer
                          sap-reg-sc-number
                          nl2-offset)))
-           (sb-c::vop return-small-struct node block nsp ptr-tn)
+           (sb-c::vop return-small-struct node block ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       ;; Handle large structs
       (t (return-large-struct bytes align)))))

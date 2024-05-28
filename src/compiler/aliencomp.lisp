@@ -638,7 +638,7 @@ length of ARG-TNS (~A) is not the same as ARG-PPS (~A)"
       #+x86
       (vop set-fpu-word-for-c call block)
       ;; A function called before stack allocation
-      (when entry-hook (funcall entry-hook call block nsp))
+      (when entry-hook (funcall entry-hook call block))
       ;; Save the stack pointer, it will get aligned and subtracting
       ;; the size will not restore the original value, and some
       ;; things, like SB-C::CALL-VARIABLE, use the stack pointer to
@@ -741,7 +741,7 @@ length of ARG-TNS (~A) is not the same as ARG-PPS (~A)"
         #+x86
         (vop set-fpu-word-for-lisp call block)
         ;; A function called after stack allocation
-        (when exit-hook (funcall exit-hook call block nsp))
+        (when exit-hook (funcall exit-hook call block))
         (cond
           #+arm-softfp
           ((and lvar
@@ -753,7 +753,7 @@ length of ARG-TNS (~A) is not the same as ARG-PPS (~A)"
            (move-lvar-result call block (list (car (last result-tns 2))) lvar))
           #+arm64
           ((functionp (car result-tns))
-           (funcall (car result-tns) call block nsp lvar))
+           (funcall (car result-tns) call block lvar))
           (t
            (move-lvar-result call block result-tns lvar)))))))
 
