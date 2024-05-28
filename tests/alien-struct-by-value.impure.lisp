@@ -49,8 +49,6 @@
 (defar tiny-align-8-mutate void (m (struct tiny-align-8)))
 (defar tiny-align-8-ret-0 (struct tiny-align-8))
 (defar tiny-align-8-ret-1 (struct tiny-align-8) (m long-long))
-;(disassemble 'tiny-align-8-ret-0)
-;(disassemble 'tiny-align-8-ret-1)
 (with-test (:name :struct-pass-by-value-tiny-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct tiny-align-8)))
     ;; Initialize struct
@@ -73,9 +71,8 @@
   (with-alien ((m (struct tiny-align-8)))
     (setf m (tiny-align-8-ret-0))
     (assert (= 42 (slot m 'm0)))
-    ;(setf m (tiny-align-8-ret-1 +magic-number+))
-    ;(assert (= (1+ +magic-number+) (slot m 'm0)))
-    ))
+    (setf m (tiny-align-8-ret-1 +magic-number+))
+    (assert (= (1+ +magic-number+) (slot m 'm0)))))
 ;;; Small struct, alignment 8
 (define-alien-type nil (struct small-align-8 (m0 (integer 64)) (m1 (integer 64))))
 (defar small-align-8-get-m0 (integer 64) (m (struct small-align-8)))
@@ -199,8 +196,7 @@
     (assert (= 51 (slot m 'm8))) (assert (= 52 (slot m 'm9)))
     (assert (= 53 (slot m 'm10))) (assert (= 54 (slot m 'm11)))
     (assert (= 55 (slot m 'm12))) (assert (= 56 (slot m 'm13)))
-    (assert (= 57 (slot m 'm14))) (assert (= 58 (slot m 'm15)))
-    ))
+    (assert (= 57 (slot m 'm14))) (assert (= 58 (slot m 'm15)))))
 
 ;;; Clean up
 (delete-file "alien-struct-by-value.so")
