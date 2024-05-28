@@ -626,9 +626,37 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
      (inst stp x0-tn x1-tn (@ nsp (- 16) :pre-index))
      (inst mov-sp ptr nsp))))
 
+(define-vop (reserve-return-large-struct)
+  (:args (nsp :scs (any-reg)))
+  (:info size)
+  (:generator 1 (inst sub nsp nsp size)))
+
+(defun return-large-struct (size align)
+  "Return a large struct. We need to:
+- On entry, reserve enough stack space
+- Pass address (i.e. NSP) on X8
+- On exit, copy address to lisp"
+  (let* ((alloc-size (align-up size align))
+         ;; On entry, allocate additional space to hold the returned struct.
+         ;; Copy its address to X8
+         (entry
+           (lambda (node block nsp)
+             (let ((x8-tn (make-wired-tn* 'system-area-pointer sap-reg-sc-number nl8-offset)))
+               (sb-c::vop reserve-return-large-struct node block nsp alloc-size)
+               (sb-c::emit-move node block nsp x8-tn))))
+         ;; We DON'T deallocate the additional space because we need it to stay alive
+         ;; upon return.
+         (exit nil)
+         ;; NSP would now point to the structure
+         (result
+           (lambda (node block nsp lvar)
+             (sb-c::move-lvar-result node block (list nsp) lvar))))
+    (values result entry exit)))
+
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore state))
   (let* ((bits (alien-type-bits type))
+         (align (truncate (alien-type-alignment type) n-byte-bits))
          (bytes (truncate bits n-byte-bits)))
     (cond
       ;; For a tiny struct, pass by X0
@@ -641,6 +669,7 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
                          nl1-offset)))
            (sb-c::vop return-tiny-struct node block nsp ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
+      ;; For a small struct, pass by X0 and X1
       ((<= bytes 16)
        (lambda (node block nsp lvar)
          ;; We store the temporary pointer at X2
@@ -650,8 +679,8 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
                          nl2-offset)))
            (sb-c::vop return-small-struct node block nsp ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
-      (t
-       (error "WIP arm64 struct return stack")))))
+      ;; Handle large structs
+      (t (return-large-struct bytes align)))))
 
 (defun assign-arguments (type state #+darwin variadic-p)
   "Stage C: Assignment of current argument to registers and stack.
@@ -744,13 +773,17 @@ NOTE:
       (let ((frame-size (arg-state-stack-frame-size arg-state)))
         (setf (arg-state-stack-frame-size arg-state)
               (align-up frame-size 8)))
-      (values (make-normal-tn *fixnum-primitive-type*)
-              (arg-state-stack-frame-size arg-state)
-              (arg-tns)
-              (invoke-alien-type-method :result-tn
-                                        (alien-fun-type-result-type type)
-                                        (make-result-state))
-              (preprocess-tns)))))
+      (multiple-value-bind (result-tn entry-hook exit-hook)
+          (invoke-alien-type-method :result-tn
+                                    (alien-fun-type-result-type type)
+                                    (make-result-state))
+        (values (make-normal-tn *fixnum-primitive-type*)
+                (arg-state-stack-frame-size arg-state)
+                (arg-tns)
+                result-tn
+                entry-hook
+                (preprocess-tns)
+                exit-hook)))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)

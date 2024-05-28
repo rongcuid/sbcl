@@ -140,7 +140,7 @@
   (i8 int)
   (m (struct large-align-8)))
 (defar large-align-8-mutate void (m (struct large-align-8)))
-;(defar large-align-8-ret-0 (struct large-align-8))
+(defar large-align-8-ret-0 (struct large-align-8))
 (with-test (:name :struct-pass-by-value-large-align-8-args :fails-on (not :arm64))
   (with-alien ((m (struct large-align-8)))
     (macrolet
@@ -171,10 +171,17 @@
       (large-align-8-mutate m)
       ;; Test that the original struct is not modified
       (test-members))))
-;(with-test (:name :struct-return-by-value-large-align-8 :fails-on (not :arm64))
-;  (with-alien ((m (struct large-align-8)))
-;    (setf m (large-align-8-ret-0))
-;    (assert (= 42 (slot m 'm0)))))
+(with-test (:name :struct-return-by-value-large-align-8 :fails-on (not :arm64))
+  (with-alien ((m (struct large-align-8)))
+    (setf m (large-align-8-ret-0))
+    (assert (= 42 (slot m 'm0))) (assert (= 43 (slot m 'm1)))
+    (assert (= 44 (slot m 'm2))) (assert (= 45 (slot m 'm3)))
+    (assert (= 46 (slot m 'm4))) (assert (= 47 (slot m 'm5)))
+    (assert (= 48 (slot m 'm6))) (assert (= 49 (slot m 'm7)))
+    (assert (= 50 (slot m 'm8))) (assert (= 51 (slot m 'm9)))
+    (assert (= 52 (slot m 'm10))) (assert (= 53 (slot m 'm11)))
+    (assert (= 54 (slot m 'm12))) (assert (= 55 (slot m 'm13)))
+    (assert (= 56 (slot m 'm14))) (assert (= 57 (slot m 'm15)))))
 
 ;;; Clean up
 (delete-file "alien-struct-by-value.so")
