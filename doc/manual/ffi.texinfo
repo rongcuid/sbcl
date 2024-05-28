@@ -743,10 +743,12 @@ only known-type calls are efficiently compiled.  Limitations:
 @itemize
 
 @item
-Structure type return values are not implemented.
+Structure type return values are not implemented on all platforms. Returned 
+structure is store on stack. If structure needs to be accessed beyond
+current scope, it needs to be copied.
 
 @item
-Passing of structures by value is not implemented.
+Passing of structures by value is not implemented on all platforms.
 
 @end itemize
 
