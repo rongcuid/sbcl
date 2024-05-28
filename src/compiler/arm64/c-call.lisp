@@ -608,12 +608,12 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
             values)))
 
 (define-vop (push-result-struct)
-  (:results (ptr))
+  (:results (ptr :scs (sap-reg any-reg)))
   (:generator
    1
    (let ((x0-tn (make-wired-tn* 't any-reg-sc-number nl0-offset)))
-     (move ptr csp-tn)
-     (inst str x0-tn (@ csp-tn n-word-bytes :post-index)))))
+     (inst str x0-tn (@ nsp-tn (- n-word-bytes) :pre-index))
+     (inst mov-sp ptr nsp-tn))))
 
 (define-alien-type-method (sb-alien::record :result-tn) (type state)
   (declare (ignore state))
