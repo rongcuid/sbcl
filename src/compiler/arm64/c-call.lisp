@@ -634,11 +634,11 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
       ;; For a tiny struct, pass by X0
       ((<= bytes 8)
        (lambda (node block nsp lvar)
-         ;; We store the pointer at X1
+         ;; We store the temporary pointer at X1
          (let* ((ptr-tn (make-wired-tn*
                          'system-area-pointer
                          sap-reg-sc-number
-                         nl1-offset))) ; FIXME: Don't hard code this
+                         nl1-offset)))
            (sb-c::vop return-tiny-struct node block nsp ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       ((<= bytes 16)
@@ -647,7 +647,7 @@ TN-GENERATOR is executed after Stage C, when FPOFF is known. "
          (let* ((ptr-tn (make-wired-tn*
                          'system-area-pointer
                          sap-reg-sc-number
-                         nl2-offset))) ; FIXME: Don't hard code this
+                         nl2-offset)))
            (sb-c::vop return-small-struct node block nsp ptr-tn)
            (sb-c::move-lvar-result node block (list ptr-tn) lvar))))
       (t
