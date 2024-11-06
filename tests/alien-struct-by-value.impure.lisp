@@ -40,6 +40,12 @@
 ;;; This forces DEFINE-ALIEN-ROUTINE to be evaluated at runtime so errors can be caught
 (defmacro defar (&body args)
   `(eval '(define-alien-routine ,@args)))
+(defmacro assert-unimplemented ((&whole def dar name ret &optional (arg nil argp)))
+  (declare (ignore dar ret))
+  ;; all the "caught 1 fatal ERROR" notices are scary to those not expecting to see them
+  `(let ((*error-output* (make-broadcast-stream)))
+     (assert-error (eval '(progn ,def
+                           ,(if argp `(with-alien ((x ,(second arg))) (,name x)) '(name)))))))
 ;;; Tiny struct, alignment 8
 (define-alien-type nil (struct tiny-align-8 (m0 (integer 64))))
 (defar tiny-align-8-get-m0 (integer 64) (m (struct tiny-align-8)))
