@@ -284,8 +284,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
   (declare (type random-state state))
   (let* ((state (random-state-state state))
          (k (aref state 2)))
-    (declare (type (mod 628) k))
-    (when (= k mt19937-n)
+    (when (>= k mt19937-n)
       (random-mt19937-update state)
       (setf k 0))
     (setf (aref state 2) (1+ k))
@@ -335,7 +334,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
         while (#+x86 eql ;; Can't use = due to 80-bit precision
                #-x86 =
                candidate arg)
-        finally (return candidate)))
+        finally (return (truly-the (single-float 0.0) candidate))))
 (declaim (ftype (function ((double-float (0d0)) random-state)
                           (double-float 0d0))
                 %random-double-float))
@@ -354,7 +353,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                  (random-chunk state))
                 1d0))
         while (= candidate arg)
-        finally (return candidate)))
+        finally (return (truly-the (double-float 0d0) candidate))))
 
 ;;; using a faster inline VOP
 #+x86
@@ -374,7 +373,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                   1d0))
           ;; Can't use = due to 80-bit precision
           while (eql candidate arg)
-          finally (return candidate))))
+          finally (return (truly-the (double-float 0d0) candidate)))))
 
 
 ;;;; random fixnums
@@ -412,10 +411,10 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
               (accept-reject-loop big-random-chunk))))))
 
 (defun random (arg &optional (state *random-state*))
+  (declare (explicit-check arg :result))
   (declare (inline %random-fixnum
                    %random-single-float %random-double-float
                    #+long-float %random-long-float))
-  (declare (explicit-check))
   (cond
     ((and (fixnump arg) (> arg 0))
      (%random-fixnum arg state))
@@ -429,8 +428,4 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
     ((and (bignump arg) (> arg 0))
      (%random-bignum arg state))
     (t
-     (error 'simple-type-error
-            :expected-type '(or (integer 1) (float (0))) :datum arg
-            :format-control "~@<Argument is neither a positive integer nor a ~
-                             positive float: ~2I~_~S~:>"
-            :format-arguments (list arg)))))
+     #.(sb-c::internal-type-error-call 'arg '(or (integer 1) (float (0)))))))

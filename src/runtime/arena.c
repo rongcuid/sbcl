@@ -170,8 +170,10 @@ static page_index_t close_heap_region(struct alloc_region* r, int page_type) {
     return result;
 }
 
+int inhibit_arena_use = 0;
 void switch_to_arena(lispobj arena_taggedptr)
 {
+    if (inhibit_arena_use) return;
     struct arena* arena = (void*)native_pointer(arena_taggedptr);
     struct thread* th = get_sb_vm_thread();
     struct extra_thread_data *extra_data = thread_extra_data(th);
@@ -560,8 +562,8 @@ int find_dynspace_to_arena_ptrs(lispobj arena, lispobj result_buffer)
             lispobj *sp = os_get_csp(th);
 #else
             int ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX, th));
-            if (ici != 1) lose("can't find interrupt context");
-            lispobj sp = *os_context_register_addr(nth_interrupt_context(0, th), reg_SP);
+            if (ici == 0) lose("can't find interrupt context");
+            lispobj sp = *os_context_register_addr(nth_interrupt_context(ici-1, th), reg_SP);
 #endif
             scan_thread_control_stack((lispobj*)sp, th->control_stack_end, th->lisp_thread);
         }

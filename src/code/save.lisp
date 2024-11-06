@@ -338,15 +338,11 @@ sufficiently motivated to do lengthy fixes."
     ;; recreate it so that we don't preserve an empty vector taking up 16KB
     (setq sb-kernel::*forward-referenced-layouts* (make-hash-table :test 'equal)))
   ;; Clean up the simulated weak list of covered code components.
-  (rplacd sb-c:*code-coverage-info*
-          (delete-if-not #'weak-pointer-value (cdr sb-c:*code-coverage-info*)))
+  (rplacd *code-coverage-info*
+          (delete-if-not #'weak-pointer-value (cdr *code-coverage-info*)))
   (sb-kernel::rebuild-ctype-hashsets)
   (drop-all-hash-caches)
   (os-deinit)
-  (clrhash sb-c::*emitted-full-calls*) ; Don't immortalize compiler's scratchpad
-  ;; Perform static linkage. Functions become un-statically-linked
-  ;; on demand, for TRACE, redefinition, etc.
-  #+(and immobile-code x86-64) (sb-vm::statically-link-core)
   (finalizers-deinit)
   ;; Try to shrink the pathname cache. It might be largely nulls
   (rebuild-pathname-cache)
@@ -382,8 +378,13 @@ sufficiently motivated to do lengthy fixes."
          (declare (ignore size))
          (case widetag
            (#.sb-vm:code-header-widetag
-            (dotimes (i (sb-kernel:code-n-entries obj))
-              (let* ((fun (sb-kernel:%code-entry-point obj i))
+            (dotimes (i (if (compiled-debug-info-p (%code-debug-info obj))
+                            (code-n-entries obj)
+                            0))
+              ;; FIXME: now that the metadata are not physically in the code primitive
+              ;; object, wouldn't it be better to process the debug-info for deduplication
+              ;; rather than treating the code as if it contained the displaced slots?
+              (let* ((fun (%code-entry-point obj i))
                      (arglist (%simple-fun-arglist fun))
                      (info (%simple-fun-info fun))
                      (type (typecase info
@@ -393,7 +394,7 @@ sufficiently motivated to do lengthy fixes."
                      (xref (%simple-fun-xrefs fun)))
                 (setf (%simple-fun-arglist fun)
                       (ensure-gethash arglist arglist-hash arglist))
-                (setf (sb-impl::%simple-fun-info fun)
+                (setf (%simple-fun-info fun)
                       (if (and type xref) (cons type xref) (or type xref))))))
            (#.sb-vm:instance-widetag
             (typecase obj

@@ -33,9 +33,7 @@ create_test_subdirectory
 temp=$TEST_DIRECTORY/$TEST_FILESTEM
 
 run_sbcl --load ../tools-for-build/elftool \
-  --eval '(sb-editcore:move-dynamic-code-to-text-space "../output/sbcl.core" "'${temp}'-patched.core")' \
-  --eval '(sb-editcore:redirect-text-space-calls "'${temp}'-patched.core")' \
-  --eval '(sb-editcore:split-core "'${temp}'-patched.core" "'${temp}'-src.s")' --quit
+  --eval '(sb-editcore:split-core "../output/sbcl.core" "'${temp}'-src.s")' --quit
 
 m_arg=`run_sbcl --eval '(progn #+sb-core-compression (princ " -lzstd") #+x86 (princ " -m32"))' --quit`
 
@@ -65,18 +63,19 @@ fi
 set +e # no exit on error
 ${exefile} --noprint n<<EOF
 (in-package sb-impl)
-(defun disassembly-contains-query-read-char ()
-  (search "FDEFN QUERY-READ-CHAR"
-          (with-output-to-string (ss) (disassemble 'y-or-n-p :stream ss))))
-(assert (not (disassembly-contains-query-read-char)))
+(defun expand-pkg-iterator (&rest whatever) whatever :bork-bork-bork)
+;; the macro-function contains a JMP to expand-pkg-iterator
+(assert (equal (macroexpand-1 '(do-all-symbols (s) (print :hi)))
+               :bork-bork-bork))
+(defun asm-string () (with-output-to-string (ss) (disassemble 'y-or-n-p :stream ss)))
+(assert (search "#'QUERY-READ-CHAR" (asm-string)))
 (defun query-read-char () #\y) ; will undo static linkage
-(assert (disassembly-contains-query-read-char))
+(assert (search "; QUERY-READ-CHAR" (asm-string)))
 (if (let ((*query-io* (make-broadcast-stream))) (y-or-n-p)) (exit :code 42))
 EOF
 status=$?
 if [ $status -eq 42 ]
 then
-  echo
   echo "Undo static linkage: PASS"
 else
   exit 1

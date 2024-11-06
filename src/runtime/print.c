@@ -477,9 +477,6 @@ static void print_slots(char **slots, int count, lispobj *ptr)
             lispobj word = *ptr;
             char* slot_name = *slots;
             if (N_WORD_BYTES == 8 && !strcmp(slot_name, "boxed_size: ")) word = word & 0xFFFFFFFF;
-#ifdef LISP_FEATURE_COMPACT_SYMBOL
-            else if (!strcmp(slot_name, "name: ")) word = decode_symbol_name(word);
-#endif
             print_obj(slot_name, word);
             slots++;
         } else {
@@ -491,18 +488,20 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 
 static void print_fun_or_otherptr(lispobj obj)
 {
-    int index;
+    lispobj *ptr;
+    unsigned long header;
+    int count, type, index;
     char buffer[16];
 
-    lispobj *ptr = native_pointer(obj);
+    ptr = native_pointer(obj);
     if (ptr == NULL) {
         printf(" (NULL Pointer)");
         return;
     }
 
-    int count = object_size(ptr)-1;
-    uword_t header = *ptr++;
-    int type = header_widetag(header);
+    header = *ptr++;
+    count = HeaderValue(header);
+    type = header_widetag(header);
 
     print_obj("header: ", header);
     if (!other_immediate_lowtag_p(header)) {
@@ -552,7 +551,12 @@ static void print_fun_or_otherptr(lispobj obj)
 #ifdef LISP_FEATURE_COMPACT_SYMBOL
         // print_obj doesn't understand raw words, so make it a fixnum
         int pkgid = symbol_package_id(sym) << N_FIXNUM_TAG_BITS;
-        print_obj("pkgid: ", pkgid);
+        print_obj("package_id: ", pkgid);
+#endif
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+        int fname_index = symbol_linkage_index(sym);
+        printf("\nindex: %x linkage_table[index]: %p",
+               fname_index, (void*)linkage_space[fname_index]);
 #endif
         break;
 
@@ -701,8 +705,7 @@ static void print_fun_or_otherptr(lispobj obj)
         break;
 
     case FDEFN_WIDETAG:
-        print_slots(fdefn_slots, 2, ptr);
-        print_obj("entry: ", decode_fdefn_rawfun((struct fdefn*)(ptr-1)));
+        print_slots(fdefn_slots, 3, ptr);
         break;
 
     // Make some vectors printable from C, for when all hell breaks lose

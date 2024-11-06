@@ -807,3 +807,24 @@
                                  (values #'1+ #'cdr))
                            (sort x f :key key)))
                       :allow-style-warnings t))))
+
+(with-test (:name :member-bad-test)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (m y)
+                         (member m y :test #'= :key #'symbol-name))
+                      :allow-warnings t))))
+
+(with-test (:name :constant-modification-functions)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (n)
+                        (setf (car (aref #((1) (2)) n)) 10))
+                      :allow-warnings t))))
+
+(with-test (:name :constant-modification-nil)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (n)
+                        (incf (car (assoc n '((1 . 2) (3 . 4))))))
+                      :allow-warnings t))))

@@ -283,13 +283,11 @@ lispobj alloc_code_object(unsigned total_words, unsigned boxed)
     // 'boxed_size' is an untagged word expressing the number of *bytes* in the boxed section
     // (so CODE-INSTRUCTIONS can simply add rather than shift and add).
     code->boxed_size = boxed * N_WORD_BYTES;
-    code->debug_info = 0;
-    code->fixups = 0;
-    lispobj* p = &code->constants[0], *end = (lispobj*)code + boxed;
-    /* Must intialize to an arbitrary non-pointer value so that GC doesn't crash after the
-     * size is assigned (at some point prior to storing the constants) */
-    for ( ; p < end ; ++p) *p = 0;
-    *p = 0; // 'p' now points to the jump table count word which must be 0
+    // GC mustn't see uninitialized data. And one word past the boxed words (which holds the
+    // count of following words containing absolute jump addresses) must also be pre-zeroed.
+    lispobj* begin = 1 + &code->boxed_size, *end = (lispobj*)code + boxed + 1;
+    memset(begin, 0, (char*)end - (char*)begin);
+
     ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
     THREAD_JIT_WP(1);
     return make_lispobj(code, OTHER_POINTER_LOWTAG);
@@ -326,10 +324,11 @@ NO_SANITIZE_MEMORY lispobj alloc_funinstance(sword_t nbytes)
 /* Make a list that couldn't be inline-allocated. Break it up into contiguous
  * blocks of conses not to exceed one GC page each. */
 NO_SANITIZE_MEMORY lispobj
-make_list(lispobj element, sword_t nbytes, int sys) {
+make_list(lispobj element, sword_t nelts, int sys) {
     // Technically this overflow handler could permit garbage collection
     // between separate allocation. For now the entire thing is pseudo-atomic.
     struct thread *self = get_sb_vm_thread();
+    sword_t nbytes = nelts << WORD_SHIFT; // fixnum input
     PREPARE_LIST_ALLOCATION();
     lispobj result, *tail = &result;
     do {
@@ -354,9 +353,10 @@ make_list(lispobj element, sword_t nbytes, int sys) {
 /* Convert a &MORE context to a list. Split it up like make_list if we have to */
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 NO_SANITIZE_MEMORY lispobj
-listify_rest_arg(lispobj* context, sword_t nbytes, int sys) {
+listify_rest_arg(lispobj* context, sword_t nelts, int sys) {
     // same comment as above in make_list() applies about the scope of pseudo-atomic
     struct thread *self = get_sb_vm_thread();
+    sword_t nbytes = nelts << WORD_SHIFT; // fixnum input
     PREPARE_LIST_ALLOCATION();
     lispobj result, *tail = &result;
     do {

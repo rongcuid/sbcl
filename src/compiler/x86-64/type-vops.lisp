@@ -137,7 +137,10 @@
                               (not except)
                               (or (atom (car headers))
                                   (= (caar headers) bignum-widetag)
-                                  (= (cdar headers) complex-array-widetag)))
+                                  (= (cdar headers) complex-array-widetag)
+                                  (and value-tn-ref
+                                       (= (caar headers) simple-array-widetag)
+                                       (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'array)))))
                          (ea (- lowtag) value)
                          temp))
          (first (car headers))
@@ -619,10 +622,17 @@
                     (:info)
                     (:conditional :c) ; Carry flag = "below" (unsigned)
                     (:arg-refs value-tn-ref)
+                    (:vop-var vop)
                     (:generator 4
-                      (fail-if-not-otherptr)
-                      (inst sub :byte temp ,min)
-                      (inst cmp :byte temp ,(1+ (- max min)))
+                      (cond ((and (eq ,min simple-array-widetag)
+                                  (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'array)))
+                             (change-vop-flags vop '(:le))
+                             (inst cmp :byte (ea (- other-pointer-lowtag) value)
+                                   ,max))
+                            (t
+                             (fail-if-not-otherptr)
+                             (inst sub :byte temp ,min)
+                             (inst cmp :byte temp ,(1+ (- max min)))))
                       OUT)))))
     (define simple-rank-1-array-*-p +simple-rank-1-array-widetags+)
     (define vectorp +vector-widetags+)
@@ -696,18 +706,16 @@
   (:translate keywordp)
   (:generator 3
     (cond ((csubtypep (tn-ref-type args) (specifier-type 'symbol))
-           (inst cmp :word (ea (+ (ash symbol-name-slot word-shift) 6
-                                  (- other-pointer-lowtag))
-                               value)
+           (inst cmp :word (ea (- 1 other-pointer-lowtag) value)
                  sb-impl::+package-id-keyword+))
           (t
            (inst lea temp (ea (- other-pointer-lowtag) value))
            (inst test :byte temp lowtag-mask)
            (inst jmp :ne out)
-           (inst cmp :byte (ea temp) symbol-widetag)
-           (inst jmp :ne out)
-           (inst cmp :word (ea (+ (ash symbol-name-slot word-shift) 6) temp)
-                 sb-impl::+package-id-keyword+)))
+           (inst mov :dword temp (ea temp))
+           (inst shl :dword temp 8) ; zeroize flag/generation bits
+           (inst cmp :dword temp
+                 (ash (logior (ash sb-impl::+package-id-keyword+ 8) symbol-widetag) 8))))
     out))
 
 (define-vop (consp type-predicate)
@@ -749,7 +757,7 @@
    (:vop-var vop)
    (:temporary (:sc unsigned-reg) temp)
    (:generator 1
-     (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) value)
+     (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop))
      (inst mov :dword (ea (- 4 instance-pointer-lowtag) object) value)))
  (define-vop (%fun-layout %instance-layout)
    (:translate %fun-layout)
@@ -757,7 +765,7 @@
  (define-vop (%set-fun-layout %set-instance-layout)
    (:translate %set-fun-layout)
    (:generator 1
-     (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) value)
+     (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop))
      (inst mov :dword (ea (- 4 fun-pointer-lowtag) object) value)))
  (define-vop ()
   (:translate sb-c::layout-eq)

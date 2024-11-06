@@ -539,7 +539,7 @@
             (error "unknown TRACE option: ~S" name))
            ((stringp name)
             (let ((package (find-undeleted-package-or-lose name)))
-              (do-all-symbols (symbol (find-package name))
+              (do-symbols (symbol package)
                 (when (eql package (symbol-package symbol))
                   (when (and (fboundp symbol)
                              (not (macro-function symbol))
@@ -788,7 +788,7 @@ functions when called with no arguments."
 ;;;   +-------------------------+
 
 (defun compile-funobj-encapsulation (wrapper info actual-fun)
-  #+(or x86 x86-64)
+  #+(or ppc64 x86 x86-64)
   (let ((code
          ;; Don't actually "compile" - just emulate the result of compiling.
          ;; Cloning a precompiled template object consumes only 272 bytes
@@ -804,19 +804,19 @@ functions when called with no arguments."
                                    ;; The code constants will be overwritten in the copy.
                                    ;; These are just placeholders essentially.
                                    (apply ,#'trace-call ,(make-trace-info) #() args))))))
-                 (index (+ sb-vm:code-constants-offset sb-vm:code-slots-per-simple-fun)))
+                 (index sb-vm:code-constants-offset))
              ;; First three args to APPLY must be at the expected offets
              (aver (typep (code-header-ref c (+ index 0)) 'function))
              (aver (typep (code-header-ref c (+ index 1)) 'trace-info))
              (aver (typep (code-header-ref c (+ index 2)) 'simple-vector))
              c)
            t)))
-        (index (+ sb-vm:code-constants-offset sb-vm:code-slots-per-simple-fun)))
+        (index sb-vm:code-constants-offset))
     (setf (code-header-ref code (+ index 0)) (symbol-function wrapper)
           (code-header-ref code (+ index 1)) info
           (code-header-ref code (+ index 2)) actual-fun)
     (%code-entry-point code 0))
-  #-(or x86 x86-64)
+  #-(or ppc64 x86 x86-64)
   (values (compile nil `(lambda (&rest args)
                           (apply #',wrapper ,info ,actual-fun args)))))
 
@@ -849,7 +849,7 @@ functions when called with no arguments."
          (tracing-wrapper
            (compile-funobj-encapsulation 'trace-call info proxy-fun)))
     (with-pinned-objects (tracing-wrapper)
-      (let (#+(or x86 x86-64 arm64)
+      (let (#+(or arm64 ppc64 x86 x86-64)
             (tracing-wrapper-entry
               (+ (get-lisp-obj-address tracing-wrapper)
                  (- sb-vm:fun-pointer-lowtag)
@@ -868,20 +868,20 @@ functions when called with no arguments."
                          (ash delta (- sb-vm:word-shift))))))
                ;; the entry point in CODE points to the tracing wrapper
                (setf (code-header-ref code (1+ fun-header-word-index))
-                     #+(or x86 x86-64 arm64) (make-lisp-obj tracing-wrapper-entry)
-                     #-(or x86 x86-64 arm64) tracing-wrapper))))
+                     #+(or arm64 ppc64 x86 x86-64) (make-lisp-obj tracing-wrapper-entry)
+                     #-(or arm64 ppc64 x86 x86-64) tracing-wrapper))))
           (closure
            (with-pinned-objects (traced-fun)
              ;; redirect the original closure to the tracing wrapper
-             #+(or x86 x86-64 arm64)
+             #+(or arm64 ppc64 x86 x86-64)
              (setf (sap-ref-word (int-sap (get-lisp-obj-address traced-fun))
                                  (- sb-vm:n-word-bytes sb-vm:fun-pointer-lowtag))
                    tracing-wrapper-entry)
-             #-(or x86 x86-64 arm64)
+             #-(or arm64 ppc64 x86 x86-64)
              (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address traced-fun))
                                     (- sb-vm:n-word-bytes sb-vm:fun-pointer-lowtag))
                    tracing-wrapper))))))
     ;; Possibly update #'NAME to point to the tracing wrapper
     (when (and namep (eq (fboundp name) traced-fun))
-      (setf (fdefn-fun (find-fdefn name)) tracing-wrapper))
+      (fset name tracing-wrapper))
     tracing-wrapper))

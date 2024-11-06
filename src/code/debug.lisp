@@ -74,7 +74,7 @@ provide bindings for printer control variables.")
   "Should the debugger display beginner-oriented help messages?")
 
 (defun debug-prompt (stream)
-  (sb-thread::get-foreground)
+  (sb-thread:get-foreground)
   (format stream
           "~%~W~:[~;[~W~]] "
           (sb-di:frame-number *current-frame*)
@@ -662,7 +662,8 @@ information."
 
 (defun clean-frame-call (frame argument-limit name method-frame-style info)
   (let ((args (frame-args-as-list frame argument-limit)))
-    (when (typep name '(cons (eql sb-pcl::gf-dispatch)))
+    (when (typep name '(cons (or (eql sb-pcl::gf-dispatch)
+                              (eql sb-impl::specialized-xep))))
       (setf name (cadr name)))
     (cond ((typep name '(cons (eql sb-pcl::fast-method)))
            (clean-fast-method name args method-frame-style info))
@@ -1886,9 +1887,7 @@ forms that explicitly control this kind of evaluation.")
   ;; Walk the catch block chain looking for the first entry with an address
   ;; higher than the pointer for FRAME or a null pointer.
   (let* ((frame-pointer (sb-di::frame-pointer frame))
-         (current-block (int-sap (ldb (byte #.sb-vm:n-word-bits 0)
-                                      (ash sb-vm:*current-catch-block*
-                                           sb-vm:n-fixnum-tag-bits))))
+         (current-block (sb-di::current-catch-block-sap))
          (enclosing-block (loop for block = current-block
                                 then (sap-ref-sap block
                                                   (* sb-vm:catch-block-previous-catch-slot
@@ -1905,12 +1904,10 @@ forms that explicitly control this kind of evaluation.")
   ;; Walk the UWP chain looking for the first entry with an address
   ;; higher than the pointer for FRAME or a null pointer.
   (let* ((frame-pointer (sb-di::frame-pointer frame))
-         (current-uwp (int-sap (ldb (byte #.sb-vm:n-word-bits 0)
-                                    (ash sb-vm::*current-unwind-protect-block*
-                                         sb-vm:n-fixnum-tag-bits))))
+         (current-uwp (sb-di::current-uwp-block-sap))
          (enclosing-uwp (loop for uwp-block = current-uwp
                               then (sap-ref-sap uwp-block
-                                                sb-vm:unwind-block-uwp-slot)
+                                                (* sb-vm:unwind-block-uwp-slot sb-vm:n-word-bytes))
                               when (or (zerop (sap-int uwp-block))
                                        #+stack-grows-downward-not-upward
                                        (sap> uwp-block frame-pointer)
@@ -1992,10 +1989,10 @@ forms that explicitly control this kind of evaluation.")
 #+(and sb-devel x86-64)
 (defun show-catch-tags ()
   (declare (notinline format))
-  (let ((sap (descriptor-sap sb-vm:*current-catch-block*)))
+  (let ((sap (sb-di::current-catch-block-sap)))
     (loop
-     (let ((tag (sap-ref-lispobj sap (ash sb-vm:catch-block-tag-slot 3)))
-           (link (sap-ref-sap sap (ash sb-vm:catch-block-previous-catch-slot 3))))
+     (let ((tag (sap-ref-lispobj sap (ash sb-vm:catch-block-tag-slot sb-vm:word-shift)))
+           (link (sap-ref-sap sap (ash sb-vm:catch-block-previous-catch-slot sb-vm:word-shift))))
        (format t "~S ~A~%" tag link)
        (setq sap link)
        (if (= (sap-int sap) 0) (return))))))

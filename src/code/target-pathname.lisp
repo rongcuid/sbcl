@@ -76,9 +76,6 @@
     (aver (typep piece '(or string symbol (cons (eql :character-set) string)))))
   (%make-pattern (pathname-sxhash pieces) pieces))
 
-(declaim (inline %pathname-directory))
-(defun %pathname-directory (pathname) (car (%pathname-dir+hash pathname)))
-
 (declaim (inline pathname-component-present-p))
 (defun pathname-component-present-p (component)
   (not (typep component 'absent-pathname-component)))
@@ -1286,22 +1283,22 @@ relative to DEFAULTS."
            (type (member nil :host :device :directory :name :type :version)
                  field-key))
   (with-pathname (pathname pathname)
-    (flet ((frob (x)
-             (or (pattern-p x) (member x '(:wild :wild-inferiors)))))
-      (ecase field-key
-        ((nil)
-         (or (wild-pathname-p pathname :host)
-             (wild-pathname-p pathname :device)
-             (wild-pathname-p pathname :directory)
-             (wild-pathname-p pathname :name)
-             (wild-pathname-p pathname :type)
-             (wild-pathname-p pathname :version)))
-        (:host (frob (%pathname-host pathname)))
-        (:device (frob (%pathname-host pathname)))
-        (:directory (some #'frob (%pathname-directory pathname)))
-        (:name (frob (%pathname-name pathname)))
-        (:type (frob (%pathname-type pathname)))
-        (:version (frob (%pathname-version pathname)))))))
+    (labels ((wildp (x)
+               (or (pattern-p x) (if (member x '(:wild :wild-inferiors)) t nil)))
+             (test (field)
+               (wildp
+                (case field
+                  (:host (%pathname-host pathname)) ; always NIL
+                  (:device (%pathname-device pathname))
+                  (:directory
+                   (return-from test (some #'wildp (%pathname-directory pathname))))
+                  (:name (%pathname-name pathname))
+                  (:type (%pathname-type pathname))
+                  (:version (%pathname-version pathname))))))
+      (if (not field-key)
+          ;; SBCL does not allow :WILD in the host
+          (or (test :device) (test :directory) (test :name) (test :type) (test :version))
+          (test field-key)))))
 
 (defun pathname-match-p (in-pathname in-wildname)
   "Pathname matches the wildname template?"
@@ -1598,8 +1595,8 @@ unspecified elements into a completed to-pathname based on the to-wildname."
   (when (string= word "")
     ;; https://www.lispworks.com/documentation/HyperSpec/Body/19_cbb.htm
     (error 'namestring-parse-error
-           :complaint "A string of length 0 is not a valid value for any
-~ component of a logical pathname"
+           :complaint "A string of length 0 is not a valid value for any ~
+                       component of a logical pathname"
            :args (list word)
            :namestring word :offset 0))
   (dotimes (i (length word) (string-upcase word))

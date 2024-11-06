@@ -265,6 +265,14 @@
          (append-args (make-gensym-list (length args))))
     `(lambda (,@list-args ,@append-args) (list* ,@list-args (append ,@append-args)))))
 
+(defoptimizer (append externally-checkable-type) ((&rest lists) node lvar)
+  (if (eq lvar (car (last lists)))
+      (specifier-type t)
+      (specifier-type 'list)))
+
+(setf (fun-info-externally-checkable-type (fun-info-or-lose 'nconc))
+      #'append-externally-checkable-type-optimizer)
+
 (flet ((remove-nil (fun args)
          (let ((remove
                  (loop for (arg . rest) on args
@@ -368,6 +376,12 @@
   (concatenate-subseq-type lvar args))
 (defoptimizer (%concatenate-to-vector-subseq externally-checkable-type) ((type &rest args) node lvar)
   (concatenate-subseq-type lvar args))
+
+(defoptimizer (%concatenate-to-list derive-type) ((&rest args))
+  (loop for arg in args
+        for min = (nth-value 1 (sequence-lvar-dimensions arg))
+        when (typep min '(integer 1))
+        return (specifier-type 'cons)))
 
 ;;; Translate RPLACx to LET and SETF.
 (define-source-transform rplaca (x y)
@@ -513,6 +527,9 @@
                           (specifier-type `(mod ,sb-vm:n-word-bits))) ; word-index
                `(logbitp index (%bignum-ref integer 0))
                `(bignum-logbitp index integer)))
+          ((and (constant-lvar-p index)
+                (< (lvar-value index) sb-vm:n-word-bits))
+           `(logbitp index (logand integer ,most-positive-word)))
           (t
            (give-up-ir1-transform)))))
 
@@ -713,17 +730,17 @@
                                     ;; less than one can round to zero.
                                     `(or (not (fp-zero-p ,res))
                                          (cond ((and (consp ,x) (fp-zero-p ,xb))
-                                                (>= (abs ,yb) 1))
+                                                (sb-xc:>= (abs ,yb) 1))
                                                ((and (consp ,y) (fp-zero-p ,yb))
-                                                (>= (abs ,xb) 1)))))
+                                                (sb-xc:>= (abs ,xb) 1)))))
                                    (sb-xc:/
                                     ;; Dividing a greater-than-zero with
                                     ;; greater than one can round to zero.
                                     `(or (not (fp-zero-p ,res))
                                          (cond ((and (consp ,x) (fp-zero-p ,xb))
-                                                (<= (abs ,yb) 1))
+                                                (sb-xc:<= (abs ,yb) 1))
                                                ((and (consp ,y) (fp-zero-p ,yb))
-                                                (<= (abs ,xb) 1)))))
+                                                (sb-xc:<= (abs ,xb) 1)))))
                                    ((sb-xc:+ sb-xc:-)
                                     ;; Adding or subtracting greater-than-zero
                                     ;; can end up with identity.
@@ -1368,6 +1385,24 @@
                             (car high)))))
          (= (floor low) (floor high)))))
 
+(defun interval-float-p (interval)
+  (let ((low (interval-low interval))
+        (high (interval-high interval)))
+    (flet ((fraction-p (x)
+             (and (numberp x)
+                  (not (integerp x))
+                  (not (zerop (nth-value 1 (truncate x)))))))
+     (and (or (fraction-p low)
+              (if (consp low)
+                  (setf low (car low))))
+          (or (fraction-p high)
+              (and (consp high)
+                   (setf high
+                         (if (fraction-p (car high))
+                             (car high)
+                             (1- (car high))))))
+          (= (floor low) (floor high))))))
+
 (defun interval-constant-p (interval)
   (let ((low (interval-low interval))
         (high (interval-high interval)))
@@ -1463,6 +1498,42 @@
 ;;; optimizations.
 (defvar *derived-numeric-union-complexity-limit* 6)
 
+(defun widen-bignum-types (numeric-type)
+  (labels ((strip-cons (x)
+             (if (consp x)
+                 (car x)
+                 x))
+           (cut-ratio-p (r)
+             (and (ratiop r)
+                  (or (not (fixnump (numerator r)))
+                      (not (fixnump (denominator r))))))
+           (cut-bignum-p (n)
+             (and (integerp n)
+                  (> (integer-length n) 512))))
+    (let* ((lo (strip-cons (numeric-type-low numeric-type)))
+           (hi (strip-cons (numeric-type-high numeric-type)))
+           (new-lo lo)
+           (new-hi hi))
+      (when (cut-ratio-p lo)
+        (setf new-lo
+              (list (floor lo))))
+      (when (cut-ratio-p hi)
+        (setf new-hi
+              (list (ceiling hi))))
+      (let ((lo (strip-cons new-lo)))
+        (when (cut-bignum-p lo)
+          (setf new-lo (if (> lo 0)
+                           (expt 2 512)))))
+      (let ((hi (strip-cons new-hi)))
+        (when (cut-bignum-p hi)
+          (setf new-hi (if (< hi 0)
+                           (- (expt 2 512))))))
+      (if (and (eq lo new-lo)
+               (eq hi new-hi))
+          numeric-type
+          (modified-numeric-type numeric-type :low new-lo
+                                              :high new-hi)))))
+
 (defun make-derived-union-type (type-list)
   (let ((xset (alloc-xset))
         (fp-zeroes '())
@@ -1478,7 +1549,7 @@
                     (add-to-xset member xset)))
               type))
             ((numeric-type-p type)
-             (setf numeric-type (type-union type numeric-type)))
+             (setf numeric-type (type-union (widen-bignum-types type) numeric-type)))
             (t
              (push type misc-types))))
     (setf numeric-type (sb-kernel::weaken-numeric-type-union *derived-numeric-union-complexity-limit* numeric-type))
@@ -2100,17 +2171,17 @@
 (defoptimizer (%unary-truncate derive-type) ((number))
   (one-arg-derive-type number
                        #'%unary-truncate-derive-type-aux
-                       #'%unary-truncate))
+                       #'truncate))
 
 (defoptimizer (%unary-truncate/single-float derive-type) ((number))
   (one-arg-derive-type number
                        #'%unary-truncate-derive-type-aux
-                       #'%unary-truncate))
+                       #'truncate))
 
 (defoptimizer (%unary-truncate/double-float derive-type) ((number))
   (one-arg-derive-type number
                        #'%unary-truncate-derive-type-aux
-                       #'%unary-truncate))
+                       #'truncate))
 
 (defoptimizer (unary-truncate derive-type) ((number))
   (let* ((one (specifier-type '(integer 1 1)))
@@ -2120,52 +2191,42 @@
                                     #'truncate))
          (rem (one-arg-derive-type number
                                    (lambda (x) (truncate-derive-type-rem-aux x one nil))
-                                   #'rem)))
+                                   (lambda (x) (nth-value 1 (truncate x 1))))))
     (when (and quot rem)
       (make-values-type (list quot rem)))))
 
 (deftransform unary-truncate ((number) (integer))
   '(values number 0))
 
-#-round-float
-(progn
-  (defun ftruncate-derive-type-quot (number-type divisor-type)
-    ;; The bounds are the same as for truncate. However, the first
-    ;; result is a float of some type. We need to determine what that
-    ;; type is. Basically it's the more contagious of the two types.
-    (let ((q-type (truncate-derive-type-quot number-type divisor-type))
-          (format (numeric-type-format
-                   (numeric-contagion number-type divisor-type))))
-      (make-numeric-type :class 'float
-                         :format format
-                         :low (coerce-for-bound (numeric-type-low q-type) format)
-                         :high (coerce-for-bound (numeric-type-high q-type) format))))
 
-  (defun ftruncate-derive-type-quot-aux (n d same-arg)
-    (declare (ignore same-arg))
-    (when (and (numeric-type-real-p n)
-               (numeric-type-real-p d))
-      (ftruncate-derive-type-quot n d)))
+(defun ftruncate-derive-type-quot (number-type divisor-type)
+  ;; The bounds are the same as for truncate. However, the first
+  ;; result is a float of some type. We need to determine what that
+  ;; type is. Basically it's the more contagious of the two types.
+  (let ((q-type (truncate-derive-type-quot number-type divisor-type))
+        (format (numeric-type-format
+                 (numeric-contagion number-type divisor-type))))
+    (make-numeric-type :class 'float
+                       :format format
+                       :low (coerce-for-bound (numeric-type-low q-type) format)
+                       :high (coerce-for-bound (numeric-type-high q-type) format))))
 
-
-  (defoptimizer (ftruncate derive-type) ((number divisor))
-    (let ((quot
-            (two-arg-derive-type number divisor
-                                 #'ftruncate-derive-type-quot-aux #'ftruncate))
-          (rem (two-arg-derive-type number divisor
-                                    #'truncate-derive-type-rem-aux #'rem)))
-      (when (and quot rem)
-        (make-values-type (list quot rem)))))
+(defun ftruncate-derive-type-quot-aux (n d same-arg)
+  (declare (ignore same-arg))
+  (when (and (numeric-type-real-p n)
+             (numeric-type-real-p d))
+    (ftruncate-derive-type-quot n d)))
 
 
-  (defoptimizer (%unary-ftruncate derive-type) ((number))
-    (let ((divisor (specifier-type '(integer 1 1))))
-      (one-arg-derive-type number
-                           #'(lambda (n)
-                               (ftruncate-derive-type-quot-aux n divisor nil))
-                           #'%unary-ftruncate))))
+(defoptimizer (ftruncate derive-type) ((number divisor))
+  (let ((quot
+          (two-arg-derive-type number divisor
+                               #'ftruncate-derive-type-quot-aux #'ftruncate))
+        (rem (two-arg-derive-type number divisor
+                                  #'truncate-derive-type-rem-aux #'rem)))
+    (when (and quot rem)
+      (make-values-type (list quot rem)))))
 
-#+round-float
 (macrolet ((derive (type)
              `(case (lvar-value mode)
                 ,@(loop for mode in '(:round :floor :ceiling :truncate)
@@ -2211,7 +2272,7 @@
                                         ,(if high
                                              (round high)
                                              '*))))))
-                       #'%unary-round))
+                       #'round))
 
 ;;; Define optimizers for FLOOR and CEILING.
 (macrolet
@@ -2846,48 +2907,6 @@
            (if (< -1 weight (- radix 10))
                (+ weight 10))))))
 
-(defun character-set-range (lvar)
-  (if (constant-lvar-p lvar)
-      (let ((code (char-code (lvar-value lvar))))
-        (values code code))
-      (let ((type (lvar-type lvar)))
-        (if (typep type 'character-set-type)
-            (loop for (lo . hi) in (character-set-type-pairs type)
-                  minimize lo into min
-                  maximize hi into max
-                  finally (return (values min max)))
-            (values 0 (1- char-code-limit))))))
-
-(defun char<-constraints (char1 char2)
-  (multiple-value-bind (min2 max2) (character-set-range char2)
-    (values (list 'typep char1 (if (zerop max2)
-                                   *empty-type*
-                                   (specifier-type `(character-set ((0 . ,(1- max2)))))))
-            (list 'typep char1 (specifier-type `(character-set ((,min2 . #.(1- char-code-limit)))))))))
-
-(defun char>-constraints (char1 char2)
-  (multiple-value-bind (min2 max2) (character-set-range char2)
-    (values (list 'typep char1 (if (= min2 (1- char-code-limit))
-                                   *empty-type*
-                                   (specifier-type `(character-set ((,(1+ min2) . #.(1- char-code-limit)))))))
-            (list 'typep char1 (specifier-type `(character-set ((0 . ,max2))))))))
-
-(defoptimizer (char< constraint-propagate-if)
-    ((char1 char2))
-  (multiple-value-bind (if1 then1)
-      (char<-constraints char1 char2)
-    (multiple-value-bind (if2 then2)
-        (char>-constraints char2 char1)
-      (values nil nil (list if1 if2) (list then1 then2)))))
-
-(defoptimizer (char> constraint-propagate-if)
-    ((char1 char2))
-  (multiple-value-bind (if1 then1)
-      (char>-constraints char1 char2)
-    (multiple-value-bind (if2 then2)
-        (char<-constraints char2 char1)
-      (values nil nil (list if1 if2) (list then1 then2)))))
-
 (defun signum-derive-type-aux (type)
   (cond ((eq type (specifier-type 'ratio))
          (specifier-type '(or (eql 1) (eql -1))))
@@ -3084,39 +3103,23 @@
 
 (deftransform %ldb ((size posn int) (fixnum fixnum integer) word :node node)
   "convert to inline logical operations"
-  (let ((width (and (constant-lvar-p size)
-                    (constant-lvar-p posn)
-                    (+ (lvar-value size) (lvar-value posn))))
-        (size-max (nth-value 1 (integer-type-numeric-bounds (lvar-type size)))))
-    (cond ((and width
-                (<= width sb-vm:n-fixnum-bits))
-           (let ((size (lvar-value size))
-                 (posn (lvar-value posn)))
-             `(logand (ash (mask-signed-field ,sb-vm:n-fixnum-bits int) ,(- posn))
-                      ,(ash most-positive-word (- size sb-vm:n-word-bits)))))
-          ((and width
-                (<= width sb-vm:n-word-bits))
-           (let ((size (lvar-value size))
-                 (posn (lvar-value posn)))
-             `(logand (ash (logand int ,most-positive-word) ,(- posn))
-                      ,(ash most-positive-word (- size sb-vm:n-word-bits)))))
-          ((let* ((posn-max (nth-value 1 (integer-type-numeric-bounds (lvar-type posn))))
-                  (width (and size-max posn-max
-                              (+ size-max posn-max))))
-             (cond ((not width) nil)
-                   ((<= width sb-vm:n-fixnum-bits)
-                    `(logandc2 (ash (mask-signed-field sb-vm:n-fixnum-bits int) (- posn))
-                               (ash -1 size)))
-                   ((<= width sb-vm:n-word-bits)
-                    `(logandc2 (ash (logand int most-positive-word) (- posn))
-                               (ash -1 size))))))
-          ((not (or (csubtypep (lvar-type int) (specifier-type 'sb-vm:signed-word))
-                    (csubtypep (lvar-type int) (specifier-type 'word))))
-           (delay-ir1-transform node :ir1-phases)
-           (give-up-ir1-transform "not a word-sized integer"))
-          (t
-           `(logandc2 (ash int (- posn))
-                      (ash -1 size))))))
+  (let* ((size-max (nth-value 1 (integer-type-numeric-bounds (lvar-type size))))
+         (posn-max (nth-value 1 (integer-type-numeric-bounds (lvar-type posn))))
+         (width (and size-max posn-max
+                     (+ size-max posn-max))))
+    (cond
+      ((or (csubtypep (lvar-type int) (specifier-type 'sb-vm:signed-word))
+           (csubtypep (lvar-type int) (specifier-type 'word)))
+       `(logandc2 (ash int (- posn))
+                  (ash -1 size)))
+      ((cond ((not width) nil)
+             ((<= width sb-vm:n-fixnum-bits)
+              `(%ldb size posn (mask-signed-field sb-vm:n-fixnum-bits int)))
+             ((<= width sb-vm:n-word-bits)
+              `(%ldb size posn (logand int most-positive-word)))))
+      (t
+       (delay-ir1-transform node :ir1-phases)
+       (give-up-ir1-transform "not a word-sized integer")))))
 
 (deftransform %mask-field ((size posn int) ((integer 0 #.sb-vm:n-word-bits) fixnum integer) word)
   "convert to inline logical operations"
@@ -3558,7 +3561,8 @@
            (result-type (type-intersection type cast)))
       (when (eq result-type *empty-type*)
         (give-up-ir1-transform))
-      (multiple-value-bind (cast-low cast-high) (integer-type-numeric-bounds cast)
+      (multiple-value-bind (cast-low cast-high) (integer-type-numeric-bounds
+                                                 (type-intersection (specifier-type 'integer) cast))
         (unless (and (fixnump cast-low)
                      (fixnump cast-high))
           (give-up-ir1-transform))
@@ -3686,23 +3690,66 @@
 (deftransform floor ((number divisor) (integer integer) * :node node)
   (let ((truncate-type (truncate-derive-type-optimizer node)))
     (if (template-translates 'truncate (combination-args node) (single-value-type truncate-type))
-        `(multiple-value-bind (tru rem) (truncate number divisor)
-           (if (if (minusp divisor)
-                   (> rem 0)
-                   (< rem 0))
-               (values (1- tru) (+ rem divisor))
-               (values tru rem)))
+        (let* ((rem-int (type-approximate-interval (lvar-type divisor)))
+               (rem-type (let* ((low (interval-low rem-int))
+                                (high (interval-high rem-int))
+                                (rem-low (cond ((not low) '*)
+                                               ((>= low 0)
+                                                0)
+                                               (t
+                                                (1+ low))))
+                                (rem-high (cond ((not high) '*)
+                                                ((<= high 0)
+                                                 0)
+                                                (t
+                                                 (1- high)))))
+                           `(integer ,rem-low ,rem-high)))
+               (n-int (type-approximate-interval (lvar-type number)))
+               (quot-type (let* ((low (interval-low n-int))
+                                 (high (interval-high n-int)))
+                            (if (and low high)
+                                (let ((max (max (abs low) (abs high))))
+                                  `(integer ,(- max) ,max))
+                                t))))
+          `(multiple-value-bind (tru rem) (truncate number divisor)
+             (if (if (minusp divisor)
+                     (> rem 0)
+                     (< rem 0))
+                 (values (truly-the ,quot-type (1- tru)) (truly-the ,rem-type (+ rem divisor)))
+                 (values tru (truly-the ,rem-type rem)))))
         (give-up-ir1-transform))))
 
 (deftransform ceiling ((number divisor) (integer integer) * :node node)
   (let ((truncate-type (truncate-derive-type-optimizer node)))
     (if (template-translates 'truncate (combination-args node) (single-value-type truncate-type))
-        `(multiple-value-bind (tru rem) (truncate number divisor)
-           (if (if (minusp divisor)
-                   (< rem 0)
-                   (> rem 0))
-               (values (+ tru 1) (- rem divisor))
-               (values tru rem)))
+        (let* ((rem-int (type-approximate-interval (lvar-type divisor)))
+               (rem-type (let* ((low (interval-low rem-int))
+                                (high (interval-high rem-int))
+                                (rem-low (cond ((not high) '*)
+                                               ((<= high 1)
+                                                0)
+                                               (t (- 1 high))))
+                                (rem-high (cond ((not low) '*)
+                                                ((>= low -1)
+                                                 0)
+                                                (t
+                                                 (- -1 low)))))
+                           `(integer ,rem-low ,rem-high)))
+               (n-int (type-approximate-interval (lvar-type number)))
+               (quot-type (let* ((low (interval-low n-int))
+                                 (high (interval-high n-int)))
+                            (if (and low high)
+                                (let ((max (max (abs low) (abs high))))
+                                  `(integer ,(- max) ,max))
+                                t))))
+          `(multiple-value-bind (tru rem) (truncate number divisor)
+             (if (if (minusp divisor)
+                     (< rem 0)
+                     (> rem 0))
+                 (values (truly-the ,quot-type (+ tru 1))
+                         (truly-the ,rem-type (- rem divisor)))
+                 (values tru
+                         (truly-the ,rem-type rem)))))
         (give-up-ir1-transform))))
 
 (define-source-transform rem (number divisor)
@@ -4350,8 +4397,9 @@
 ;;;; character operations
 
 (deftransform char-equal ((a b) (base-char base-char) *
-                          :policy (>= speed space))
+                          :policy (>= speed space) :node node)
   "open code"
+  (delay-ir1-transform node :constraint)
   '(let* ((ac (char-code a))
           (bc (char-code b))
           (sum (logxor ac bc)))
@@ -4366,8 +4414,9 @@
 
 #+sb-unicode
 (deftransform char-equal ((a b) (base-char character) *
-                          :policy (>= speed space))
+                          :policy (>= speed space) :node node)
   "open code"
+  (delay-ir1-transform node :constraint)
   '(let* ((ac (char-code a))
           (bc (char-code b))
           (sum (logxor ac bc)))
@@ -4378,8 +4427,9 @@
 
 #+sb-unicode
 (deftransform char-equal ((a b) (character base-char) *
-                          :policy (>= speed space))
+                          :policy (>= speed space) :node node)
   "open code"
+  (delay-ir1-transform node :constraint)
   '(let* ((ac (char-code a))
           (bc (char-code b))
           (sum (logxor ac bc)))
@@ -4401,6 +4451,23 @@
 (deftransform char-equal ((a b) (t (constant-arg character)) *
                           :node node)
   (transform-constant-char-equal 'a b))
+
+(defun no-case-character-type-p (type)
+  (and (typep type 'character-set-type)
+       (loop for (start . end) in (character-set-type-pairs type)
+             always (loop for c from start to end
+                          always (not (and #+sb-xc-host
+                                           (or (< 31 c 127)
+                                               (= c 10))
+                                           (both-case-p (code-char c))))))))
+
+(deftransform char-equal ((a b))
+  (cond ((same-leaf-ref-p a b) t)
+        ((or (no-case-character-type-p (lvar-type a))
+             (no-case-character-type-p (lvar-type b)))
+         `(char= a b))
+        (t
+         (give-up-ir1-transform))))
 
 (deftransform char-upcase ((x) (base-char))
   "open code"
@@ -4529,12 +4596,6 @@
        `(lambda (obj i val) (%instance-ref-eq obj i val)))
       ((transform-eq-on-words 'eq x y))
       (t (give-up-ir1-transform)))))
-
-;;; Can't use the above thing, since TYPES-EQUAL-OR-INTERSECT is case sensitive.
-(deftransform char-equal ((x y) * *)
-  (cond
-    ((same-leaf-ref-p x y) t)
-    (t (give-up-ir1-transform))))
 
 ;;; This is similar to SIMPLE-EQUALITY-TRANSFORM, except that we also
 ;;; try to convert to a type-specific predicate or EQ:
@@ -4692,263 +4753,262 @@
   "convert to simpler equality predicate"
   (let ((x-type (lvar-type x))
         (y-type (lvar-type y)))
-    (cond ((same-leaf-ref-p x y) t)
-          ((array-type-dimensions-mismatch x-type y-type)
-           nil)
-          (t
-           (flet ((try (x-type y-type)
-                    (flet ((both-csubtypep (type)
-                             (let ((ctype (specifier-type type)))
-                               (and (csubtypep x-type ctype)
-                                    (csubtypep y-type ctype))))
-                           (some-csubtypep (type)
-                             (let ((ctype (specifier-type type)))
-                               (or (csubtypep x-type ctype)
-                                   (csubtypep y-type ctype))))
-                           (non-equal-array-p (type)
-                             (and (csubtypep type (specifier-type 'array))
-                                  (let ((equal-types (specifier-type '(or bit character)))
-                                        (element-types (ctype-array-specialized-element-types type)))
-                                    (and (neq element-types *wild-type*)
-                                         (notany (lambda (x)
-                                                   (csubtypep x equal-types))
-                                                 element-types))))))
-                      (cond
-                        ((and (constant-lvar-p x)
-                              (equal (lvar-value x) ""))
-                         `(and (stringp y)
-                               (zerop (length y))))
-                        ((and (constant-lvar-p y)
-                              (equal (lvar-value y) ""))
-                         `(and (stringp x)
-                               (zerop (length x))))
-                        ((or (some-csubtypep 'symbol)
-                             (some-csubtypep 'character))
-                         `(eq x y))
-                        ((both-csubtypep 'string)
-                         '(string= x y))
-                        ((both-csubtypep 'bit-vector)
-                         '(bit-vector-= x y))
-                        ((both-csubtypep 'pathname)
-                         '(pathname= x y))
-                        ((or (non-equal-array-p x-type)
-                             (non-equal-array-p y-type))
-                         '(eq x y))
-                        ((multiple-value-bind (x-type y-type)
-                             (equal-remove-incompatible-types x-type y-type)
-                           (cond
-                             ((or (eq x-type *empty-type*)
-                                  (eq y-type *empty-type*))
-                              nil)
-                             ((equal-comparable-types x-type y-type)
-                              :give-up)
-                             ((types-equal-or-intersect x-type y-type)
-                              '(eql x y)))))))))
-             (let ((r (try x-type y-type)))
-               (if (eq r :give-up)
-                   (let* ((not-x-type (type-difference x-type (specifier-type 'null)))
-                          (r (try not-x-type y-type)))
-                     (cond ((not r)
-                            `(eq x y))
-                           ((neq r :give-up)
-                            `(when x
-                               ,r))
-                           (t
-                            (let* ((not-y-type (type-difference y-type (specifier-type 'null)))
-                                   (r (try x-type not-y-type)))
-                              (cond ((not r)
-                                     `(eq x y))
-                                    ((neq r :give-up)
-                                     `(when y
-                                        ,r))
-                                    (t
-                                     (let ((r (try not-x-type not-y-type)))
-                                       (if (neq r :give-up)
-                                           `(if (null x)
-                                                (null y)
-                                                (and y
-                                                     ,r))
-                                           (give-up-ir1-transform)))))))))
-                   r)))))))
+    (flet ((unroll-constant (x y)
+             (when (constant-lvar-p x)
+               (let ((value (lvar-value x)))
+                 (cond ((equal value "")
+                        `(and (stringp ,y)
+                              (zerop (length ,y))))
+                       ((typep value '(cons (or fixnum symbol character) null))
+                        `(and (,(if (car value)
+                                    'listp
+                                    'consp)
+                               ,y)
+                              (eq (car ,y) ',(car value))
+                              (null (cdr ,y)))))))))
+      (cond ((same-leaf-ref-p x y) t)
+            ((array-type-dimensions-mismatch x-type y-type)
+             nil)
+            ((unroll-constant x 'y))
+            ((unroll-constant y 'x))
+            (t
+             (flet ((try (x-type y-type)
+                      (flet ((both-csubtypep (type)
+                               (let ((ctype (specifier-type type)))
+                                 (and (csubtypep x-type ctype)
+                                      (csubtypep y-type ctype))))
+                             (some-csubtypep (type)
+                               (let ((ctype (specifier-type type)))
+                                 (or (csubtypep x-type ctype)
+                                     (csubtypep y-type ctype))))
+                             (non-equal-array-p (type)
+                               (and (csubtypep type (specifier-type 'array))
+                                    (let ((equal-types (specifier-type '(or bit character)))
+                                          (element-types (ctype-array-specialized-element-types type)))
+                                      (and (neq element-types *wild-type*)
+                                           (notany (lambda (x)
+                                                     (csubtypep x equal-types))
+                                                   element-types))))))
+                        (cond
+                          ((or (some-csubtypep 'symbol)
+                               (some-csubtypep 'character))
+                           `(eq x y))
+                          ((both-csubtypep 'string)
+                           '(string= x y))
+                          ((both-csubtypep 'bit-vector)
+                           '(bit-vector-= x y))
+                          ((both-csubtypep 'pathname)
+                           '(pathname= x y))
+                          ((or (non-equal-array-p x-type)
+                               (non-equal-array-p y-type))
+                           '(eq x y))
+                          ((multiple-value-bind (x-type y-type)
+                               (equal-remove-incompatible-types x-type y-type)
+                             (cond
+                               ((or (eq x-type *empty-type*)
+                                    (eq y-type *empty-type*))
+                                nil)
+                               ((equal-comparable-types x-type y-type)
+                                :give-up)
+                               ((types-equal-or-intersect x-type y-type)
+                                '(eql x y)))))))))
+               (let ((r (try x-type y-type)))
+                 (if (eq r :give-up)
+                     (let* ((not-x-type (type-difference x-type (specifier-type 'null)))
+                            (r (try not-x-type y-type)))
+                       (cond ((not r)
+                              `(eq x y))
+                             ((neq r :give-up)
+                              `(when x
+                                 ,r))
+                             (t
+                              (let* ((not-y-type (type-difference y-type (specifier-type 'null)))
+                                     (r (try x-type not-y-type)))
+                                (cond ((not r)
+                                       `(eq x y))
+                                      ((neq r :give-up)
+                                       `(when y
+                                          ,r))
+                                      (t
+                                       (let ((r (try not-x-type not-y-type)))
+                                         (if (neq r :give-up)
+                                             `(if (null x)
+                                                  (null y)
+                                                  (and y
+                                                       ,r))
+                                             (give-up-ir1-transform)))))))))
+                     r))))))))
 
 (deftransform equalp ((x y) * *)
   "convert to simpler equality predicate"
   (let ((x-type (lvar-type x))
         (y-type (lvar-type y)))
-    (cond ((same-leaf-ref-p x y) t)
-          ((array-type-dimensions-mismatch x-type y-type)
-           nil)
-          (t
-           (flet ((try (x-type y-type)
-                    (flet ((both-csubtypep (type)
-                             (let ((ctype (specifier-type type)))
-                               (and (csubtypep x-type ctype)
-                                    (csubtypep y-type ctype))))
-                           (some-csubtypep (type)
-                             (let ((ctype (specifier-type type)))
-                               (or (csubtypep x-type ctype)
-                                   (csubtypep y-type ctype))))
-                           (transform-char-equal (x y)
-                             (and (constant-lvar-p y)
-                                  (characterp (lvar-value y))
-                                  (transform-constant-char-equal x y 'eq))))
-                      (cond
-                        ((and (constant-lvar-p x)
-                              (typep (lvar-value x) '(simple-array * (0))))
-                         `(and (vectorp y)
-                               (zerop (length y))))
-                        ((and (constant-lvar-p y)
-                              (typep (lvar-value y) '(simple-array * (0))))
-                         `(and (vectorp x)
-                               (zerop (length x))))
-                        ((some-csubtypep 'symbol)
-                         `(eq x y))
-                        ((transform-char-equal 'x y))
-                        ((transform-char-equal 'y x))
-                        ((both-csubtypep 'string)
-                         '(string-equal x y))
-                        ((both-csubtypep 'bit-vector)
-                         '(bit-vector-= x y))
-                        ((both-csubtypep 'pathname)
-                         '(pathname= x y))
-                        ((both-csubtypep 'character)
-                         '(char-equal x y))
-                        ((both-csubtypep 'number)
-                         '(= x y))
-                        ((both-csubtypep 'hash-table)
-                         '(hash-table-equalp x y))
-                        ;; TODO: two instances of the same type should dispatch
-                        ;; directly to the EQUALP-IMPL function in the layout.
-                        (t
-                         (multiple-value-bind (x-type y-type)
-                             (equal-remove-incompatible-types x-type y-type t)
-                           (cond
-                             ((or (eq x-type *empty-type*)
-                                  (eq y-type *empty-type*))
-                              nil)
-                             ((types-equal-or-intersect x-type y-type)
-                              (if (equalp-eql-comparable-types x-type y-type)
-                                  '(eql x y)
-                                  :give-up))
-                             ((equalp-comparable-types x-type y-type)
-                              :give-up))))))))
-             (let ((r (try x-type y-type)))
-               (if (eq r :give-up)
-                   (let* ((not-x-type (type-difference x-type (specifier-type 'null)))
-                          (r (try not-x-type y-type)))
-                     (cond ((not r)
-                            `(eq x y))
-                           ((neq r :give-up)
-                            `(when x
-                               ,r))
-                           (t
-                            (let* ((not-y-type (type-difference y-type (specifier-type 'null)))
-                                   (r (try x-type not-y-type)))
-                              (cond ((not r)
-                                     `(eq x y))
-                                    ((neq r :give-up)
-                                     `(when y
-                                        ,r))
-                                    (t
-                                     (let ((r (try not-x-type not-y-type)))
-                                       (if (neq r :give-up)
-                                           `(if (null x)
-                                                (null y)
-                                                (and y
-                                                     ,r))
-                                           (give-up-ir1-transform)))))))))
-                   r)))))))
-
-(defoptimizer (equal constraint-propagate-if) ((x y) node gen)
-  (let* ((x-var (ok-lvar-lambda-var x gen))
-         (y-var (ok-lvar-lambda-var y gen)))
-    (when (or x-var y-var)
-      (labels ((%downgrade (type supertype)
-                 (let ((ctype (specifier-type supertype)))
-                   (if (types-equal-or-intersect type ctype)
-                       (type-union type ctype)
-                       type)))
-               (downgrade (type)
-                 (setf type (%downgrade type 'cons))
-                 (setf type (%downgrade type 'string))
-                 (setf type (%downgrade type 'bit-vector))))
-        (let ((x-type (downgrade (lvar-type x)))
-              (y-type (downgrade (lvar-type y))))
-          (let ((intersection (type-intersection x-type y-type)))
-            (unless (or (eq intersection *empty-type*)
-                        (eq intersection *universal-type*))
-              (let ((constraints))
-                (when x-var
-                  (push (list 'typep x-var intersection) constraints))
-                (when y-var
-                  (push (list 'typep y-var intersection) constraints))
-                (values nil nil constraints)))))))))
-
-(defoptimizer (equalp constraint-propagate-if) ((x y) node gen)
-  (let* ((x-var (ok-lvar-lambda-var x gen))
-         (y-var (ok-lvar-lambda-var y gen)))
-    (when (or x-var y-var)
-      (labels ((%downgrade (type supertype)
-                 (let ((ctype (specifier-type supertype)))
-                   (if (types-equal-or-intersect type ctype)
-                       (type-union type ctype)
-                       type)))
-               (downgrade (type)
-                 (setf type (%downgrade type 'array))
-                 (setf type (%downgrade type 'cons))
-                 (setf type (%downgrade type 'number))
-                 (setf type (%downgrade type 'character))))
-        (let ((x-type (downgrade (lvar-type x)))
-              (y-type (downgrade (lvar-type y))))
-          (let ((intersection (type-intersection x-type y-type)))
-            (unless (or (eq intersection *empty-type*)
-                        (eq intersection *universal-type*))
-              (let ((constraints))
-                (when x-var
-                  (push (list 'typep x-var intersection) constraints))
-                (when y-var
-                  (push (list 'typep y-var intersection) constraints))
-                (values nil nil constraints)))))))))
+    (flet ((unroll-constant (x y)
+             (when (constant-lvar-p x)
+               (let ((value (lvar-value x)))
+                 (cond ((typep value '(simple-array * (0)))
+                        `(and (vectorp ,y)
+                              (zerop (length ,y))))
+                       ((typep value '(cons symbol null))
+                        `(and (,(if (car value)
+                                    'listp
+                                    'consp)
+                               ,y)
+                              (eq (car ,y) ',(car value))
+                              (null (cdr ,y))))
+                       ((and (proper-or-dotted-list-p value)
+                             (loop with cdr = value
+                                   while (consp cdr)
+                                   always (symbolp (pop cdr))))
+                        `(equal x y)))))))
+      (cond ((same-leaf-ref-p x y) t)
+            ((array-type-dimensions-mismatch x-type y-type)
+             nil)
+            ((unroll-constant x 'y))
+            ((unroll-constant y 'x))
+            (t
+             (flet ((try (x-type y-type)
+                      (flet ((both-csubtypep (type)
+                               (let ((ctype (specifier-type type)))
+                                 (and (csubtypep x-type ctype)
+                                      (csubtypep y-type ctype))))
+                             (some-csubtypep (type)
+                               (let ((ctype (specifier-type type)))
+                                 (or (csubtypep x-type ctype)
+                                     (csubtypep y-type ctype))))
+                             (transform-char-equal (x y)
+                               (and (constant-lvar-p y)
+                                    (characterp (lvar-value y))
+                                    (transform-constant-char-equal x y 'eq))))
+                        (cond
+                          ((some-csubtypep 'symbol)
+                           `(eq x y))
+                          ((transform-char-equal 'x y))
+                          ((transform-char-equal 'y x))
+                          ((both-csubtypep 'string)
+                           '(string-equal x y))
+                          ((both-csubtypep 'bit-vector)
+                           '(bit-vector-= x y))
+                          ((and (both-csubtypep 'array)
+                                (not (types-equal-or-intersect x-type (specifier-type '(or string bit-vector))))
+                                (not (types-equal-or-intersect y-type (specifier-type '(or string bit-vector)))))
+                           `(sb-impl::array-equalp x y))
+                          ((both-csubtypep 'pathname)
+                           '(pathname= x y))
+                          ((both-csubtypep 'character)
+                           '(char-equal x y))
+                          ((both-csubtypep 'number)
+                           '(= x y))
+                          ((both-csubtypep 'hash-table)
+                           '(hash-table-equalp x y))
+                          ;; TODO: two instances of the same type should dispatch
+                          ;; directly to the EQUALP-IMPL function in the layout.
+                          (t
+                           (multiple-value-bind (x-type y-type)
+                               (equal-remove-incompatible-types x-type y-type t)
+                             (cond
+                               ((or (eq x-type *empty-type*)
+                                    (eq y-type *empty-type*))
+                                nil)
+                               ((types-equal-or-intersect x-type y-type)
+                                (if (equalp-eql-comparable-types x-type y-type)
+                                    '(eql x y)
+                                    :give-up))
+                               ((equalp-comparable-types x-type y-type)
+                                :give-up))))))))
+               (let ((r (try x-type y-type)))
+                 (if (eq r :give-up)
+                     (let* ((not-x-type (type-difference x-type (specifier-type 'null)))
+                            (r (try not-x-type y-type)))
+                       (cond ((not r)
+                              `(eq x y))
+                             ((neq r :give-up)
+                              `(when x
+                                 ,r))
+                             (t
+                              (let* ((not-y-type (type-difference y-type (specifier-type 'null)))
+                                     (r (try x-type not-y-type)))
+                                (cond ((not r)
+                                       `(eq x y))
+                                      ((neq r :give-up)
+                                       `(when y
+                                          ,r))
+                                      (t
+                                       (let ((r (try not-x-type not-y-type)))
+                                         (if (neq r :give-up)
+                                             `(if (null x)
+                                                  (null y)
+                                                  (and y
+                                                       ,r))
+                                             (give-up-ir1-transform)))))))))
+                     r))))))))
 
 ;;; Convert to EQL if both args are rational and complexp is specified
 ;;; and the same for both.
 (deftransform = ((x y) (number number) *)
   "open code"
-  (let ((x-type (lvar-type x))
-        (y-type (lvar-type y)))
-    (cond ((or (and (csubtypep x-type (specifier-type 'float))
-                    (csubtypep y-type (specifier-type 'float)))
-               (and (csubtypep x-type (specifier-type '(complex float)))
-                    (csubtypep y-type (specifier-type '(complex float))))
-               (and (vop-existsp :named sb-vm::=/complex-single-float)
-                    (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
-                    (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
-               (and (vop-existsp :named sb-vm::=/complex-double-float)
-                    (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
-                    (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
-           ;; They are both floats. Leave as = so that -0.0 is
-           ;; handled correctly.
-           (give-up-ir1-transform))
-          ((or (and (csubtypep x-type (specifier-type 'rational))
-                    (csubtypep y-type (specifier-type 'rational)))
-               (and (csubtypep x-type
-                               (specifier-type '(complex rational)))
-                    (csubtypep y-type
-                               (specifier-type '(complex rational)))))
-           ;; They are both rationals and complexp is the same.
-           ;; Convert to EQL.
-           '(eql x y))
-          ((or (and (csubtypep x-type (specifier-type 'real))
-                    (csubtypep y-type
-                               (specifier-type '(complex rational))))
-               (and (csubtypep y-type (specifier-type 'real))
-                    (csubtypep x-type
-                               (specifier-type '(complex rational)))))
-           ;; Can't be EQL since imagpart can't be 0.
-           nil)
-          (t
-           (give-up-ir1-transform
-            "The operands might not be the same type.")))))
+  (let* ((x-type (lvar-type x))
+         (y-type (lvar-type y)))
+    ;; Inline if the intersecting type is simple:
+    ;; (= (the (or single-float integer) x) 1.5)
+    ;; => (and (single-float-p x) (= x 1.5))
+    (labels ((transform (x-type y-type x y type test)
+               (when (and (csubtypep x-type type)
+                          (not (and (eq test 'fixnump)
+                                    (csubtypep y-type (specifier-type 'rational))))
+                          (not (csubtypep y-type type))
+                          (let ((excluded (type-difference y-type type)))
+                            (and (neq excluded *empty-type*)
+                                 (let ((x-int (type-approximate-interval x-type))
+                                       (y-int (type-approximate-interval excluded)))
+                                   (and x-int
+                                        (or (and y-int
+                                                 (interval-/= x-int y-int))
+                                            (and (interval-float-p x-int)
+                                                 (csubtypep excluded (specifier-type 'integer)))))))))
+                 `(and (,test ,y)
+                       (= ,x (truly-the ,(type-specifier type) ,y)))))
+             (intersecting (type test)
+               (or (transform x-type y-type 'x 'y type test)
+                   (transform y-type x-type 'y 'x type test))))
+      (cond ((intersecting (specifier-type 'single-float) 'single-float-p))
+            ((intersecting (specifier-type 'double-float) 'double-float-p))
+            ((intersecting (specifier-type 'fixnum) 'fixnump))
+            ;; Convert to EQL if both args are rational and complexp is specified
+            ;; and the same for both.
+            ((or (and (csubtypep x-type (specifier-type 'float))
+                      (csubtypep y-type (specifier-type 'float)))
+                 (and (csubtypep x-type (specifier-type '(complex float)))
+                      (csubtypep y-type (specifier-type '(complex float))))
+                 (and (vop-existsp :named sb-vm::=/complex-single-float)
+                      (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
+                      (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
+                 (and (vop-existsp :named sb-vm::=/complex-double-float)
+                      (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
+                      (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
+             ;; They are both floats. Leave as = so that -0.0 is
+             ;; handled correctly.
+             (give-up-ir1-transform))
+            ((or (and (csubtypep x-type (specifier-type 'rational))
+                      (csubtypep y-type (specifier-type 'rational)))
+                 (and (csubtypep x-type
+                                 (specifier-type '(complex rational)))
+                      (csubtypep y-type
+                                 (specifier-type '(complex rational)))))
+             ;; They are both rationals and complexp is the same.
+             ;; Convert to EQL.
+             '(eql x y))
+            ((or (and (csubtypep x-type (specifier-type 'real))
+                      (csubtypep y-type
+                                 (specifier-type '(complex rational))))
+                 (and (csubtypep y-type (specifier-type 'real))
+                      (csubtypep x-type
+                                 (specifier-type '(complex rational)))))
+             ;; Can't be EQL since imagpart can't be 0.
+             nil)
+            (t
+             (give-up-ir1-transform
+              "The operands might not be the same type."))))))
 
 (defun maybe-float-lvar-p (lvar)
   (neq *empty-type* (type-intersection (specifier-type 'float)
@@ -4990,47 +5050,52 @@
     "invert or open code"
     (maybe-invert node '< '> x y)))
 
+;;; Make sure any constant arg is second.
+(macrolet ((def (name inverse)
+             `(deftransform ,name ((x y))
+                (if (and (constant-lvar-p x)
+                         (not (constant-lvar-p y)))
+                    `(,',inverse y x)
+                    (give-up-ir1-transform)))))
+  (def = =)
+  (def < >)
+  (def > <)
+  (def <= >=)
+  (def >= <=))
+
 ;;; See whether we can statically determine (< X Y) using type
 ;;; information. If X's high bound is < Y's low, then X < Y.
 ;;; Similarly, if X's low is >= to Y's high, the X >= Y (so return
-;;; NIL). If not, at least make sure any constant arg is second.
-(macrolet ((def (name inverse reflexive-p surely-true surely-false)
-             `(deftransform ,name ((x y))
-                "optimize using intervals"
+;;; NIL).
+(macrolet ((def (name reflexive-p surely-true surely-false)
+             `(defoptimizer (,name derive-type) ((x y))
                 (if (and (same-leaf-ref-p x y)
                          ;; For non-reflexive functions we don't need
                          ;; to worry about NaNs: (non-ref-op NaN NaN) => false,
                          ;; but with reflexive ones we don't know...
                          ,@(when reflexive-p
-                                 '((and (not (maybe-float-lvar-p x))
-                                        (not (maybe-float-lvar-p y))))))
-                    ,reflexive-p
+                             '((and (not (maybe-float-lvar-p x))
+                                (not (maybe-float-lvar-p y))))))
+                    (specifier-type '(eql ,reflexive-p))
                     (multiple-value-bind (ix x-complex)
                         (type-approximate-interval (lvar-type x))
-                      (unless ix
-                        (give-up-ir1-transform))
-                      (multiple-value-bind (iy y-complex)
-                          (type-approximate-interval (lvar-type y))
-                        (unless iy
-                          (give-up-ir1-transform))
-                        (cond ((and (or (not x-complex)
-                                        (interval-contains-p 0 ix))
-                                    (or (not y-complex)
-                                        (interval-contains-p 0 iy))
-                                    ,surely-true)
-                               t)
-                              (,surely-false
-                               nil)
-                              ((and (constant-lvar-p x)
-                                    (not (constant-lvar-p y)))
-                               `(,',inverse y x))
-                              (t
-                               (give-up-ir1-transform)))))))))
-  (def = = t (interval-= ix iy) (interval-/= ix iy))
-  (def < > nil (interval-< ix iy) (interval->= ix iy))
-  (def > < nil (interval-< iy ix) (interval->= iy ix))
-  (def <= >= t (interval->= iy ix) (interval-< iy ix))
-  (def >= <= t (interval->= ix iy) (interval-< ix iy)))
+                      (when ix
+                        (multiple-value-bind (iy y-complex)
+                            (type-approximate-interval (lvar-type y))
+                          (when iy
+                            (cond ((and (or (not x-complex)
+                                            (interval-contains-p 0 ix))
+                                        (or (not y-complex)
+                                            (interval-contains-p 0 iy))
+                                        ,surely-true)
+                                   (specifier-type '(eql t)))
+                                  (,surely-false
+                                   (specifier-type '(eql nil))))))))))))
+  (def =  t (interval-= ix iy) (interval-/= ix iy))
+  (def <  nil (interval-< ix iy) (interval->= ix iy))
+  (def >  nil (interval-< iy ix) (interval->= iy ix))
+  (def <= t (interval->= iy ix) (interval-< iy ix))
+  (def >= t (interval->= ix iy) (interval-< ix iy)))
 
 (defun ir1-transform-char< (x y first second inverse)
   (cond
@@ -5234,30 +5299,46 @@
   (def <= < ceiling)
   (def >= > floor))
 
-(macrolet ((def (name x y type-x type-y &optional non-fixnum)
-             `(deftransform ,name ((,x ,y) (,type-x ,type-y) * :node node :important nil)
-                (cond ((or (csubtypep (lvar-type i) (specifier-type 'word))
-                           (csubtypep (lvar-type i) (specifier-type 'sb-vm:signed-word)))
-                       (give-up-ir1-transform))
-                      (t
-                       ;; Give the range-transform optimizers a chance to trigger.
-                       (delay-ir1-transform node :ir1-phases)
-                       `(if (fixnump i)
-                            (let ((i (truly-the fixnum i)))
-                              (,',name ,',x ,',y))
-                            ,,non-fixnum))))))
+;;; Do a check for fixnum and a fixnum comparison if the range is
+;;; already restricted to a fixnum on one side.
+(macrolet ((def (name x y type-x type-y check-range &optional non-fixnum)
+               `(deftransform ,name ((,x ,y) (,type-x ,type-y) * :node node :important nil)
+                  (cond ((or (csubtypep (lvar-type i) (specifier-type 'word))
+                             (csubtypep (lvar-type i) (specifier-type 'sb-vm:signed-word)))
+                         (give-up-ir1-transform))
+                        (t
+                         ;; Give the range-transform optimizers a chance to trigger.
+                         (delay-ir1-transform node :ir1-phases)
+                         ',(if (vop-existsp :translate check-range<<=)
+                               check-range
+                               `(if (fixnump i)
+                                    (let ((i (truly-the fixnum i)))
+                                      (,name ,x ,y))
+                                    ,non-fixnum)))))))
 
-  (def < i f (integer #.most-negative-fixnum) fixnum)
-  (def > f i fixnum (integer #.most-negative-fixnum))
+  (def < i f (integer #.most-negative-fixnum) fixnum
+       (check-range<=< most-negative-fixnum i f))
+  (def > f i fixnum (integer #.most-negative-fixnum)
+       (check-range<=< most-negative-fixnum i f))
 
-  (def > i f (integer * #.most-positive-fixnum) fixnum)
-  (def < f i fixnum (integer * #.most-positive-fixnum))
+  (def > i f (integer * #.most-positive-fixnum) fixnum
+       (check-range<<= f i most-positive-fixnum))
+  (def < f i fixnum (integer * #.most-positive-fixnum)
+       (check-range<<= f i most-positive-fixnum))
 
-  (def > i f (integer #.most-negative-fixnum) fixnum t)
-  (def < f i fixnum (integer #.most-negative-fixnum) t)
+  (def > i f (integer #.most-negative-fixnum) fixnum
+       (not (check-range<= most-negative-fixnum i f))
+       t)
+  (def < f i fixnum (integer #.most-negative-fixnum)
+       (not (check-range<= most-negative-fixnum i f))
+       t)
 
-  (def < i f (integer * #.most-positive-fixnum) fixnum t)
-  (def > f i fixnum (integer * #.most-positive-fixnum) t))
+  (def < i f (integer * #.most-positive-fixnum) fixnum
+       (not (check-range<= f i most-positive-fixnum))
+       t)
+  (def > f i fixnum (integer * #.most-positive-fixnum)
+       (not (check-range<= f i most-positive-fixnum))
+       t))
 
 (deftransform < ((x y) (integer (eql #.(1+ most-positive-fixnum))) * :important nil)
   `(not (> x most-positive-fixnum)))
@@ -6310,14 +6391,16 @@
                       :policy (= space 0))
   (when (eq (array-type-upgraded-element-type (lvar-type vector)) *wild-type*)
     (give-up-ir1-transform))
-  `(with-array-data ((vector vector)
-                     (start)
-                     (end)
-                     :check-fill-pointer t)
-     (sb-impl::sort-vector vector
-                           start end
-                           (%coerce-callable-to-fun predicate)
-                           (if key (%coerce-callable-to-fun key) #'identity))))
+  `(progn
+     (with-array-data ((vector vector)
+                       (start)
+                       (end)
+                       :check-fill-pointer t)
+       (sb-impl::sort-vector vector
+                             start end
+                             (%coerce-callable-to-fun predicate)
+                             (if key (%coerce-callable-to-fun key) #'identity)))
+     vector))
 
 (deftransform stable-sort ((sequence predicate &key key)
                            ((or vector list) t))
@@ -6609,6 +6692,8 @@
 ;;; Add transforms in reverse of the order you want them tried
 ;;; (because of stupid semantics)
 (deftransform fboundp ((symbol) (symbol))
+  #+linkage-space `(sb-kernel:fdefn-fun symbol)
+  #-linkage-space
   `(let ((fdefn (sb-vm::%symbol-fdefn symbol)))
      (and (not (eq fdefn 0))
           ;; On 32-bit, where %SYMBOL-FDEFN of NIL returns NIL instead of 0,
@@ -6620,6 +6705,7 @@
 ;;; but this transform is neutral in terms of the sum of code and data size.
 ;;; So for the cost of an FDEFN that might never store a function, the code
 ;;; is smaller by about the size of an fdefn; and it's faster, so do it.
+#-linkage-space
 (deftransform fboundp ((name) ((constant-arg symbol)))
   `(fdefn-fun (load-time-value (find-or-create-fdefn ',(lvar-value name)) t)))
 
@@ -6941,7 +7027,13 @@
     (def range<= 0 0)
     (def range< 1 -1)
     (def range<<= 1 0)
-    (def range<=< 0 -1)))
+    (def range<=< 0 -1))
+
+  (defoptimizer (check-range<= constraint-propagate-if) ((l x h))
+    (let ((l-int (type-approximate-interval (lvar-type l)))
+          (h-int (type-approximate-interval (lvar-type h))))
+      (values x (specifier-type `(integer ,(interval-low l-int)
+                                          ,(interval-high h-int)))))))
 
 (defun find-or-chains (node op)
   (let ((chains (make-array 1 :adjustable t :fill-pointer 1 :initial-element nil)))
@@ -7016,7 +7108,7 @@
            (or (contiguous-sequence values)
                (bit-test-sequence values))))))
 
-(defun replace-chain (chain form)
+(defun replace-chain (chain form &optional kill-last)
   (let* ((node (second (first chain)))
          (lvar (first (combination-args node))))
     (flush-dest (second (combination-args node)))
@@ -7036,7 +7128,11 @@
                  (flush-dest a2)
                  (transform-call node
                                  form
-                                 'or-eq-transform))))))
+                                 'or-eq-transform)
+                 (when kill-last
+                   (kill-if-branch-1 if (if-test if)
+                                     (node-block if)
+                                     (if-consequent if))))))))
 
 (defun single-or-chain (chain)
   (let* ((node (second (first chain)))
@@ -7304,7 +7400,8 @@
                                                                                 key)
                                                                             target)))
 
-                                         (otherwise . ,otherwise))))
+                                         (otherwise . ,otherwise)))
+                          t)
            t)
           ((let ((diff (type-difference (lvar-type lvar)
                                         (specifier-type `(member ,@keys)))))
@@ -7327,10 +7424,10 @@
            (multiple-value-bind (code new-targets)
                (and (slow-findhash-allowed node)
                     (expand-hash-case-for-jump-table keys key-lists
-                                                (append targets
-                                                        (and otherwise
-                                                             (list (cons 'otherwise
-                                                                         otherwise))))))
+                                                     (append targets
+                                                             (and otherwise
+                                                                  (list (cons 'otherwise
+                                                                              otherwise))))))
              (when code
                (replace-chain (reduce #'append chains)
                               `(lambda (key b)
@@ -7340,7 +7437,8 @@
                                                    ,@new-targets
                                                    ,@(and otherwise
                                                           `((otherwise . ,otherwise))))
-                                      code))))
+                                      code))
+                              t))
              t)))))
 
 ;;; Do something when comparing the same value to multiple things.
@@ -7480,3 +7578,77 @@
 (defun key-lists-for-or-eq-transform-p (key-lists)
   (and (= (length key-lists) 1)
        (or-eq-transform-p (first key-lists))))
+
+(defun ensure-lvar-fun-form (lvar lvar-name &key (coercer '%coerce-callable-to-fun)
+                                                 give-up
+                                                 node)
+  (aver (and lvar-name (symbolp lvar-name)))
+  (if (csubtypep (lvar-type lvar) (specifier-type 'function))
+      lvar-name
+      (let ((cname (lvar-constant-global-fun-name lvar)))
+        (cond (cname
+               (when node
+                 (record-late-xref :calls cname node))
+               (if (lvar-annotations lvar)
+                   `(with-annotations ,(lvar-annotations lvar)
+                      (global-function ,cname))
+                   `(global-function ,cname)))
+              (give-up
+               (give-up-ir1-transform
+                ;; No ~S here because if fallback is shown, it wants no quotes.
+                "~A is not known to be a function"
+                ;; LVAR-NAME is not what to show - if only it were that easy.
+                (source-variable-or-else lvar "callable expression")))
+              (t
+               `(,coercer ,lvar-name))))))
+
+(deftransform %coerce-callable-to-fun ((thing) * * :node node)
+  "optimize away possible call to FDEFINITION at runtime"
+  (ensure-lvar-fun-form thing 'thing :give-up t :node node))
+
+;;; Behaves just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
+(deftransform %coerce-callable-for-call ((thing) * * :node node)
+  "optimize away possible call to FDEFINITION at runtime"
+  (ensure-lvar-fun-form thing 'thing :give-up t :coercer '%coerce-callable-for-call :node node))
+
+(define-source-transform %coerce-callable-to-fun (thing &environment env)
+  (ensure-source-fun-form thing env :give-up t))
+
+;;; Change 'f to #'f
+(defoptimizer (%coerce-callable-for-call optimizer) ((fun) node)
+  (let ((uses (lvar-uses fun)))
+    (when (consp uses)
+      (loop for use in uses
+            when (ref-p use)
+            do (let ((leaf (ref-leaf use)))
+                 (when (and (constant-p leaf)
+                            (or (internal-name-p (constant-value leaf))
+                                (almost-immediately-used-p fun use)))
+                   (let ((name (constant-value leaf)))
+                     (record-late-xref :calls name use)
+                     (change-ref-leaf use (find-global-fun name t) :recklessly t)))))))
+  nil)
+
+(defoptimizer (open derive-type) ((filename
+                                   &key
+                                   direction
+                                   if-exists
+                                   if-does-not-exist
+                                   &allow-other-keys))
+  (when (and (or (not if-exists)
+                 (not (types-equal-or-intersect (lvar-type if-exists) (specifier-type 'null))))
+             (or (not if-does-not-exist)
+                 (not (types-equal-or-intersect (lvar-type if-does-not-exist) (specifier-type 'null))))
+             (or (not direction)
+                 if-does-not-exist
+                 (not (types-equal-or-intersect (lvar-type direction) (specifier-type '(eql :probe))))))
+    (specifier-type 'stream)))
+
+;; Absence of a second argument on the pathname accessor defaults to :LOCAL case
+;; which implies that MAYBE-DIDDLE-CASE has no effect.
+(deftransform pathname-host ((p) (pathname)) '(sb-impl::%pathname-host p))
+(deftransform pathname-device ((p) (pathname)) '(sb-impl::%pathname-device p))
+(deftransform pathname-directory ((p) (pathname)) '(sb-impl::%pathname-directory p))
+(deftransform pathname-name ((p) (pathname)) '(sb-impl::%pathname-name p))
+(deftransform pathname-type ((p) (pathname)) '(sb-impl::%pathname-type p))
+(deftransform pathname-version ((p) (pathname)) '(sb-impl::%pathname-version p))

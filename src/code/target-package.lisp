@@ -307,6 +307,7 @@
 
 ;;;; iteration macros
 
+(define-thread-local *clear-resized-symbol-tables* t)
 (defmacro with-package-iterator ((mname package-list &rest symbol-types) &body body)
   "Within the lexical scope of the body forms, MNAME is defined via macrolet
 such that successive invocations of (MNAME) will return the symbols, one by
@@ -319,21 +320,18 @@ of :INHERITED :EXTERNAL :INTERNAL."
     (unless (member symbol '(:internal :external :inherited))
       (%program-error "~S is not one of :INTERNAL, :EXTERNAL, or :INHERITED."
                       symbol)))
-  (with-unique-names (bits index sym-vec pkglist symbol kind)
-    (let ((state (list bits index sym-vec pkglist))
-          (select (logior (if (member :internal  symbol-types) 1 0)
-                          (if (member :external  symbol-types) 2 0)
-                          (if (member :inherited symbol-types) 4 0))))
-      `(multiple-value-bind ,state (package-iter-init ,select ,package-list)
-         (let (,symbol ,kind)
-           (macrolet
-               ((,mname ()
-                   '(if (eql 0 (multiple-value-setq (,@state ,symbol ,kind)
-                                 (package-iter-step ,@state)))
-                        nil
-                        (values t ,symbol ,kind
-                                (car (truly-the list ,pkglist))))))
-             ,@body))))))
+  (let ((enable (logior (if (member :external  symbol-types) 1 0)
+                        (if (member :internal  symbol-types) 2 0)
+                        (if (member :inherited symbol-types) 4 0)))
+        (iter '#:iter))
+    `(let ((,iter (pkg-iter (package-listify ,package-list) ,enable))
+           (*clear-resized-symbol-tables*))
+       (declare (dynamic-extent ,iter))
+       (macrolet ((,mname ()
+                    ;; "status" is the term used in the doc of FIND-SYMBOL for its 2nd value
+                    '(multiple-value-bind (status package symbol) (package-iter-step ,iter)
+                       (when status (values t symbol status package)))))
+         ,@body))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun expand-pkg-iterator (range var body result-form)
@@ -373,6 +371,40 @@ of :INHERITED :EXTERNAL :INTERNAL."
    to the current symbol."
   (expand-pkg-iterator '((list-all-packages) :internal :external)
                        var body-decls result-form))
+
+;;; Utility iteration macros for detecting name conflicts
+(defmacro do-symbol-name-groups (((name syms) symbols) &body body)
+  (sb-int:with-unique-names (table sym next entryp k v)
+    `(let ((,table (make-hash-table :test 'equal)))
+       (dolist (,sym ,symbols)
+         (pushnew ,sym (gethash (symbol-name ,sym) ,table)))
+       (block nil
+         (with-hash-table-iterator (,next ,table)
+           (loop
+             (multiple-value-bind (,entryp ,k ,v)
+                 (,next)
+               (unless ,entryp
+                 (return))
+               (let ((,name ,k)
+                     (,syms (nreverse ,v)))
+                 ,@body))))))))
+
+(defmacro do-external-symbol-name-groups (((name syms) packages) &body body)
+  (sb-int:with-unique-names (table pkg sym next entryp k v)
+    `(let ((,table (make-hash-table :test 'equal)))
+       (dolist (,pkg ,packages)
+         (do-external-symbols (,sym ,pkg)
+           (pushnew ,sym (gethash (symbol-name ,sym) ,table))))
+       (block nil
+         (with-hash-table-iterator (,next ,table)
+           (loop
+             (multiple-value-bind (,entryp ,k ,v)
+                 (,next)
+               (unless ,entryp
+                 (return))
+               (let ((,name ,k)
+                     (,syms (nreverse ,v)))
+                 ,@body))))))))
 
 ;;;; SYMBOL-TABLE stuff
 
@@ -499,16 +531,16 @@ of :INHERITED :EXTERNAL :INTERNAL."
 ;;; calls to ADD-SYMBOL make no attempt to preserve Robinhood's minimization
 ;;; of the maximum probe sequence length. We can do it now because the
 ;;; entire vector will be swapped, which is concurrent reader safe.
-(defun resize-symbol-table (table size splat &optional (load-factor 3/4))
-  (when (zerop size)
+(defun resize-symbol-table (table size reason &optional (load-factor 3/4))
+  (when (zerop size) ; Q: when do we resize to zero; everything gets uninterned?
     (return-from resize-symbol-table
       ;; Don't need a barrier here. Suppose a reader finished probing with a miss.
       ;; Whether it re-probes again or not, it will surely result in a miss.
-      (setf (symtbl-%cells table)
-            (load-time-value (cons (make-symtbl-magic 0 0 0) #(0 0 0)) t)
-            (symtbl-free table) 0
-            (symtbl-size table) 0
-            (symtbl-deleted table) 0)))
+      (let ((new (load-time-value (cons (make-symtbl-magic 0 0 0) #(0 0 0)) t)))
+        (setf (symtbl-free table) 0
+              (symtbl-deleted table) 0
+              (symtbl-size table) 0
+              (symtbl-%cells table) new))))
   (let* ((temp-table (make-symbol-table size load-factor))
          (cells (symtbl-%cells temp-table))
          (reciprocals (car cells))
@@ -563,14 +595,17 @@ of :INHERITED :EXTERNAL :INTERNAL."
           (setf (symtbl-size table) (symtbl-size temp-table)
                 (symtbl-free table) (symtbl-free temp-table)
                 (symtbl-deleted table) 0)
-          ;; Splat with 0 to reduce garbage tenuring. Readers who searched the old VEC
-          ;; may miss spuriously, but will retry because they can detect that %CELLS changed.
-          ;; Exception: UNINTERN must not splat the vector because it is permitted to
-          ;; UNINTERN while iterating over symbols. We never re-fetch the vector, as doing
-          ;; that would cause extreme complications in deciding what symbols to produce.
-          ;; As such, we simply avoid splatting if called by UNINTERN.
-          ;; (Also, the constant vector of an empty package hashtable.)
-          (when (and splat (not (read-only-space-obj-p old)))
+          ;; Try to splat with 0 to reduce garbage tenuring based on a pre-test:
+          ;; - If the current thread has bound *CLEAR-RESIZED-SYMBOL-TABLES* to NIL,
+          ;;   meaning that it is within the dynamic extent of WITH-PACKAGE-ITERATOR,
+          ;;   splat only if the package modification is NOT a permissible one.
+          ;; - If the currrent thread has NOT bound the special variable, always splat.
+          ;; Concurrent readers who searched the old VEC may miss spuriously, but will retry
+          ;; because they can detect that %CELLS changed. In this manner, FIND-SYMBOL
+          ;; remains lock-free while allowing resizing and splatting.
+          (when (and (or *clear-resized-symbol-tables*
+                         (not (memq reason '(unintern export unexport)))) ; permissible
+                     (not (read-only-space-obj-p old)))
             (fill old 0))
           new)))))
 
@@ -592,7 +627,7 @@ locked. Signals an error if PACKAGE is not a valid package designator"
              ;; What horrible fate befalls you for unsetting that.
              (when (and (typep x '(and symbol (not null)))
                         (test-header-data-bit x sb-vm::+symbol-fast-bindable+))
-               (sb-c::unset-symbol-progv-optimize x)))))
+               (unset-symbol-progv-optimize x)))))
     (let ((p (find-undeleted-package-or-lose package)))
       (setf (package-lock p) t)
       (unoptimize (package-internal-symbols p))
@@ -855,7 +890,9 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
      (do-pkg-table ((,package) *all-packages*) ,@body)))
 
 (defun package-%used-by-list (package &aux (wp (package-%used-by package)))
-  (or (and wp (weak-pointer-value wp))
+  (acond
+     ((and wp (weak-pointer-value wp)) (if (eq it :none) nil it))
+     (t
       ;; Ensure that the "uses" relation is fixed by acquiring the graph lock.
       ;; Additionally, DO-PACKAGES will acquire the name table lock.
       (with-package-graph ()
@@ -864,10 +901,8 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
           (do-packages (user)
             (when (find me (package-tables user))
               (push user list)))
-          ;; A minor deficiency: if the actual result is NIL, it will appear to
-          ;; always need recomputation. Honestly it's not worth caring about.
-          (setf (package-%used-by package) (if list (make-weak-pointer list)))
-          list))))
+         (setf (package-%used-by package) (make-weak-pointer (or list :none)))
+         list)))))
 
 (macrolet ((def (ext real)
              `(defun ,ext (package-designator)
@@ -1070,9 +1105,9 @@ Experimental: interface subject to change."
 
 ;;; Add a symbol to a hashset. The symbol MUST NOT be present.
 ;;; This operation is under the WITH-PACKAGE-GRAPH lock if called by %INTERN.
-(defun add-symbol (table symbol)
+(defun add-symbol (table symbol reason &aux (cells (symtbl-%cells table)))
   (setf (symtbl-modified table) t)
-  (when (zerop (symtbl-free table))
+  (when (or (zerop (symtbl-free table)) (/= 0 (symtbl-immutable (car cells))))
     ;; The hashtable is full. Resize it to be able to hold twice the
     ;; amount of symbols than it currently contains. The actual new size
     ;; can be smaller than twice the current size if the table contained
@@ -1080,9 +1115,8 @@ Experimental: interface subject to change."
     ;; N.B.: Never pass 0 for the new size, as that will assign the
     ;; constant read-only vector #(0 0 0) into the cells.
     (let ((new-size (max 1 (* (- (symtbl-size table) (symtbl-deleted table)) 2))))
-      (resize-symbol-table table new-size t)))
-  (let* ((cells (symtbl-%cells table))
-         (reciprocals (car cells))
+      (setq cells (resize-symbol-table table new-size reason))))
+  (let* ((reciprocals (car cells))
          (vec (truly-the simple-vector (cdr cells)))
          (len (length vec))
          (name-hash (symbol-name-hash symbol))
@@ -1270,25 +1304,10 @@ Experimental: interface subject to change."
                     (probe)))))))))
 
 ;;; Delete SYMBOL from TABLE, storing -1 in its place. SYMBOL must exist.
-;;;
-;;; NOTE: It's possible that NUKE-SYMBOL should never 0-fill the old symbol-table if downsizing.
-;;; CLHS nowhere implies that altering accessability of a symbol already _present_ in a package
-;;; counts as INTERNing. Iterating over directly present symbols of a package permits UNINTERN on
-;;; the current symbol, which might rehash the storage vector, creating a new one. To allow it,
-;;; UNINTERN does not 0-fill the old vector, so any observers of that vector still see all symbols
-;;; beyond the cursor. But what if the operation is EXPORT or UNEXPORT? This moves the symbol from
-;;; one table to the other for that same package. EXPORT would remove from internals and move to
-;;; externals. If the internals can down-size and 0-fill (as we do), then symbols beyond the cursor
-;;; are missed. The argument in favaor of allowing EXPORT would seem to be that EXPORT is not
-;;; technically INTERNing in this case. But the argument _against_ allowing EXPORT or UNEXPORT
-;;; is that there is one and only one exception specifically called out as permissible, namely:
-;;;  "the current symbol may be uninterned from the package being traversed."
-;;; If it were _also_ intended to be permissible to EXPORT or UNEXPORT, would it not have said
-;;; that it is permissible to change accessibility ? I'm not sure.
-(defun nuke-symbol (table symbol splat)
+(defun nuke-symbol (table symbol reason)
   (let ((cells (symtbl-%cells table)))
     (when (functionp (car cells)) ; change table back to not-perfectly-hashed
-      (resize-symbol-table table (length (cdr cells)) splat)))
+      (resize-symbol-table table (length (cdr cells)) reason)))
   (let* ((string (symbol-name symbol))
          (length (length string))
          (hash (symbol-name-hash symbol)))
@@ -1305,7 +1324,7 @@ Experimental: interface subject to change."
   (let ((size (symtbl-size table))
         (used (%symtbl-count table)))
     (when (< used (truncate size 4))
-      (resize-symbol-table table (* used 2) splat))))
+      (resize-symbol-table table (* used 2) reason))))
 
 (defun list-all-packages ()
   "Return a list of all existing packages."
@@ -1391,10 +1410,10 @@ Experimental: interface subject to change."
                 ;; This matters in the case of concurrent INTERN.
                 (%set-symbol-package symbol package)
                 (if ignore-lock
-                    (add-symbol table symbol)
+                    (add-symbol table symbol 'intern)
                     (with-single-package-locked-error
                         (:package package "interning ~A" symbol-name)
-                      (add-symbol table symbol)))
+                      (add-symbol table symbol 'intern)))
                 (values symbol nil)))))))
 
 (macrolet ((find/intern (function package-lookup &rest more-args)
@@ -1485,20 +1504,28 @@ Experimental: interface subject to change."
              (name-conflict-symbols c)))))
 
 (defun name-conflict (package function datum &rest symbols)
-  (flet ((importp (c)
+  (flet ((import1p (c)
            (declare (ignore c))
-           (eq 'import function))
-         (use-or-export-p (c)
+           (and (eq 'import function)
+                ;; exactly two symbols are involved in the conflict
+                (null (cddr symbols)) (null (cdr datum))
+                ;; one of the symbols is already accessible in the package
+                (nth-value 1 (find-symbol (symbol-name (car datum)) package))))
+         (use1-or-export-p (c)
            (declare (ignore c))
-           (or (eq 'use-package function)
+           (or (and (eq 'use-package function)
+                    (null (cddr symbols)) (null (cdr datum))
+                    (nth-value 1 (find-symbol (symbol-name (car datum)) package)))
                (eq 'export function)))
          (old-symbol ()
-           (car (remove datum symbols))))
+           (ecase function
+             ((export) (car (remove datum symbols)))
+             ((use-package import) (find-symbol (symbol-name (car datum)) package)))))
     (let ((pname (package-name package)))
       (restart-case
           (error 'name-conflict :package package :symbols symbols
                                 :function function :datum datum)
-        ;; USE-PACKAGE and EXPORT
+        ;; USE-PACKAGE with a pair of symbols conflicting, and EXPORT
         (keep-old ()
           :report (lambda (s)
                     (ecase function
@@ -1506,9 +1533,9 @@ Experimental: interface subject to change."
                        (format s "Keep ~S accessible in ~A (shadowing ~S)."
                                (old-symbol) pname datum))
                       (use-package
-                       (format s "Keep symbols already accessible in ~A (shadowing others)."
-                               pname))))
-          :test use-or-export-p
+                       (format s "Keep ~S accessible in ~A (shadowing ~S)."
+                               (old-symbol) pname (car datum)))))
+          :test use1-or-export-p
           (dolist (s (remove-duplicates symbols :test #'string=))
             (shadow (symbol-name s) package)))
         (take-new ()
@@ -1518,26 +1545,24 @@ Experimental: interface subject to change."
                        (format s "Make ~S accessible in ~A (uninterning ~S)."
                                datum pname (old-symbol)))
                       (use-package
-                       (format s "Make newly exposed symbols accessible in ~A, ~
-                                  uninterning old ones."
-                               pname))))
-          :test use-or-export-p
+                       (format s "Make ~S accessible in ~A (uninterning ~S)."
+                               (car datum) pname (old-symbol)))))
+          :test use1-or-export-p
           (dolist (s symbols)
             (when (eq s (find-symbol (symbol-name s) package))
               (unintern s package))))
-        ;; IMPORT
+        ;; IMPORT with a pair of symbols conflicting.
         (shadowing-import-it ()
           :report (lambda (s)
                     (format s "Shadowing-import ~S, uninterning ~S."
-                            datum (old-symbol)))
-          :test importp
+                            (car datum) (old-symbol)))
+          :test import1p
           (shadowing-import datum package))
         (dont-import-it ()
           :report (lambda (s)
                     (format s "Don't import ~S, keeping ~S."
-                            datum
-                            (car (remove datum symbols))))
-          :test importp)
+                            (car datum) (old-symbol)))
+          :test import1p)
         ;; General case. This is exposed via SB-EXT.
         (resolve-conflict (chosen-symbol)
           :report "Resolve conflict."
@@ -1562,7 +1587,7 @@ Experimental: interface subject to change."
                     (return (list (nth (1- i) symbols))))))))
           (multiple-value-bind (package-symbol status)
               (find-symbol (symbol-name chosen-symbol) package)
-            (let* ((accessiblep status)     ; never NIL here
+            (let* ((accessiblep status)
                    (presentp (and accessiblep
                                   (not (eq :inherited status)))))
               (ecase function
@@ -1585,7 +1610,7 @@ Experimental: interface subject to change."
                      (if (eq package-symbol chosen-symbol)
                          nil                ; re-importing the same symbol
                          (shadowing-import (list chosen-symbol) package))
-                     (shadowing-import (list chosen-symbol) package)))))))))))
+                     (import (list chosen-symbol) package)))))))))))
 
 ;;; If we are uninterning a shadowing symbol, then a name conflict can
 ;;; result, otherwise just nuke the symbol.
@@ -1624,7 +1649,7 @@ uninterned."
                                   (package-internal-symbols package)
                                   (package-external-symbols package))
                               symbol
-                              nil)
+                              'unintern)
                  (if (eq (sb-xc:symbol-package symbol) package)
                      (%set-symbol-package symbol nil))
                  t)
@@ -1697,8 +1722,13 @@ uninterned."
         (let ((internal (package-internal-symbols package))
               (external (package-external-symbols package)))
           (dolist (sym syms)
-            (add-symbol external sym)
-            (nuke-symbol internal sym t))))
+            ;; no error if this condition is false: inaccessibility
+            ;; and subsequent conflicts handled above by IMPORT can
+            ;; mean that some symbols in the original export list are
+            ;; not exportable.
+            (when (eql (find-symbol (symbol-name sym) package) sym)
+              (add-symbol external sym 'export)
+              (nuke-symbol internal sym 'export)))))
       t)))
 
 ;;; Check that all symbols are accessible, then move from external to internal.
@@ -1723,8 +1753,8 @@ uninterned."
         (let ((internal (package-internal-symbols package))
               (external (package-external-symbols package)))
           (dolist (sym syms)
-            (add-symbol internal sym)
-            (nuke-symbol external sym t))))
+            (add-symbol internal sym 'unexport)
+            (nuke-symbol external sym 'unexport))))
       t)))
 
 ;;; Check for name conflict caused by the import and let the user
@@ -1755,18 +1785,16 @@ the importation, then a correctable error is signalled."
            (homeless (remove-if #'sb-xc:symbol-package symbols))
            (syms ()))
       (with-single-package-locked-error ()
-        (dolist (sym symbols)
-          (multiple-value-bind (s w) (find-symbol (symbol-name sym) package)
+        (do-symbol-name-groups ((n ss) symbols)
+          (multiple-value-bind (s w) (find-symbol n package)
             (cond ((not w)
-                   (let ((found (member sym syms :test #'string=)))
-                     (if found
-                         (when (not (eq (car found) sym))
-                           (setf syms (remove (car found) syms))
-                           (name-conflict package 'import sym sym (car found)))
-                         (push sym syms))))
-                  ((not (eq s sym))
-                   (name-conflict package 'import sym sym s))
-                  ((eq w :inherited) (push sym syms)))))
+                   (if (not (null (cdr ss)))
+                       (apply #'name-conflict package 'import ss ss)
+                       (push (car ss) syms)))
+                  ((and (eql (car ss) s) (null (cdr ss)))
+                   (if (eq w :inherited) (push s syms)))
+                  (t
+                   (apply #'name-conflict package 'import ss (adjoin s ss))))))
         (when (or homeless syms)
           (let ((union (delete-duplicates (append homeless syms))))
             (assert-package-unlocked package "importing symbol~P ~{~A~^, ~}"
@@ -1774,7 +1802,7 @@ the importation, then a correctable error is signalled."
         ;; Add the new symbols to the internal hashtable.
         (let ((internal (package-internal-symbols package)))
           (dolist (sym syms)
-            (add-symbol internal sym)))
+            (add-symbol internal sym 'import)))
         ;; If any of the symbols are uninterned, make them be owned by PACKAGE.
         (dolist (sym homeless)
           (%set-symbol-package sym package))
@@ -1805,7 +1833,7 @@ the importation, then a correctable error is signalled."
                 (setf (package-%shadowing-symbols package)
                       (remove s (the list (package-%shadowing-symbols package))))
                 (unintern s package))
-              (add-symbol internal sym))
+              (add-symbol internal sym 'shadowing-import))
             (pushnew sym (package-%shadowing-symbols package)))))))
   t)
 
@@ -1833,7 +1861,7 @@ it is not already present."
               (unless (present-p w)
                 (setq s (%make-symbol 2 name)) ; 2 = random interned symbol
                 (%set-symbol-package s package)
-                (add-symbol internal s))
+                (add-symbol internal s 'shadow))
               (pushnew s (package-%shadowing-symbols package))))))))
   t)
 
@@ -1848,67 +1876,45 @@ PACKAGE."
   ;; If user code further affects the name -> package mapping while concurrently
   ;; doing a USE-PACKAGE, that not our problem)
   (let ((package
-         (let ((pkg (find-undeleted-package-or-lose package)))
-           ;; "package [...] cannot be the KEYWORD package."
-           (when (eq pkg *keyword-package*)
-             (error "~S can't use packages" pkg))
-           pkg))
-        (packages (package-listify packages-to-use)))
+          (let ((pkg (find-undeleted-package-or-lose package)))
+            ;; "package [...] cannot be the KEYWORD package."
+            (when (eq pkg *keyword-package*)
+              (error "~S can't use packages" pkg))
+            pkg))
+        (deduped-packages (remove-duplicates (package-listify packages-to-use) :from-end t))
+        (packages))
     ;; "packages-to-use ... The KEYWORD package may not be supplied."
     (when (memq *keyword-package* packages)
       (error "Can not USE-PACKAGE ~S" *keyword-package*))
     (with-package-graph ()
-      ;; Loop over each package, USE'ing one at a time...
       (with-single-package-locked-error ()
-        (dolist (pkg packages)
+        (dolist (pkg deduped-packages)
+          ;; Loop over each package, checking for lock and for
+          ;; already-used one at a time...
           (unless (find (package-external-symbols pkg) (package-tables package))
             (assert-package-unlocked package "using package~P ~{~A~^, ~}"
                                      (length packages) packages)
-            (let ((shadowing-symbols (package-%shadowing-symbols package))
-                  (use-list (package-%use-list package)))
+            (push pkg packages)))
+        (setq packages (nreverse packages)))
+      ;; ... but USE all the packages in one go (after resolving any
+      ;; name conflicts)
+      (let ((shadowing-symbols (package-%shadowing-symbols package)))
+        (do-external-symbol-name-groups ((n ss) packages)
+          (multiple-value-bind (s w) (find-symbol n package)
+            (cond
+              ((not w)
+               (when (not (null (cdr ss)))
+                 (apply #'name-conflict package 'use-package ss ss)))
+              ((and (eql s (car ss)) (null (cdr ss))))
+              ((member s shadowing-symbols))
+              (t (apply #'name-conflict package 'use-package ss (adjoin s ss)))))))
 
-              ;; If the number of symbols already accessible is less
-              ;; than the number to be inherited then it is faster to
-              ;; run the test the other way. This is particularly
-              ;; valuable in the case of a new package USEing
-              ;; COMMON-LISP.
-              (cond
-                ((< (+ (package-internal-symbol-count package)
-                       (package-external-symbol-count package)
-                       (let ((res 0))
-                         (dolist (p use-list res)
-                           (incf res (package-external-symbol-count p)))))
-                    (package-external-symbol-count pkg))
-                 (do-symbols (sym package)
-                   (let ((s (find-external-symbol (symbol-name sym) pkg)))
-                     (when (and (not (eql s 0))
-                                (not (eq s sym))
-                                (not (member sym shadowing-symbols)))
-                       (name-conflict package 'use-package pkg sym s))))
-                 (dolist (p use-list)
-                   (do-external-symbols (sym p)
-                     (let ((s (find-external-symbol (symbol-name sym) pkg)))
-                       (when (and (not (eql s 0))
-                                  (not (eq s sym))
-                                  (not (member
-                                        (find-symbol (symbol-name sym) package)
-                                        shadowing-symbols)))
-                         (name-conflict package 'use-package pkg sym s))))))
-                (t
-                 (do-external-symbols (sym pkg)
-                   (multiple-value-bind (s w)
-                       (find-symbol (symbol-name sym) package)
-                     (when (and w
-                                (not (eq s sym))
-                                (not (member s shadowing-symbols)))
-                       (name-conflict package 'use-package pkg sym s)))))))
-
-            (setf (package-tables package)
-                  (let ((tbls (package-tables package)))
-                    (replace (make-array (1+ (length tbls))
-                              :initial-element (package-external-symbols pkg))
-                             tbls)))
-            (setf (package-%used-by pkg) nil)))))) ; recomputed on demand
+      (let ((tbls (package-tables package))
+            (added-tbls (mapcar #'package-external-symbols packages)))
+        (setf (package-tables package)
+              (concatenate 'vector tbls added-tbls)))
+      (dolist (pkg packages)
+        (setf (package-%used-by pkg) nil)))) ; recomputed on demand
   t)
 
 (defun unuse-package (packages-to-unuse &optional (package (sane-package)))
@@ -1975,7 +1981,7 @@ PACKAGE."
       (flet ((!make-table (input)
                (let ((table (make-symbol-table (length (the simple-vector input)))))
                  (dovector (symbol input table)
-                   (add-symbol table symbol)))))
+                   (add-symbol table symbol 'intern)))))
         (let ((externals (!make-table external-v)))
           (setf (package-external-symbols pkg) externals
                 (package-internal-symbols pkg) (!make-table internal-v)
@@ -2010,87 +2016,95 @@ PACKAGE."
 
 ;;; support for WITH-PACKAGE-ITERATOR
 
-(defun package-iter-init (access-types pkg-designator-list)
-  (declare (type (integer 1 7) access-types)) ; a nonzero bitmask over types
-  (values (logior (ash access-types 3) #b11) 0 #()
-          (package-listify pkg-designator-list)))
-
-;; The STATE parameter is comprised of 4 packed fields
-;;  [0:1] = substate {0=internal,1=external,2=inherited,3=initial}
-;;  [2]   = package with inherited symbols has shadowing symbols
-;;  [3:5] = enabling bits for {internal,external,inherited}
-;;  [6:]  = index into 'package-tables'
-;;
-(defconstant +package-iter-check-shadows+  #b000100)
-
-(defun package-iter-step (start-state index sym-vec pkglist)
-  ;; the defknown isn't enough
-  (declare (type fixnum start-state) (type index index)
-           (type simple-vector sym-vec) (type list pkglist))
-  (declare (optimize speed) (muffle-conditions compiler-note))
+(defun package-iter-step (iter)
+  (declare (optimize speed))
+  ;; Keeping in mind that (DO-SYMBOLS (s p) (EXPORT s p)) is a prevalent idiom among users,
+  ;; the right thing for us is to produce external symbols before producing internals.
+  ;; We'll never double-visit an external. It does mean, however, that we must solve the
+  ;; double-visit problem for UNEXPORT of externals, as those symbols will appear in
+  ;; internals. The difficulties are symmetrical, but solving the problem that occurs
+  ;; hypothetically less often is better, as the solution involves consing.
   (labels
-      ((advance (state) ; STATE is the one just completed
-         (case (logand state #b11)
-           ;; Test :INHERITED first because the state repeats for a package
-           ;; as many times as there are packages it uses. There are enough
-           ;; bits to count up to 2^23 packages if fixnums are 30 bits.
-           (2
-            (when (desired-state-p 2)
-              (let* ((tables (package-tables (this-package)))
-                     (next-state (the fixnum (+ state (ash 1 6))))
-                     (table-idx (ash next-state -6)))
-              (when (< table-idx (length tables))
-                (return-from advance ; remain in state 2
-                  (start next-state (svref tables table-idx))))))
-            (pop pkglist)
-            (advance 3)) ; start on next package
-           (1 ; finished externals, switch to inherited if desired
-            (when (desired-state-p 2)
-              (let ((tables (package-tables (this-package))))
-                (when (plusp (length tables)) ; inherited symbols
-                  (return-from advance ; enter state 2
-                    (start (if (package-%shadowing-symbols (this-package))
-                               (logior 2 +package-iter-check-shadows+) 2)
-                           (svref tables 0))))))
-            (advance 2)) ; skip state 2
-           (0 ; finished internals, switch to externals if desired
-            (if (desired-state-p 1) ; enter state 1
-                (start 1 (package-external-symbols (this-package)))
-                (advance 1))) ; skip state 1
-           (t ; initial state
-            (cond ((endp pkglist) ; latch into returning NIL forever more
-                   (values 0 0 #() '() nil nil))
-                  ((desired-state-p 0) ; enter state 0
-                   (start 0 (package-internal-symbols (this-package))))
-                  (t (advance 0)))))) ; skip state 0
-       (desired-state-p (target-state)
-         (logtest start-state (ash 1 (+ target-state 3))))
-       (this-package ()
-         (truly-the package (car pkglist)))
-       (start (next-state new-table)
-         (let ((symbols (symtbl-cells new-table)))
-           (package-iter-step (logior (mask-field (byte 3 3) start-state)
-                                      next-state)
-                              ;; assert that physical length was nonzero
-                              (the index (length symbols))
-                              symbols pkglist))))
-    (declare (inline desired-state-p this-package))
-    (if (zerop index)
-        (advance start-state)
-        (macrolet ((scan (&optional (guard t))
-                   `(loop
-                     (let ((sym (aref sym-vec (decf index))))
-                       (when (and (pkg-symbol-valid-p sym) ,guard)
-                         (return (values start-state index sym-vec pkglist sym
-                                         (aref #(:internal :external :inherited)
-                                               (logand start-state 3))))))
-                     (when (zerop index)
-                       (return (advance start-state))))))
+      ((advance-from-state (bits &aux (cur-pkg
+                                       (truly-the package (car (pkg-iter-pkglist iter)))))
+         ;; For most platforms, this CASE should become a jump-table, therefore the order
+         ;; in which to test clauses is not as relevant as if may have once been.
+         (case (logand bits #b11)
+           (2 ; state 2 repeats as many times as there are packages used by cur-package
+            (let* ((tables (package-tables cur-pkg))
+                   (next-state (the fixnum (+ bits #b100)))
+                   (table-idx (ash next-state -2)))
+              (if (< table-idx (length tables)) ; remain in state 2
+                  (start next-state (symtbl-cells (svref tables table-idx)))
+                  (start-next-pkg))))
+           (1 ; finished internals, switch to inherited if desired
+            (let ((tables (package-tables cur-pkg)))
+              (setf (pkg-iter-exclude iter) (package-%shadowing-symbols cur-pkg))
+              (if (and (plusp (length tables)) (logbitp 2 (pkg-iter-enable iter)))
+                  (start 2 (symtbl-cells (svref tables 0)))
+                  (start-next-pkg)))) ; bypass state 2 entirely
+           (0 ; finished externals, switch to internals if desired
+            (if (logbitp 1 (pkg-iter-enable iter)) ; enter state 1
+                (let ((snapshot (shiftf (pkg-iter-snapshot iter) nil)))
+                  (start 1 (cond ((null snapshot)
+                                  (symtbl-cells (package-internal-symbols cur-pkg)))
+                                 (t (atomic-decf (symtbl-immutable (car snapshot)))
+                                    (cdr snapshot)))))
+                (advance-from-state 1))) ; skip the internals
+           (3 ; initial state
+            (let ((pkglist (pkg-iter-pkglist iter)))
+              (cond ((not pkglist)
+                     (setf (pkg-iter-bits iter) -1) ; ensure further -STEP calls drop to state 3
+                     (values nil *cl-package* nil)) ; type-correct 2nd value!
+                    ((not (logbitp 0 (pkg-iter-enable iter))) (advance-from-state 0))
+                    (t ; enter state 0 (externals)
+                     (let ((pkg (truly-the package (car pkglist))))
+                       (when (logbitp 1 (pkg-iter-enable iter)) ; will visit internals
+                         ;; - Capture the internal symbol vector as it exists now, not later.
+                         ;; - Bump the copy-on-write count and undo it after visiting externals.
+                         ;;   But in fact it's benign for the user to stop iteration early, even
+                         ;;   through non-local exit. If that occurs, the C-O-W status sticks,
+                         ;;   causing ADD-SYMBOL to copy the table as though immutable,
+                         ;;   which has no effect other than extra consing.
+                         ;; FIXME: %CELLS isn't an instance of SYMTBL-MAGIC if perfectly hashed
+                         ;;        though for the time being that can't happen.
+                         (let ((other (symtbl-%cells (package-internal-symbols pkg))))
+                           (atomic-incf (symtbl-immutable (car other)))
+                           (setf (pkg-iter-snapshot iter) other)))
+                       (start 0 (symtbl-cells (package-external-symbols pkg))))))))))
+       (start (state vec)
+         (setf (pkg-iter-symbols iter) vec
+               (pkg-iter-cur-index iter) (length vec)
+               (pkg-iter-bits iter) state)
+         (package-iter-step iter))
+       (start-next-pkg ()
+         (setf (pkg-iter-exclude iter) nil)
+         (pop (pkg-iter-pkglist iter))
+         (advance-from-state 3))
+       (symbol-name= (a b)
+         ;; Symbols won't be string= unless their name hashes are =
+         ;; so I think it's worth guarding the slower test with a quicker test.
+         (and (= (symbol-name-hash a) (symbol-name-hash b))
+              (string= a b))))
+    ;; INDEX is decremented before use, so if it's already zero upon entry,
+    ;; then the current symbol set is exhausted.
+    (let ((index (pkg-iter-cur-index iter)))
+      (unless (zerop index)
+        (let ((sym-vec (pkg-iter-symbols iter))
+              (exclude (pkg-iter-exclude iter)))
           (declare (optimize (sb-c:insert-array-bounds-checks 0)))
-          (if (logtest start-state +package-iter-check-shadows+)
-              (let ((shadows (package-%shadowing-symbols (this-package))))
-                (scan (not (member sym shadows :test #'string=))))
-              (scan))))))
+          (loop
+            (let ((sym (aref sym-vec (decf index))))
+              (when (and (pkg-symbol-valid-p sym)
+                         (not (and exclude (member sym exclude :test #'symbol-name=))))
+                (setf (pkg-iter-cur-index iter) index)
+                (return-from package-iter-step
+                  (values (aref #(:external :internal :inherited)
+                                (logand (pkg-iter-bits iter) 3))
+                          (truly-the package (car (pkg-iter-pkglist iter)))
+                          sym))))
+            (when (zerop index) (return))))))
+    (advance-from-state (pkg-iter-bits iter))))
 
 (defun program-assert-symbol-home-package-unlocked (context symbol control)
   (handler-bind ((package-lock-violation

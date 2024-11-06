@@ -105,12 +105,18 @@ copied_realpath(const char *pathname)
     }
 
     tidy = successful_malloc(PATH_MAX + 1);
+#ifdef LISP_FEATURE_ANSI_COMPLIANT_LOAD_TRUENAME
     if (realpath((messy ? messy : pathname), tidy) == NULL) {
         if (messy)
             free(messy);
         free(tidy);
         return NULL;
     }
+#else
+    // I don't know why avoiding realpath shouldn't be the default behavior
+    // but I'm sure some user would complain if it were.
+    strcpy(tidy, (messy ? messy : pathname));
+#endif
 
     if (messy)
         free(messy);
@@ -385,19 +391,7 @@ static int is_memsize_arg(char *argv[], int argi, int argc, int *merge_core_page
         if ((argi+1) >= argc) lose("missing argument for --dynamic-space-size");
         dynamic_space_size = parse_size_arg(argv[argi+1],
                                             "--dynamic-space-size");
-#ifdef MAX_DYNAMIC_SPACE_END
-        if (!((DYNAMIC_SPACE_START <
-                       DYNAMIC_SPACE_START+dynamic_space_size) &&
-                      (DYNAMIC_SPACE_START+dynamic_space_size <=
-                       MAX_DYNAMIC_SPACE_END))) {
-            char* suffix = "";
-            char* size = argv[argi-1];
-            if (!strchr(size, 'B') && !strchr(size, 'b')) suffix = " [MB]";
-            lose("--dynamic-space-size argument %s%s is too large, max %lu KB",
-                 size, suffix, (MAX_DYNAMIC_SPACE_END-DYNAMIC_SPACE_START) / 1024);
-        }
-#endif
-        return 2;
+        return 2; // return number of elements of argv[] consumed
     }
     if (!strcmp(arg, "--control-stack-size")) {
         if ((argi+1) >= argc) lose("missing argument for --control-stack-size");
@@ -646,10 +640,8 @@ initialize_lisp(int argc, char *argv[], char *envp[])
 
     interrupt_init();
 #ifdef LISP_FEATURE_UNIX
-    /* Not sure why anyone sends signals to this process so early.
-     * But win32 models the signal mask as part of 'struct thread'
-     * which doesn't exist yet, so don't do this */
-    block_blockable_signals(0);
+    /* Use SETMASK instead of BLOCK to clear the inhereted sigmask. */
+    thread_sigmask(SIG_SETMASK, &blockable_sigset, 0);
 #endif
 
     /* Check early to see if this executable has an embedded core,
@@ -711,7 +703,8 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     if (!core && !(core = search_for_core())) {
       /* Try resolving symlinks */
       if (sbcl_runtime) {
-        free(sbcl_runtime_home);
+        if (sbcl_runtime_home != libpath)
+            free(sbcl_runtime_home);
         char* real = sb_realpath(sbcl_runtime);
         if (!real)
           goto lose;

@@ -311,6 +311,11 @@
                    (prev (node-prev dest) :exit-if-null)
                    (block (ctran-block prev))
                    (component (block-component block)))
+          (when (valued-node-p dest)
+            (let ((dest (node-dest dest)))
+              (when (and (if-p dest)
+                         (node-prev dest))
+                (reoptimize-node dest))))
           (setf (block-reoptimize block) t)
           (reoptimize-component component :maybe))
         (loop for cast in (lvar-dependent-nodes lvar)
@@ -799,6 +804,41 @@
 
 (declaim (start-block ir1-optimize-if kill-if-branch-1))
 
+;;; Make the 0 branch go directly to 2
+;;; (if (> (if x (length x) 0) 10)
+;;;     1
+;;;     2)
+(defun bypass-if (if test block)
+  (let ((combination (lvar-uses test)))
+    (when (and (combination-p combination)
+               (eq (combination-kind combination) :known))
+      (let ((info (combination-fun-info combination)))
+        (when (and info
+                   (flushable-combination-p combination)
+                   (skip-nodes-before-node-p block combination))
+          (loop for arg in (combination-args combination)
+                for uses = (lvar-uses arg)
+                for type = (lvar-type arg)
+                when (consp uses)
+                do
+                (loop for use in uses
+                      when (eq (next-block use) block)
+                      do (let ((node-type (single-value-type (node-derived-type use))))
+                           (when (type/= type node-type)
+                             (let ((types (loop for arg2 in (combination-args combination)
+                                                collect (if (eq arg arg2)
+                                                            node-type
+                                                            (lvar-type arg2)))))
+                               (let ((derived (combination-derive-type-for-arg-types combination types)))
+                                 (cond ((not derived))
+                                       ((eq (setf derived (single-value-type derived))
+                                            (specifier-type 'null))
+                                        (change-block-successor (node-block use) block (if-alternative if))
+                                        (delete-lvar-use use))
+                                       ((not (types-equal-or-intersect derived (specifier-type 'null)))
+                                        (change-block-successor (node-block use) block (if-consequent if))
+                                        (delete-lvar-use use))))))))))))))
+
 ;;; Check whether the predicate is known to be true or false,
 ;;; deleting the IF node in favor of the appropriate branch when this
 ;;; is the case.
@@ -809,7 +849,8 @@
 (defun ir1-optimize-if (node &optional fast)
   (declare (type cif node))
   (let* ((test (if-test node))
-         (block (node-block node))(type (lvar-type test))
+         (block (node-block node))
+         (type (lvar-type test))
          (consequent  (if-consequent  node))
          (alternative (if-alternative node))
          (victim
@@ -838,6 +879,7 @@
     (cond (victim
            (kill-if-branch-1 node test block victim))
           ((not fast)
+           (bypass-if node test block)
            (tension-if-if-1 node test block)
            (duplicate-if-if-1 node test block)))))
 
@@ -1082,8 +1124,10 @@
       (cond (value
              ;; The number of consumed values is now known, reoptimize the users.
              ;; The VALUES transform in particular benefits from this.
-             (do-uses (use value)
-               (reoptimize-node use))
+             (let ((type (node-derived-type node)))
+               (do-uses (use value)
+                 (reoptimize-node use)
+                 (derive-node-type use type)))
              (delete-filter node (node-lvar node) value))
             (t
              (unlink-node node))))))
@@ -1169,20 +1213,36 @@
                 (let* ((fun (basic-combination-fun node))
                        (uses (lvar-uses fun))
                        (leaf (when (ref-p uses) (ref-leaf uses))))
-                  (multiple-value-bind (type defined-type)
-                      (cond ((global-var-p leaf)
-                             (values (leaf-type leaf) (leaf-defined-type leaf)))
-                            ((eq kind :unknown-keys)
-                             (values (lvar-fun-type fun t t) nil))
-                            (t
-                             (values nil nil)))
-                    (when (or (and (eq kind :unknown-keys)
-                                   (fun-type-p type))
-                              (and (fun-type-p defined-type)
-                                   (not (fun-type-p type))))
-                      (validate-call-type node type leaf)))
-                  (unless (eq (basic-combination-kind node) kind)
-                    (ir1-optimize-combination node))))))
+                  (cond ((consp uses)
+                         (loop with union
+                               for use in uses
+                               do
+                               (if (ref-p use)
+                                   (let ((type (node-fun-type use)))
+                                     (if (fun-type-p type)
+                                         (let ((return (fun-type-returns type)))
+                                           (setf union
+                                                 (if union
+                                                     (values-type-union union return)
+                                                     return)))
+                                         (return)))
+                                   (return))
+                               finally (derive-node-type node union)))
+                        (t
+                         (multiple-value-bind (type defined-type)
+                             (cond ((global-var-p leaf)
+                                    (values (leaf-type leaf) (leaf-defined-type leaf)))
+                                   ((eq kind :unknown-keys)
+                                    (values (lvar-fun-type fun t t) nil))
+                                   (t
+                                    (values nil nil)))
+                           (when (or (and (eq kind :unknown-keys)
+                                          (fun-type-p type))
+                                     (and (fun-type-p defined-type)
+                                          (not (fun-type-p type))))
+                             (validate-call-type node type leaf)))
+                         (unless (eq (basic-combination-kind node) kind)
+                           (ir1-optimize-combination node))))))))
         (:known
          (aver info)
          (clear-reoptimize-args)
@@ -1456,6 +1516,8 @@
                ((and (global-var-p leaf)
                      (eq (global-var-kind leaf) :global-function)
                      (leaf-has-source-name-p leaf)
+                     (or (not (defined-fun-p leaf))
+                         (not (eq (defined-fun-inlinep leaf) 'notinline)))
                      (or (info :function :source-transform (leaf-source-name leaf))
                          (and info
                               (ir1-attributep (fun-info-attributes info)
@@ -2750,34 +2812,62 @@
 ;;; (allowing the LIST to be flushed.)
 (defoptimizer (values-list optimizer) ((list) node)
   (let ((use (lvar-uses list)))
-    (when (combination-p use)
-      (let ((name (lvar-fun-name (combination-fun use)))
-            (args (combination-args use)))
-        ;; Recognizing LIST* seems completely ad-hoc, however, once upon a time
-        ;; (LIST x) was translated to (CONS x NIL), so in order for this optimizer to
-        ;; pick off (VALUES-LIST (LIST x)), it had to instead look for (CONS x NIL).
-        ;; Realistically nobody should hand-write (VALUES-LIST ({CONS | LIST*} x NIL))
-        ;; so it seems very questionable in utility to preserve both spellings.
-        (when (or (eq name 'list)
-                  (and (eq name 'list*)
-                       (let ((cdr (car (last args))))
-                        (and (lvar-value-is cdr nil)
-                             (progn
-                               (flush-dest cdr)
-                               (setf args (butlast args))
-                               t)))))
+    (cond ((combination-p use)
+           (let ((name (lvar-fun-name (combination-fun use)))
+                 (args (combination-args use)))
+             ;; Recognizing LIST* seems completely ad-hoc, however, once upon a time
+             ;; (LIST x) was translated to (CONS x NIL), so in order for this optimizer to
+             ;; pick off (VALUES-LIST (LIST x)), it had to instead look for (CONS x NIL).
+             ;; Realistically nobody should hand-write (VALUES-LIST ({CONS | LIST*} x NIL))
+             ;; so it seems very questionable in utility to preserve both spellings.
+             (when (or (eq name 'list)
+                       (and (eq name 'list*)
+                            (let ((cdr (car (last args))))
+                              (and (lvar-value-is cdr nil)
+                                   (progn
+                                     (flush-dest cdr)
+                                     (setf args (butlast args))
+                                     t)))))
 
-          ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
-          (change-ref-leaf (lvar-uses (combination-fun node))
-                           (find-free-fun 'values "in a strange place"))
-          (setf (combination-kind node) :full)
-          (dolist (arg args)
-            (setf (lvar-dest arg) node))
-          (setf (combination-args use) nil)
-          (flush-dest list)
-          (flush-combination use)
-          (setf (combination-args node) args)
-          t)))))
+               ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
+               (change-ref-leaf (lvar-uses (combination-fun node))
+                                (find-free-fun 'values "values-list optimizer"))
+               (setf (combination-kind node) :full)
+               (dolist (arg args)
+                 (setf (lvar-dest arg) node))
+               (setf (combination-args use) nil)
+               (flush-dest list)
+               (flush-combination use)
+               (setf (combination-args node) args)
+               t)))
+          ;; Transform (values-list (if x (list 1 2 3)))
+          ;; to
+          ;; (if x (values 1 2 3) (values))
+          ((flet ((use-good-p (use)
+                    (and
+                     (typecase use
+                       (combination
+                        (lvar-fun-is (combination-fun use) '(list)))
+                       (ref
+                        (and (ref-leaf use)
+                             (constant-p (ref-leaf use))
+                             (proper-list-p (constant-value (ref-leaf use))))))
+                     (almost-immediately-used-p list use))))
+             (and (listp use)
+                  (every #'use-good-p use)))
+           (flet ((transform (use)
+                    (cond ((ref-p use)
+                           (delete-ref use)
+                           (replace-node use `(values ,@(constant-value (ref-leaf use)))))
+                          (t
+                           (change-ref-leaf (lvar-uses (combination-fun use))
+                                            (find-free-fun 'values "values-list optimizer"))
+                           (setf (combination-kind use) :full)
+                           (setf (node-derived-type use) *wild-type*)))))
+             (mapc #'transform use)
+             (substitute-lvar-uses (node-lvar node) list nil)
+             (unlink-node node)
+             t)))))
 
 (deftransform values-list ((list) * * :node node)
   (cond ((and (policy node (< safety 3))
@@ -2843,18 +2933,6 @@
 (defun compile-time-type-error-context (context)
   #+sb-xc-host context
   #-sb-xc-host (source-to-string context))
-
-(defun cast-mismatch-from-inlined-p (cast node)
-  (let* ((path (node-source-path node))
-         (transformed (memq 'transformed path))
-         (inlined))
-    (cond ((and transformed
-                (not (eq (memq 'transformed (node-source-path cast))
-                         transformed))))
-          ((setf inlined
-                 (memq 'inlined path))
-           (not (eq (memq 'inlined (node-source-path cast))
-                    inlined))))))
 
 ;;; Delete or move around casts when possible
 (defun maybe-delete-cast (cast)

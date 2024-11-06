@@ -169,7 +169,7 @@
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
            (boundp '*compilation*)
-           (member name (fun-names-in-this-file *compilation*) :test #'equal))
+           (hashset-find (fun-names-in-this-file *compilation*) name))
       :defined-here
       where))
 
@@ -212,6 +212,10 @@
                                          name)))
                            (system-package-p (symbol-package name))))))
           (setf where :declared-verify))
+        (when (typep name
+                     '(cons (eql sb-impl::specialized-xep)))
+          (setf ftype (specifier-type `(function ,@(cddr name)))
+                where :declared))
         (make-global-var
          :kind :global-function
          :%source-name name
@@ -1658,8 +1662,8 @@ possible.")
        (current-defmethod
         (destructuring-bind (name qualifiers specializers lambda-list)
             (cdr spec)
-          (let* ((gfs (or *methods-in-compilation-unit*
-                          (setf *methods-in-compilation-unit*
+          (let* ((gfs (or (cu-methods *compilation-unit*)
+                          (setf (cu-methods *compilation-unit*)
                                 (make-hash-table :test #'equal))))
                  (methods (or (gethash name gfs)
                               (setf (gethash name gfs)

@@ -190,6 +190,12 @@
                       (inst b (if not-p :ne :eq) target)
                       (return))
                      ((and last
+                           value-tn-ref
+                           (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'array))
+                           (= start simple-array-widetag))
+                      (inst cmp widetag end)
+                      (inst b (if not-p :gt :le) target))
+                     ((and last
                            (/= start bignum-widetag)
                            (/= end complex-array-widetag))
                       (inst sub temp widetag start)
@@ -891,9 +897,7 @@
     (unless (csubtypep (tn-ref-type args) (specifier-type 'symbol))
       (test-type value temp (if not-p target not-target) t (symbol-widetag)
                  :value-tn-ref args))
-    (inst ldrh temp (@ value (+ (ash symbol-name-slot word-shift)
-                               (- other-pointer-lowtag)
-                               6)))
+    (inst ldrh temp (@ value (- 2 other-pointer-lowtag)))
     (inst cmp temp sb-impl::+package-id-keyword+)
     (inst b (if not-p :ne :eq) target)
     not-target))

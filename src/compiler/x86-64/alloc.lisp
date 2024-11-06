@@ -52,6 +52,9 @@
   (aver (= thread-tot-bytes-alloc-unboxed-slot
            (1+ thread-tot-bytes-alloc-boxed-slot))))
 
+(defun instrument-alloc-policy-p (node)
+  (policy node (> sb-c::instrument-consing 1)))
+
 ;;; Emit counter increments for SB-APROF. SCRATCH-REGISTERS is either a TN
 ;;; or list of TNs that can be used to store into the profiling data.
 ;;; We pick one of the available TNs to use for addressing the data buffer.
@@ -134,7 +137,7 @@
                      size)
                (inst inc :qword (thread-slot-ea (+ thread-allocator-histogram-slot
                                                    n-histogram-bins-small index))))))))
-  (when (policy node (> sb-c::instrument-consing 1))
+  (when (instrument-alloc-policy-p node)
     (when (tn-p size)
       (aver (not (location= size temp))))
     ;; CAUTION: the logic for RAX-SAVE is entirely untested
@@ -199,8 +202,8 @@
 ;;; 2. where to put the result
 ;;; 3. node (for determining immobile-space-p) and a scratch register or two
 (defun allocation (type size lowtag alloc-tn node temp thread-temp
-                   &key overflow
-                   &aux (systemp (system-tlab-p type node)))
+                   &key scale overflow
+                        (systemp (system-tlab-p type node)))
   (declare (ignorable thread-temp))
   (flet ((fallback (size)
            ;; Call an allocator trampoline and get the result in the proper register.
@@ -261,7 +264,7 @@
              (inst mov alloc-tn free-pointer)
              (cond (temp
                     (when (tn-p size) (aver (not (location= size temp))))
-                    (inst lea temp (ea size alloc-tn))
+                    (inst lea temp (if scale (ea alloc-tn size scale) (ea size alloc-tn)))
                     (inst cmp temp end-addr)
                     (inst jmp :a NOT-INLINE)
                     (inst mov free-pointer temp)
@@ -836,6 +839,11 @@
                            (ea nil ,length
                                (ash 1 (1+ (- word-shift n-fixnum-tag-bits)))))
                      ,answer)))
+           (test-for-empty-list (length)
+             `(progn (inst mov result nil-value)
+                     (inst test ,length ,length)
+                     (inst jmp :z done)
+                     ,length))
            (compute-end ()
              `(let ((size (cond ((typep size '(or (signed-byte 32) tn))
                                  size)
@@ -847,7 +855,8 @@
                           (if (fixnump size) nil size))))))
 
   (define-vop (allocate-list-on-stack)
-    (:args (length :scs (any-reg immediate))
+    (:args (length :scs (any-reg (immediate
+                                  (typep (* (tn-value tn) n-word-bytes 2) 'sc-offset))))
            (element :scs (any-reg descriptor-reg)))
     (:results (result :scs (descriptor-reg) :from :load))
     (:arg-types positive-fixnum *)
@@ -859,11 +868,16 @@
       (let ((size (calc-size-in-bytes length next))
             (loop (gen-label)))
         (when (sb-c::make-list-check-overflow-p node)
-          (let ((overflow (generate-error-code vop 'stack-allocated-object-overflows-stack-error size)))
+          (let ((overflow (generate-error-code vop 'stack-allocated-object-overflows-stack-error
+                                               (if (integerp size)
+                                                   (list size)
+                                                   size))))
             (inst sub rsp-tn size)
             (inst cmp :qword rsp-tn (thread-slot-ea thread-control-stack-start-slot))
             ;; avoid clearing condition codes
-            (inst lea rsp-tn (ea rsp-tn size))
+            (inst lea rsp-tn (if (integerp size)
+                                 (ea size rsp-tn)
+                                 (ea rsp-tn size)))
             (inst jmp :be overflow)))
         (stack-allocation size list-pointer-lowtag result)
         (compute-end)
@@ -891,28 +905,32 @@
     (:temporary (:sc descriptor-reg) tail next limit)
     #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
     (:generator 20
-      (let ((size (calc-size-in-bytes length tail))
-            (entry (gen-label))
-            (loop (gen-label))
-            (leave-pa (gen-label)))
+      (multiple-value-bind (size scale)
+          ;; Multiply by 8 in ALLOCATION, not here, if possible.
+          (if (and (sc-is length any-reg) (not (instrument-alloc-policy-p node)))
+              (values (test-for-empty-list length) 8)
+              (values (calc-size-in-bytes length tail) nil))
         (instrument-alloc +cons-primtype+ size node (list next limit) thread-tn)
         (pseudo-atomic (:thread-tn thread-tn)
          (allocation +cons-primtype+ size list-pointer-lowtag result node limit thread-tn
+                     :scale scale
                      :overflow
                      (lambda ()
                        ;; Push C call args right-to-left
-                       (inst push (if (integerp size) (constantize size) size))
+                       (inst push (if (integerp size)
+                                      (constantize (fixnumize (tn-value length)))
+                                      length))
                        (inst push (if (sc-is element immediate) (tn-value element) element))
                        (invoke-asm-routine
                         'call (if (system-tlab-p 0 node) 'sys-make-list 'make-list) node)
                        (inst pop result)
-                       (inst jmp leave-pa)))
-         (compute-end)
+                       (inst jmp alloc-done)))
+         (if scale (inst lea limit (ea result length 8)) (compute-end))
          (inst mov next result)
          (inst jmp entry)
-         (emit-label LOOP)
+         LOOP
          (storew next tail cons-cdr-slot list-pointer-lowtag)
-         (emit-label ENTRY)
+         ENTRY
          (inst mov tail next)
          (inst add next (* 2 n-word-bytes))
          (storew element tail cons-car-slot list-pointer-lowtag)
@@ -920,10 +938,9 @@
          (inst jmp :ne loop)
          ;; still pseudo-atomic
          (storew nil-value tail cons-cdr-slot list-pointer-lowtag)
-         (emit-label leave-pa)))
+         ALLOC-DONE))
       done))) ; label needed by calc-size-in-bytes
 
-#-immobile-space
 (define-vop (make-fdefn)
   (:policy :fast-safe)
   (:translate make-fdefn)
@@ -933,11 +950,7 @@
   (:node-var node)
   (:generator 37
     (alloc-other fdefn-widetag fdefn-size result node nil thread-tn
-      (lambda ()
-        (storew name result fdefn-name-slot other-pointer-lowtag)
-        (storew nil-value result fdefn-fun-slot other-pointer-lowtag)
-        (storew (make-fixup 'undefined-tramp :assembly-routine)
-                result fdefn-raw-addr-slot other-pointer-lowtag)))))
+      (lambda () (storew name result fdefn-name-slot other-pointer-lowtag)))))
 
 (define-vop (make-closure)
   (:info label length stack-allocate-p)
@@ -971,8 +984,7 @@
                           (inst or temp layout)))
                    temp)
                  result 0 fun-pointer-lowtag (not stack-allocate-p))
-        (inst lea (pc-size vop)
-              temp (rip-relative-ea label (ash simple-fun-insts-offset word-shift)))
+        (inst lea temp (rip-relative-ea label (ash simple-fun-insts-offset word-shift)))
         (storew temp result closure-fun-slot fun-pointer-lowtag)))))
 
 (define-vop (reference-closure)
@@ -980,7 +992,7 @@
   (:results (result :scs (descriptor-reg)))
   (:vop-var vop)
   (:generator 1
-    (inst lea (pc-size vop) result (rip-relative-ea label fun-pointer-lowtag))))
+    (inst lea result (rip-relative-ea label fun-pointer-lowtag))))
 
 ;;; The compiler likes to be able to directly make value cells.
 (define-vop (make-value-cell)
@@ -1147,12 +1159,8 @@
       (move c-arg-1 rax-tn))
     (move res c-arg-1)))
 
-#+immobile-space
-(macrolet ((c-fun (name)
-             `(let ((c-fun (make-fixup ,name :foreign)))
-                (cond ((sb-c::code-immobile-p node) c-fun)
-                                 (t (progn (inst mov rax c-fun) rax))))))
-(define-vop (!alloc-immobile-fixedobj)
+#+(and sb-xc-host immobile-space)
+(define-vop (alloc-immobile-fixedobj)
   (:args (size-class :scs (any-reg) :target c-arg1)
          (nwords :scs (any-reg) :target c-arg2)
          (header :scs (any-reg) :target c-arg3))
@@ -1164,7 +1172,6 @@
                :offset #.(third *c-call-register-arg-offsets*)) c-arg3)
   (:temporary (:sc unsigned-reg :from :eval :to (:result 0) :offset rax-offset) rax)
   (:results (result :scs (descriptor-reg)))
-  (:node-var node)
   (:generator 50
    (inst mov c-arg1 size-class)
    (inst mov c-arg2 nwords)
@@ -1173,7 +1180,7 @@
    ;; which has that effect
    (inst and rsp-tn -16)
    (pseudo-atomic ()
-     (call-c (c-fun "alloc_immobile_fixedobj"))
+     (call-c "alloc_immobile_fixedobj")
      (move result rax))))
 
 ;;; Timing test:
@@ -1196,7 +1203,7 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset) rcx)
   (:temporary (:sc unsigned-reg) header)
   (:generator 1
-    ;; fixedobj_pages linkage entry: 1 PTE per page, 12-byte struct
+    ;; fixedobj_pages alien linkage entry: 1 PTE per page, 12-byte struct
     (inst mov rbx (rip-relative-ea (make-fixup "fixedobj_pages" :foreign-dataref)))
     ;; fixedobj_page_hint: 1 hint per sizeclass. C type = uint32_t
     (inst mov rax (rip-relative-ea (make-fixup "fixedobj_page_hint" :foreign-dataref)))
@@ -1230,7 +1237,7 @@
        (inst test :dword rax 1)
        (inst jmp :nz FAIL) ; not a fixnum implies already taken
        ;; try to claim this word of memory
-       (inst mov header (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag))
+       (inst mov header (compute-object-header (1- symbol-size) symbol-widetag))
        (inst cmpxchg :lock (ea result) header)
        (inst jmp :ne FAIL) ; already taken
        ;; compute new free_index = spacing + old header + free_index
@@ -1243,5 +1250,3 @@
        FAIL
        (inst mov result nil-value)
        OUT)))
-
-) ; end MACROLET

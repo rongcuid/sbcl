@@ -304,7 +304,7 @@
                 (or (not pkg)
                     (package-locked-p pkg)
                     (system-package-p pkg)
-                    (eq pkg (find-package "COMMON-LISP"))
+                    (eq pkg *cl-package*)
                     (basic-combination-fun-info node)))
               (policy node (= safety 0)))
           (dolist (arg-spec dxable-args)
@@ -579,6 +579,8 @@
         (let ((result (return-result ret)))
           (do-uses (use result)
             (when (and (immediately-used-p result use)
+                       (not (and (combination-p use)
+                                 (lvar-fun-is (combination-fun use) '(break))))
                        (or (not (eq (node-derived-type use) *empty-type*))
                            (not (basic-combination-p use))
                            ;; This prevents external entry points from
@@ -587,7 +589,7 @@
                            ;; functions they are the entry point for.
                            (eq (basic-combination-kind use) :local)))
               (setf (node-tail-p use) t)))))))
-  ;; Tail call non returning functions if no debugging is wanted.
+  ;; Tail call non-returning functions if no debugging is wanted.
   (dolist (block (block-pred (component-tail component)))
     (let ((last (block-last block)))
       (when (and (combination-p last)

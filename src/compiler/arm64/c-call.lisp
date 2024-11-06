@@ -812,6 +812,10 @@ NOTE:
 #+sb-safepoint
 (defconstant thread-saved-csp-slot (- (1+ sb-vm::thread-header-slots)))
 
+(defconstant-eqx +destroyed-c-registers+
+  (loop for i from 0 to 18 collect i)
+  #'equal)
+
 (defun emit-c-call (vop nfp-save temp temp2 cfunc function)
   (let ((cur-nfp (current-nfp-tn vop)))
     (when cur-nfp
@@ -837,16 +841,19 @@ NOTE:
                  (sap-stack
                   (load-stack-offset cfunc cur-nfp function)))
                (inst blr cfunc)))
-        (loop for reg in (list r0-offset r1-offset r2-offset r3-offset
-                               r4-offset r5-offset r6-offset r7-offset
-                               #-darwin r8-offset)
-              do
-              (inst mov
-                    (make-random-tn
-                     :kind :normal
-                     :sc (sc-or-lose 'descriptor-reg)
-                     :offset reg)
-                    0))
+        ;; Blank all boxed registers that potentially contain Lisp
+        ;; pointers, not just volatile ones, since GC could
+        ;; potentially observe stale pointers otherwise.
+        (loop for reg in (set-difference descriptor-regs
+                                         ;; any-reg temporaries contain no pointers
+                                         (list #-immobile-space r9-offset ;; invoke-foreign-routine doesn't touch it
+                                               r10-offset lexenv-offset))
+              do (inst mov
+                       (make-random-tn
+                        :kind :normal
+                        :sc (sc-or-lose 'descriptor-reg)
+                        :offset reg)
+                       0))
         ;; No longer OK to run GC except at safepoints.
         #+sb-safepoint
         (storew zr-tn thread-tn thread-saved-csp-slot)
@@ -867,12 +874,7 @@ NOTE:
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun destroyed-c-registers ()
-    (let ((gprs (list nl0-offset nl1-offset nl2-offset nl3-offset
-                      nl4-offset nl5-offset nl6-offset nl7-offset nl8-offset #| tmp-offset |#
-                      r0-offset r1-offset r2-offset r3-offset
-                      r4-offset r5-offset r6-offset r7-offset
-                      #-darwin r8-offset
-                      #-sb-thread r11-offset))
+    (let ((gprs +destroyed-c-registers+)
           (vars))
       (append
        (loop for gpr in gprs
@@ -892,7 +894,7 @@ NOTE:
   (:temporary (:sc any-reg :offset r9-offset
                :from (:argument 0) :to (:result 0)) cfunc)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:sc any-reg :offset #+darwin r8-offset #-darwin r10-offset) temp)
+  (:temporary (:sc any-reg :offset r10-offset) temp)
   (:temporary (:sc any-reg :offset lexenv-offset) temp2)
   (:vop-var vop)
   (:generator 0

@@ -128,9 +128,10 @@
              (inst add csp-tn csp-tn size)
              (storew cfp-tn res ocfp-save-offset))))
     (when (ir2-environment-number-stack-p callee)
-      (inst sub nfp nsp-tn (add-sub-immediate
-                            (bytes-needed-for-non-descriptor-stack-frame)))
-      (inst mov-sp nsp-tn nfp))))
+      (let ((size (bytes-needed-for-non-descriptor-stack-frame)))
+        (unless (zerop size)
+          (inst sub nfp nsp-tn (add-sub-immediate size))
+          (inst mov-sp nsp-tn nfp))))))
 
 ;;; Allocate a partial frame for passing stack arguments in a full call.  Nargs
 ;;; is the number of arguments passed.  If no stack arguments are passed, then
@@ -202,9 +203,9 @@
                                   :unknown-return))
       (flet ((check-nargs ()
                (assemble ()
-                 (let* ((*location-context* (list* name
-                                                   (type-specifier type)
-                                                   (make-restart-location SKIP)))
+                 (let* ((*location-context* (list* (make-restart-location SKIP)
+                                                   name
+                                                   (type-specifier type)))
                         (err-lab (generate-error-code vop 'invalid-arg-count-error))
                         (min min-values)
                         (max (and (< max-values call-arguments-limit)
@@ -653,15 +654,15 @@
     (move result null-tn)
     (inst cbz count DONE)
 
-    (let ((dx-p (node-stack-allocate-p node))
-          (leave-pa (gen-label)))
-      (pseudo-atomic (lr :sync nil :elide-if dx-p)
+    (pseudo-atomic (lr :sync nil :elide-if (node-stack-allocate-p node))
+      (assemble ()
         ;; Allocate a cons (2 words) for each item.
-        (let ((size (cond (dx-p
-                           (lsl count (1+ (- word-shift n-fixnum-tag-bits))))
-                          (t
-                           (inst lsl temp count (1+ (- word-shift n-fixnum-tag-bits)))
-                           temp))))
+        (let* ((dx-p (node-stack-allocate-p node))
+               (size (cond (dx-p
+                            (lsl count (1+ (- word-shift n-fixnum-tag-bits))))
+                           (t
+                            (inst lsl temp count (1+ (- word-shift n-fixnum-tag-bits)))
+                            temp))))
           (allocation 'list size list-pointer-lowtag dst
                       :flag-tn lr
                       :stack-allocate-p dx-p
@@ -671,7 +672,7 @@
                         (inst mov tmp-tn context)
                         (invoke-asm-routine (if (system-tlab-p 0 node) 'sys-listify-&rest 'listify-&rest) lr)
                         (inst mov result tmp-tn)
-                        (inst b leave-pa))))
+                        (inst b ALLOC-DONE))))
         (move result dst)
 
         (inst b ENTER)
@@ -693,7 +694,7 @@
 
         ;; NIL out the last cons.
         (storew null-tn dst 1 list-pointer-lowtag)
-        (emit-label LEAVE-PA)))
+        ALLOC-DONE))
     DONE))
 
 ;;; Return the location and size of the more arg glob created by
@@ -726,11 +727,16 @@
   (:arg-types positive-fixnum (:constant t) (:constant t))
   (:info min max)
   (:vop-var vop)
+  (:node-var node)
   (:temporary (:sc unsigned-reg :offset nl0-offset) temp)
   (:save-p :compute-only)
   (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error)))
+    RESTART
+    (let* ((*location-context* (and max
+                                    (policy node (> debug 1))
+                                    (cons (make-restart-location RESTART) max)))
+           (err-lab
+             (generate-error-code vop 'invalid-arg-count-error)))
       (labels ((load-immediate (x)
                  (add-sub-immediate (fixnumize x))))
         (cond ((eql max 0)
@@ -1160,6 +1166,7 @@
 
 (define-full-call unboxed-call-named t :unboxed nil)
 (define-full-call fixed-unboxed-call-named t :unboxed nil :fixed)
+(define-full-call fixed-multiple-call-named t :unknown nil :fixed)
 
 ;;; Defined separately, since needs special code that BLT's the
 ;;; arguments down.

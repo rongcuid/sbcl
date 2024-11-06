@@ -52,7 +52,7 @@
 (define-load-time-global *available-buffers* ()
   "List of available buffers.")
 
-(defconstant +bytes-per-buffer+ (* 8 1024)
+(defconstant +bytes-per-buffer+ (* 32 1024)
   "Default number of bytes per buffer.")
 
 (defun alloc-buffer (&optional (size +bytes-per-buffer+))
@@ -129,9 +129,8 @@
   (buffering :full :type (member :full :line :none))
   ;; controls whether the input buffer must be cleared before output
   ;; (must be done for files, not for sockets, pipes and other data
-  ;; sources where input and output aren't related).  non-NIL means
-  ;; don't clear input buffer.
-  (dual-channel-p nil)
+  ;; sources where input and output aren't related).
+  (synchronize-output nil)
   ;; character position if known -- this may run into bignums, but
   ;; we probably should flip it into null then for efficiency's sake...
   (output-column nil :type (or (and unsigned-byte
@@ -200,13 +199,13 @@
             (:constructor %make-form-tracking-stream)
             (:include fd-stream
                       (misc #'tracking-stream-misc)
-                      (input-char-pos 0))
+             (input-char-pos (- +ansi-stream-in-buffer-length+)))
             (:copier nil))
   ;; a function which is called for events on this stream.
   (observer (lambda (x y z) (declare (ignore x y z))) :type function)
   ;;  A vector of the character position of each #\Newline seen
   (newlines (make-array 10 :fill-pointer 0 :adjustable t))
-  (last-newline -1 :type index-or-minus-1)
+  (last-newline +ansi-stream-in-buffer-length+ :type (integer 0 #.+ansi-stream-in-buffer-length+))
   ;; Better than reporting that a reader error occurred at a position
   ;; before any whitespace (or equivalently, a macro producing no value),
   ;; we can note the position at the first "good" character.
@@ -214,23 +213,24 @@
   (form-start-char-pos))
 
 (defun line/col-from-charpos
-    (stream &optional (charpos (ansi-stream-input-char-pos stream)))
+    (stream &optional (charpos (form-tracking-stream-current-char-pos stream)))
+  (track-newlines stream)
   (let ((newlines (form-tracking-stream-newlines stream)))
-   (if charpos
-       (let ((index (position charpos newlines :test #'>= :from-end t)))
-         ;; Line numbers traditionally begin at 1, columns at 0.
-         (if index
-             ;; INDEX is 1 less than the number of newlines seen
-             ;; up to and including this startpos.
-             ;; e.g. index=0 => 1 newline seen => line=2
-             (cons (+ index 2)
-                   ;; 1 char after the newline = column 0
-                   (- charpos (aref newlines index) 1))
-             ;; zero newlines were seen
-             (cons 1 charpos)))
-       ;; No charpos means the error is before reading the first char
-       ;; e.g. an encoding error. Take the last Newline.
-       (cons (1+ (length newlines)) 0))))
+    (if charpos
+        (let ((index (position charpos newlines :test #'>= :from-end t)))
+          ;; Line numbers traditionally begin at 1, columns at 0.
+          (if index
+              ;; INDEX is 1 less than the number of newlines seen
+              ;; up to and including this startpos.
+              ;; e.g. index=0 => 1 newline seen => line=2
+              (cons (+ index 2)
+                    ;; 1 char after the newline = column 0
+                    (- charpos (aref newlines index) 1))
+              ;; zero newlines were seen
+              (cons 1 charpos)))
+        ;; No charpos means the error is before reading the first char
+        ;; e.g. an encoding error. Take the last Newline.
+        (cons (1+ (length newlines)) 0))))
 
 ;;;; CORE OUTPUT FUNCTIONS
 
@@ -309,7 +309,8 @@
                ;; Try a non-blocking write, if SERVE-EVENT is allowed, queue
                ;; whatever is left over. Otherwise wait until we can write.
                (aver (< head tail))
-               (synchronize-stream-output stream)
+               (when (fd-stream-synchronize-output stream)
+                 (synchronize-stream-output stream))
                (loop
                  (let ((length (- tail head)))
                    (multiple-value-bind (count errno)
@@ -345,7 +346,8 @@
                                                      stream errno)))))))))))))
 
 (defun finish-writing-sequence (sequence stream start end)
-  (synchronize-stream-output stream)
+  (when (fd-stream-synchronize-output stream)
+    (synchronize-stream-output stream))
   (loop
    (let ((length (- end start)))
      (multiple-value-bind (count errno)
@@ -400,7 +402,8 @@
 ;;; possible.
 (defun write-output-from-queue (stream)
   (aver (fd-stream-serve-events stream))
-  (synchronize-stream-output stream)
+  (when (fd-stream-synchronize-output stream)
+    (synchronize-stream-output stream))
   (let (not-first-p)
     (tagbody
      :pop-buffer
@@ -455,7 +458,8 @@
          (error ":END before :START!"))
         ((> end start)
          (let ((length (- end start)))
-           (synchronize-stream-output stream)
+           (when (fd-stream-synchronize-output stream)
+             (synchronize-stream-output stream))
            (multiple-value-bind (count errno)
                (sb-unix:unix-write (fd-stream-fd stream) thing start length)
              (cond ((eql count length)
@@ -647,10 +651,7 @@
 (defun synchronize-stream-output (stream)
   ;; If we're reading and writing on the same file, flush buffered
   ;; input and rewind file position accordingly.
-  (unless (or (fd-stream-dual-channel-p stream)
-              (and
-               (eq (fd-stream-in stream) #'ill-in)
-               (eq (fd-stream-bin stream) #'ill-bin)))
+  (when (fd-stream-synchronize-output stream)
     (let ((adjust (nth-value 1 (flush-input-buffer stream))))
       (unless (eql 0 adjust)
         (sb-unix:unix-lseek (fd-stream-fd stream) (- adjust) sb-unix:l_incr)))))
@@ -674,7 +675,8 @@
                   tail (buffer-tail obuf)))))
       ,@(unless (eq (car buffering) :none)
          ;; FIXME: Why this here? Doesn't seem necessary.
-         `((synchronize-stream-output ,stream-var)))
+         `((when (fd-stream-synchronize-output ,stream-var)
+             (synchronize-stream-output ,stream-var))))
       ,(if restart
            `(block output-nothing
               ,@body
@@ -699,7 +701,8 @@
                    tail (buffer-tail obuf)))))
        ;; FIXME: Why this here? Doesn't seem necessary.
        ,@(unless (eq (car buffering) :none)
-          `((synchronize-stream-output ,stream-var)))
+          `((when (fd-stream-synchronize-output ,stream-var)
+              (synchronize-stream-output ,stream-var))))
        ,(if restart
             `(block output-nothing
                ,@body
@@ -854,7 +857,8 @@
                        :start start :end end))))
       (if (and (typep thing 'base-string)
                (let ((external-format (fd-stream-external-format stream)))
-                 (and (eq (external-format-keyword external-format) :latin-1)
+                 (and (memq (external-format-keyword external-format)
+                            '(#+sb-unicode :utf-8 :latin-1))
                       (or (null last-newline)
                           (eq (external-format-newline-variant external-format) :lf)))))
           (ecase (fd-stream-buffering stream)
@@ -1372,40 +1376,80 @@
 ;;; Note that this blocks in UNIX-READ. It is generally used where
 ;;; there is a definite amount of reading to be done, so blocking
 ;;; isn't too problematical.
-(defun fd-stream-read-n-bytes (stream buffer sbuffer start requested eof-error-p
-                               &aux (total-copied 0))
+(defun fd-stream-read-n-bytes (stream buffer sbuffer start end eof-error-p
+                               &aux (index start))
   (declare (type fd-stream stream))
-  (declare (type index start requested total-copied))
+  (declare (type index start end))
   (declare (ignore sbuffer))
   (aver (= (length (fd-stream-instead stream)) 0))
-  (do ()
-      (nil)
-    (let* ((remaining-request (- requested total-copied))
-           (ibuf (fd-stream-ibuf stream))
-           (head (buffer-head ibuf))
-           (tail (buffer-tail ibuf))
-           (available (- tail head))
-           (n-this-copy (min remaining-request available))
-           (this-start (+ start total-copied))
-           (sap (buffer-sap ibuf)))
-      (declare (type index remaining-request head tail available))
-      (declare (type index n-this-copy))
-      ;; Copy data from stream buffer into user's buffer.
-      (%byte-blt sap head buffer this-start n-this-copy)
-      (incf (buffer-head ibuf) n-this-copy)
-      (incf total-copied n-this-copy)
-      ;; Maybe we need to refill the stream buffer.
-      (cond (;; If there were enough data in the stream buffer, we're done.
-             (eql total-copied requested)
-             (return total-copied))
-            (;; If EOF, we're done in another way.
-             (null (catch 'eof-input-catcher (refill-input-buffer stream)))
-             (if eof-error-p
-                 (error 'end-of-file :stream stream)
-                 (return total-copied)))
-            ;; Otherwise we refilled the stream buffer, so fall
-            ;; through into another pass of the loop.
-            ))))
+  (let* ((ibuf (fd-stream-ibuf stream))
+         (sap (buffer-sap ibuf)))
+    (cond #+soft-card-marks ; read(2) doesn't like write-protected buffers
+          ((and (typep buffer '(simple-array (unsigned-byte 8) (*)))
+                (>= (- end start) 256)
+                (eq (fd-stream-fd-type stream) :regular)
+                ;; TODO: handle non-empty initial buffers
+                (= (buffer-head ibuf) (buffer-tail ibuf)))
+           (prog ((fd (fd-stream-fd stream))
+                  (errno 0)
+                  (count 0))
+              (declare ((or null index) count))
+              (go :read)
+            :read-error
+              (simple-stream-perror "couldn't read from ~S" stream errno)
+            :eof
+              (if eof-error-p
+                  (error 'end-of-file :stream stream)
+                  (return index))
+            :read
+              (without-interrupts
+                (tagbody
+                 :read
+                   (with-pinned-objects (buffer)
+                     (let ((sap (vector-sap buffer)))
+                       (declare (inline sb-unix:unix-read))
+                       (setf (fd-stream-listen stream) nil)
+                       (setf (values count errno)
+                             (sb-unix:unix-read fd (sap+ sap index) (- end index)))
+                       (cond ((null count)
+                              (cond #-win32 ((eql errno sb-unix:eintr)
+                                             (go :read))
+                                    (t
+                                     (go :read-error))))
+                             ((zerop count)
+                              (setf (fd-stream-listen stream) :eof)
+                              (go :eof))
+                             (t
+                              (setf index (truly-the index (+ index count)))))
+                       (when (= index end)
+                         (return index))
+                       (go :read)))))))
+          (t
+           (do ()
+               (nil)
+             (let* ((remaining-request (- end index))
+                    (head (buffer-head ibuf))
+                    (tail (buffer-tail ibuf))
+                    (available (- tail head))
+                    (n-this-copy (min remaining-request available)))
+               (declare (type index remaining-request head tail available))
+               (declare (type index n-this-copy))
+               ;; Copy data from stream buffer into user's buffer.
+               (%byte-blt sap head buffer index n-this-copy)
+               (incf (buffer-head ibuf) n-this-copy)
+               (incf index n-this-copy)
+               ;; Maybe we need to refill the stream buffer.
+               (cond (;; If there were enough data in the stream buffer, we're done.
+                      (= index end)
+                      (return index))
+                     (;; If EOF, we're done in another way.
+                      (null (catch 'eof-input-catcher (refill-input-buffer stream)))
+                      (if eof-error-p
+                          (error 'end-of-file :stream stream)
+                          (return index)))
+                     ;; Otherwise we refilled the stream buffer, so fall
+                     ;; through into another pass of the loop.
+                     )))))))
 
 (defun fd-stream-advance (stream unit)
   (let* ((buffer (fd-stream-ibuf stream))
@@ -1521,7 +1565,8 @@
          (let ((start (or start 0))
                (end (or end (length string))))
            (declare (type index start end))
-           (synchronize-stream-output stream)
+           (when (fd-stream-synchronize-output stream)
+             (synchronize-stream-output stream))
            (unless (<= 0 start end (length string))
              (sequence-bounding-indices-bad-error string start end))
            (do ()
@@ -1575,27 +1620,25 @@
                (tail (buffer-tail obuf)))
            ,out-expr))
        ,@(unless fd-stream-read-n-characters
-           `((defun ,in-function (stream buffer sbuffer start requested eof-error-p
-                                  &aux (total-copied 0))
+           `((defun ,in-function (stream buffer sbuffer start end &aux (index start))
                (declare (type fd-stream stream)
-                        (type index start requested total-copied)
+                        (type index index start end)
                         (type ansi-stream-cin-buffer buffer)
                         (type ansi-stream-csize-buffer sbuffer)
                         (optimize (sb-c:verify-arg-count 0)))
                (when (fd-stream-eof-forced-p stream)
                  (setf (fd-stream-eof-forced-p stream) nil)
-                 (return-from ,in-function 0))
-               (do ((instead (fd-stream-instead stream))
-                    (index (+ start total-copied) (1+ index)))
+                 (return-from ,in-function index))
+               (do ((instead (fd-stream-instead stream)))
                    ((= (fill-pointer instead) 0)
                     (setf (fd-stream-listen stream) nil))
                  (setf (aref buffer index) (vector-pop instead))
                  (setf (aref sbuffer index) 0)
-                 (incf total-copied)
-                 (when (= requested total-copied)
+                 (incf index)
+                 (when (= index end)
                    (when (= (fill-pointer instead) 0)
                      (setf (fd-stream-listen stream) nil))
-                   (return-from ,in-function total-copied)))
+                   (return-from ,in-function index)))
                (do (;; external formats might wish for e.g. 2 octets
                     ;; to be available, but still be able to handle a
                     ;; single octet before end of file.  This flag
@@ -1633,7 +1676,8 @@
                    (declare (type index head tail))
                    ;; Copy data from stream buffer into user's buffer.
                    (do ((size nil nil))
-                       ((or (= tail head) (= requested total-copied)))
+                       ((or (= tail head)
+                            (= index end)))
                      (setf decode-break-reason
                            (block decode-break-reason
                              ,@(when (consp in-size-expr)
@@ -1650,10 +1694,9 @@
                                (setq size ,(if (consp in-size-expr) (cadr in-size-expr) in-size-expr))
                                (when (> size (- tail head))
                                  (return))
-                               (let ((index (+ start total-copied)))
-                                 (setf (aref buffer index) ,in-expr)
-                                 (setf (aref sbuffer index) size))
-                               (incf total-copied)
+                               (setf (aref buffer index) ,in-expr)
+                               (setf (aref sbuffer index) size)
+                               (incf index)
                                (incf head size))
                              nil))
                      (setf (buffer-head ibuf) head)
@@ -1664,32 +1707,23 @@
                        ;; (where this check will be false). This allows establishing
                        ;; high-level handlers for decode errors (for example
                        ;; automatically resyncing in Lisp comments).
-                       (when (plusp total-copied)
-                         (return-from ,in-function total-copied))
-                       (when (stream-decoding-error-and-handle
-                              stream decode-break-reason unit)
-                         (if eof-error-p
-                             (error 'end-of-file :stream stream)
-                             (return-from ,in-function total-copied)))
+                       (unless (> index start)
+                         (stream-decoding-error-and-handle stream decode-break-reason unit))
                        ;; we might have been given stuff to use instead, so
-                       ;; we have to return (and trust our caller to know
-                       ;; what to do about TOTAL-COPIED being 0).
-                       (return-from ,in-function total-copied)))
+                       ;; we have to return
+                       (return-from ,in-function index)))
                    (setf (buffer-head ibuf) head)
                    ;; Maybe we need to refill the stream buffer.
-                   (cond (;; If was data in the stream buffer, we're done.
-                          (plusp total-copied)
-                          (return total-copied))
-                         (;; If EOF, we're done in another way.
-                          (or (eq decode-break-reason 'eof)
-                              (null (catch 'eof-input-catcher
-                                      (refill-input-buffer stream))))
-                          (if eof-error-p
-                              (error 'end-of-file :stream stream)
-                              (return total-copied)))
-                         ;; Otherwise we refilled the stream buffer, so fall
-                         ;; through into another pass of the loop.
-                         ))))))
+                   (when (or
+                          ;; If there was data in the stream buffer, we're done.
+                          (> index start)
+                          ;; If EOF, we're also done
+                          (null (catch 'eof-input-catcher
+                                  (refill-input-buffer stream))))
+                     (return index))
+                   ;; Otherwise we refilled the stream buffer, so fall
+                   ;; through into another pass of the loop.
+                   )))))
        (def-input-routine/variable-width ,in-char-function (character
                                                             ,external-format
                                                             ,in-size-expr
@@ -1856,7 +1890,8 @@
 ;;; OUTPUT-P indicate what slots to fill. The buffering slot must be
 ;;; set prior to calling this routine.
 (defun set-fd-stream-routines (fd-stream element-type canonized-external-format external-format-entry
-                               input-p output-p buffer-p)
+                               input-p output-p buffer-p
+                               dual-channel-p)
   (let* ((target-type (case element-type
                         (unsigned-byte '(unsigned-byte 8))
                         (signed-byte '(signed-byte 8))
@@ -1936,7 +1971,7 @@
               (fd-stream-char-size fd-stream) char-size
               (fd-stream-replacement fd-stream) replacement))
       (when (= (or cin-size 1) (or bin-size 1) 1)
-        (setf (fd-stream-n-bin fd-stream) ;XXX
+        (setf (fd-stream-n-bin fd-stream)
               (if (and character-stream-p (not bivalent-stream-p))
                   read-n-characters
                   #'fd-stream-read-n-bytes))
@@ -1998,7 +2033,10 @@
             (fd-stream-sout fd-stream) (if (eql cout-size 1)
                                            #'fd-sout #'ill-out))
       (setf output-size (or cout-size bout-size))
-      (setf output-type (or cout-type bout-type)))
+      (setf output-type (or cout-type bout-type))
+      (when (and input-p
+                 (not dual-channel-p))
+        (setf (fd-stream-synchronize-output fd-stream) t)))
 
     (when (and input-size output-size
                (not (eq input-size output-size)))
@@ -2404,7 +2442,7 @@
                                         external-format))
          (external-format-entry (get-external-format defaulted-external-format))
          (canonized-external-format
-          (and external-format-entry (canonize-external-format external-format external-format-entry))))
+          (and external-format-entry (canonize-external-format defaulted-external-format external-format-entry))))
     (unless external-format-entry
       (unwind-protect
            (error "Undefined external-format: ~S" external-format)
@@ -2434,7 +2472,6 @@
                             :delete-original delete-original
                             :pathname pathname
                             :buffering buffering
-                            :dual-channel-p dual-channel-p
                             :element-mode element-mode
                             :serve-events serve-events
                             :timeout
@@ -2442,7 +2479,7 @@
                                 (coerce timeout 'single-float)
                                 nil))))
       (set-fd-stream-routines stream element-type canonized-external-format external-format-entry
-                              input output input-buffer-p)
+                              input output input-buffer-p dual-channel-p)
       (when auto-close
         (finalize stream
                   (lambda ()
@@ -2492,11 +2529,11 @@
               (sb-kernel::%file-error
                pathname
                "~@<The path ~2I~_~S ~I~_does not exist.~:>" pathname))
-             (t '(:return nil))))
+             (t '(:return t))))
           (#-win32 #.sb-unix:eexist
            #+win32 #.sb-win32::error_file_exists
            (if (null if-exists)
-               '(:return nil)
+               '(:return t)
                (restart-case
                    (signal-it 'file-exists)
                  (supersede ()
@@ -2551,7 +2588,7 @@
                                         external-format))
          (external-format-entry (get-external-format defaulted-external-format))
          (canonized-external-format
-          (and external-format-entry (canonize-external-format external-format external-format-entry))))
+          (and external-format-entry (canonize-external-format defaulted-external-format external-format-entry))))
     (unless external-format-entry
       (error "Undefined external-format: ~S" external-format))
     ;; Calculate useful stuff.
@@ -2714,13 +2751,13 @@
                                                   :element-type element-type)))
                             (close stream)
                             stream)))))
-             (destructuring-bind (&key (return nil returnp)
+             (destructuring-bind (&key return
                                        new-filename
                                        new-if-exists
                                        new-if-does-not-exist)
                  (%open-error pathname errno if-exists if-does-not-exist)
-               (when returnp
-                 (return return))
+               (when return
+                 (return))
                (when new-filename
                  (setf filename new-filename))
                (when new-if-exists
@@ -2754,22 +2791,27 @@
              (fd-stream-pathname stream))))
     :simple (s-%file-name stream new-name)))
 
-;; Fix the INPUT-CHAR-POS slot of STREAM after having consumed characters
-;; from the CIN-BUFFER. This operation is done upon exit from a FAST-READ-CHAR
-;; loop, and for each buffer refill inside the loop.
-(defun update-input-char-pos (stream &optional (end +ansi-stream-in-buffer-length+))
-  (do ((chars (ansi-stream-cin-buffer stream))
-       (pos (form-tracking-stream-input-char-pos stream))
-       (i (ansi-stream-in-index stream) (1+ i)))
+(defun track-newlines (stream &optional (end (ansi-stream-in-index stream)))
+  (do ((start (form-tracking-stream-input-char-pos stream))
+       (chars (or (ansi-stream-cin-buffer stream)
+                  (return-from track-newlines)))
+       (i (form-tracking-stream-last-newline stream) (1+ i)))
       ((>= i end)
-       (setf (form-tracking-stream-input-char-pos stream) pos))
+       (setf (form-tracking-stream-last-newline stream) i))
     (let ((char (aref chars i)))
-      (when (and (eql char #\Newline)
-                 ;; record it only if it wasn't unread and re-read
-                 (> pos (form-tracking-stream-last-newline stream)))
-        (vector-push-extend pos (form-tracking-stream-newlines stream))
-        (setf (form-tracking-stream-last-newline stream) pos))
-      (incf pos))))
+      (when (eql char #\Newline)
+        (vector-push-extend (+ start i)
+                            (form-tracking-stream-newlines stream))))))
+
+;; Fix the INPUT-CHAR-POS slot of STREAM after having consumed characters
+;; before refilling cin-buffer.
+(defun update-input-char-pos (stream)
+  (track-newlines stream +ansi-stream-in-buffer-length+)
+  (incf (form-tracking-stream-input-char-pos stream) +ansi-stream-in-buffer-length+))
+
+(defun form-tracking-stream-current-char-pos (stream)
+  (+ (form-tracking-stream-input-char-pos stream)
+     (ansi-stream-in-index stream)))
 
 (defun tracking-stream-misc (stream operation arg1)
   ;; The :UNREAD operation will never be invoked because STREAM has a buffer,
@@ -2777,5 +2819,9 @@
   ;; But we do need to prevent attempts to change the absolute position.
   (stream-misc-case (operation)
     (:set-file-position (simple-stream-perror "~S is not positionable" stream))
-    (t ; call next method
+    (t
+     (stream-misc-case (operation :default nil)
+       (:close
+        (track-newlines stream)))
+     ;; call next method
      (fd-stream-misc-routine stream operation arg1))))

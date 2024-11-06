@@ -382,8 +382,7 @@
   (gf-info-fast-mf-p (slot-value gf 'arg-info)))
 
 (defun add-to-weak-hashset (key set)
-  (with-system-mutex ((hashset-mutex set))
-    (hashset-insert set key)))
+  (hashset-insert-if-absent set key #'identity)) ; implicitly locks
 (defun remove-from-weak-hashset (key set)
   (with-system-mutex ((hashset-mutex set))
     (hashset-remove set key)))
@@ -414,15 +413,15 @@
     ((gf standard-generic-function) &rest args &key
      (lambda-list nil lambda-list-p) (argument-precedence-order nil apo-p))
   (let* ((old-mc (generic-function-method-combination gf))
-         (mc (getf args :method-combination old-mc)))
+         (mc (getf args :method-combination old-mc))
+         (keys (arg-info-keys (gf-arg-info gf))))
     (unless (eq mc old-mc)
       (aver (weak-hashset-memberp gf (method-combination-%generic-functions old-mc)))
       (aver (not (weak-hashset-memberp gf (method-combination-%generic-functions mc)))))
     (prog1 (call-next-method)
       (unless (eq mc old-mc)
         (remove-from-weak-hashset gf (method-combination-%generic-functions old-mc))
-        (add-to-weak-hashset gf (method-combination-%generic-functions mc))
-        (flush-effective-method-cache gf))
+        (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
       (sb-thread::with-recursive-system-lock ((gf-lock gf))
         (cond
           ((and lambda-list-p apo-p)
@@ -431,8 +430,11 @@
                          :argument-precedence-order argument-precedence-order))
           (lambda-list-p (set-arg-info gf :lambda-list lambda-list))
           (t (set-arg-info gf)))
-        (when (arg-info-valid-p (gf-arg-info gf))
-          (update-dfun gf))
+        (let ((arg-info (gf-arg-info gf)))
+          (unless (and (eq mc old-mc) (equal keys (arg-info-keys arg-info)))
+            (flush-effective-method-cache gf))
+          (when (arg-info-valid-p arg-info)
+            (update-dfun gf)))
         (map-dependents gf (lambda (dependent)
                              (apply #'update-dependent gf dependent args)))))))
 
@@ -497,9 +499,9 @@
 
 (defun compute-gf-ftype (name)
   (let ((gf (and (fboundp name) (fdefinition name)))
-        (methods-in-compilation-unit (and (boundp 'sb-c::*methods-in-compilation-unit*)
-                                          sb-c::*methods-in-compilation-unit*
-                                          (gethash name sb-c::*methods-in-compilation-unit*))))
+        (methods-in-compilation-unit (binding* ((cu sb-c::*compilation-unit* :exit-if-null)
+                                                (methods (sb-c::cu-methods cu) :exit-if-null))
+                                       (gethash name methods))))
     (cond ((generic-function-p gf)
            (let* ((ll (generic-function-lambda-list gf))
                   ;; If the GF has &REST without &KEY then we don't augment
@@ -1381,7 +1383,9 @@
 (defun methods-converter (form generic-function)
   (cond ((and (consp form) (eq (car form) 'methods))
          (cons '.methods.
-               (get-effective-method-function1 generic-function (cadr form))))
+               ;; force to heap since the method list is stored in the %CACHE slot
+               (get-effective-method-function1 generic-function
+                                               (ensure-heap-list (cadr form)))))
         ((and (consp form) (eq (car form) 'unordered-methods))
          (default-secondary-dispatch-function generic-function))))
 
@@ -1407,13 +1411,13 @@
              (:assoc
               alist)
              (:hash-table
-              (let ((table (make-hash-table :test (if (car mp) 'eq 'eql))))
+              (let ((table (sb-vm:without-arena
+                            (make-hash-table :test (if (car mp) 'eq 'eql)))))
                 (dolist (k+m alist)
                   (setf (gethash (car k+m) table) (cdr k+m)))
                 table)))))))
 
-(defun compute-secondary-dispatch-function1 (generic-function net
-                                             &optional function-p)
+(defun compute-secondary-dispatch-function1 (generic-function net &optional function-p)
   (cond
    ((and (eq (car net) 'methods) (not function-p))
     (get-effective-method-function1 generic-function (cadr net)))

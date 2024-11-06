@@ -66,7 +66,7 @@
                                 gethash-impl
                                 puthash-impl
                                 remhash-impl
-                                clrhash-impl
+                                %hash-fun-state
                                 test
                                 test-fun
                                 hash-fun
@@ -77,21 +77,33 @@
                                 next-vector
                                 hash-vector)))
 
-  (gethash-impl #'error :type (sfunction * (values t boolean)) :read-only t)
-  (puthash-impl #'error :type (sfunction * t) :read-only t)
-  (remhash-impl #'error :type (sfunction * t) :read-only t)
-  (clrhash-impl #'error :type (sfunction * t) :read-only t)
+  (gethash-impl #'error :type (sfunction * (values t boolean)))
+  (puthash-impl #'error :type (sfunction * t))
+  (remhash-impl #'error :type (sfunction * t))
+  ;; If non-negative, this gets passed to HASH-TABLE-HASH-FUN as its
+  ;; second argument (see HASH-KEY and HT-HASH-SETUP). For a given
+  ;; HASH-TABLE-TEST, the same HASH-FUN-STATE cannot be an argument
+  ;; for the different HASH-FUNs. Thus, it completely identifies the
+  ;; hash function. It may be changed during the lifetime of the hash
+  ;; table, which allows us to do adaptive hashing.
+  (%hash-fun-state 0
+   ;; HASH-FUN-STATE easily fits into a fixnum, but having it unboxed
+   ;; as a signed word allows EQ-HASH/SMALL in EQ-HASH/COMMON to be
+   ;; compiled a bit more tightly.
+   :type (signed-byte #.sb-vm:n-word-bits))
   ;; The Key-Value pair vector.
   ;; Note: this vector has a "high water mark" which resembles a fill
   ;; pointer, but unlike a fill pointer, GC can ignore elements
   ;; above the high water mark.  If you store non-immediate data past
   ;; that mark, you're sure to have problems.
   (pairs nil :type simple-vector)
-  ;; MRU physical index of a key in the k/v vector. If < (LENGTH PAIRS)
-  ;; the cell can be examined first in GETHASH and PUTHASH. The "unknown" value
-  ;; is not 0 because that would look valid but could accidentally return a
-  ;; false match if the user's key is EQ to element 0 in the pair vector.
-  (cache (- array-dimension-limit 2) :type index)
+  ;; If positive, this is the MRU physical index of a key in the k/v
+  ;; vector to be examined first in GETHASH and PUTHASH. Negative
+  ;; values stand for the desired initial hash table size in the
+  ;; deferred initialization scheme between %MAKE-HASH-TABLE and
+  ;; GROW-HASH-TABLE.
+  (cache -1 :type (integer (#.(- (1- array-dimension-limit)))
+                           (#.(1- array-dimension-limit))))
   ;; The index vector. This may be larger than the capacity to help
   ;; reduce collisions.
   (index-vector nil :type (simple-array hash-table-index (*)))
@@ -131,8 +143,8 @@
   (test-fun nil :type function :read-only t)
   ;; The function used to compute the hashing of a key. Returns two
   ;; values: the index hashing and T if that might change with the
-  ;; next GC.
-  (hash-fun nil :type function :read-only t)
+  ;; next GC. It may take HASH-FUN-STATE as an extra argument.
+  (hash-fun nil :type function)
 
   ;; The type of hash table this is. Part of the exported interface,
   ;; as well as needed for the MAKE-LOAD-FORM and PRINT-OBJECT methods.
@@ -178,7 +190,7 @@
                                 gethash-impl
                                 puthash-impl
                                 remhash-impl
-                                clrhash-impl
+                                %hash-fun-state
                                 test
                                 test-fun
                                 hash-fun
@@ -221,17 +233,38 @@
 ;;; but is not meaningful with a user-provided test or hash function.
 (sb-xc:defmacro pack-ht-flags-kind (x) `(ash ,x 4))
 (defmacro ht-flags-kind (flags) `(ldb (byte 2 4) ,flags))
+(defconstant ht-flags-kind-mask #b110000)
 
-(defconstant default-rehash-size 1.5)
-;; Don't raise this number to 8 - if you do it'll increase the memory
-;; consumption of a default MAKE-HASH-TABLE call by 7% just due to
-;; padding slots.  This is a "perfect" minimal size.
-(defconstant +min-hash-table-size+ 7)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant default-rehash-size 1.5)
+  ;; Don't raise this number to 8 - if you do it'll increase the memory
+  ;; consumption of a default MAKE-HASH-TABLE call by 7% just due to
+  ;; padding slots.  This is a "perfect" minimal size.
+  (defconstant +min-hash-table-size+ 7))
+
+;;; HASH-TABLE-HASH-FUN-STATEs not specific to a particular hash test
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; This is redundant with HASH-TABLE-USERFUN-FLAG, but sometimes
+  ;; more convenient to inspect the state. User-defined hash functions
+  ;; are never adaptive.
+  (defconstant +hft-user-defined+ -4)
+  ;; State for our own non-adaptive hash functions.
+  (defconstant +hft-non-adaptive+ -3)
+  ;; The state denoting a traditional, general-purpose hash function
+  ;; that tries to be as "random" as opossible.
+  (defconstant +hft-safe+ -2)
+  ;; State for the FLAT-HASH-TABLE-P.
+  (defconstant +hft-flat+ -1))
 
 (sb-xc:defmacro make-system-hash-table (&key test synchronized weakness)
   (multiple-value-bind (kind args)
-      (cond ((equal test '(quote eq))  (values 0 '('eq  #'eq  #'eq-hash)))
-            ((equal test '(quote eql)) (values 1 '('eql #'eql #'eql-hash)))
+      ;; Currently, all calls to MAKE-SYSTEM-HASH-TABLE are with
+      ;; :WEAKNESS, so we need not bother with flat hash tables
+      ;; because they are not implemented for weak hash tables.
+      (cond ((equal test '(quote eq))
+             (values 0 '('eq  #'eq  #'non-adaptive-eq-hash)))
+            ((equal test '(quote eql))
+             (values 1 '('eql #'eql #'eql-hash)))
             (t
              (bug "Incomplete implementation of MAKE-SYSTEM-HASH-TABLE")
              0))
@@ -246,9 +279,12 @@
       ;; MAKE-SYSTEM-HASH-TABLE before the constants are known to make-host-2, as happens
       ;; when compiling type-class. hash-table.lisp can't be moved earlier in build-order
       ;; (without pain) so the expanded code can't use the values.
+      ,+hft-non-adaptive+
       ,+min-hash-table-size+
       ,default-rehash-size
       1.0)))
+
+(defconstant +max-hash-table-bits+ #-64-bit 29 #+64-bit 31)
 
 ;; Our hash-tables store precomputed hashes to speed rehash and to guard
 ;; the call of the general comparator.
@@ -257,4 +293,8 @@
 ;; (As a practical matter, this limits tables to 2^31 bins.)
 ;; Address-sensitive keys can't store a precomputed hash. They instead
 ;; store this value that indicates address-sensitivity.
-(defconstant +magic-hash-vector-value+ #xFFFFFFFF)
+(defconstant +magic-hash-vector-value+
+  (logandc2 #xFFFFFFFF
+            ;; Zero the highest bit in the hash table range for
+            ;; SET-TRUNCATED-HASH-P.
+            (ash 1 (1- +max-hash-table-bits+))))

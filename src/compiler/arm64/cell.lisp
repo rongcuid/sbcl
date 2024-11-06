@@ -25,11 +25,14 @@
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg zero)))
-  (:info name offset lowtag)
+  (:info name offset lowtag barrier)
   (:results)
   (:vop-var vop)
+  (:ignore name)
+  (:gc-barrier 0 1 0)
   (:generator 1
-    (emit-gengc-barrier object nil tmp-tn (vop-nth-arg 1 vop) value name)
+    (when barrier
+      (emit-gengc-barrier object nil tmp-tn t))
     (storew value object offset lowtag)))
 
 (define-vop (compare-and-swap-slot)
@@ -42,7 +45,7 @@
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   (:vop-var vop)
   (:generator 5
-    (emit-gengc-barrier object nil lip (vop-nth-arg 2 vop) new)
+    (emit-gengc-barrier object nil lip (vop-nth-arg 2 vop))
     (inst add-sub lip object (- (* offset n-word-bytes) lowtag))
     (cond ((member :arm-v8.1 *backend-subfeatures*)
            (move result old)
@@ -112,7 +115,7 @@
            (inst ldr (32-bit-reg tls-index) (tls-index-of object))
            (inst ldr tmp-tn (@ thread-tn tls-index))
            (no-tls-marker tmp-tn object nil LOCAL)
-           (emit-gengc-barrier object nil tls-index (vop-nth-arg 1 vop) value)
+           (emit-gengc-barrier object nil tls-index (vop-nth-arg 1 vop))
            (storew value object symbol-value-slot other-pointer-lowtag)
            (inst b DONE)
            LOCAL
@@ -247,18 +250,7 @@
   (:policy :fast-safe)
   (:generator 1
     #.(assert (= sb-impl::package-id-bits 16))
-    (inst ldrh result (@ symbol (+ (ash symbol-name-slot word-shift)
-                                  (- other-pointer-lowtag)
-                                  6))))) ; little-endian
-(define-vop ()
-  (:policy :fast-safe)
-  (:translate symbol-name)
-  (:args (symbol :scs (descriptor-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:generator 5
-    (pseudo-atomic (tmp-tn :sync nil)
-      (loadw tmp-tn symbol symbol-name-slot other-pointer-lowtag)
-      (inst and result tmp-tn (1- (ash 1 sb-impl::symbol-name-bits))))))
+    (inst ldrh result (@ symbol (- 2 other-pointer-lowtag))))) ; little-endian
 
 ;; Is it worth eliding the GC store barrier for a thread-local CAS?
 ;; Not really, because why does such an operation even exists?
@@ -275,7 +267,7 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 15
-    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop) new)
+    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop))
     (inst dsb)
     #+sb-thread
     (assemble ()
@@ -318,7 +310,7 @@
   (:vop-var vop)
   (:guard (member :arm-v8.1 *backend-subfeatures*))
   (:generator 14
-    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop) new)
+    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop))
     #+sb-thread
     (assemble ()
       (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
@@ -396,7 +388,7 @@
     (:args (value :scs (any-reg descriptor-reg zero) :to :save)
            (symbol :scs (descriptor-reg)
                    :target alloc-tls-symbol))
-    (:temporary (:sc descriptor-reg :offset r8-offset :from (:argument 1)) alloc-tls-symbol)
+    (:temporary (:sc descriptor-reg :offset r10-offset :from (:argument 1)) alloc-tls-symbol)
     (:temporary (:sc non-descriptor-reg :offset nl0-offset) tls-index)
     (:temporary (:sc non-descriptor-reg :offset nl1-offset) free-tls-index)
     (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
@@ -417,16 +409,6 @@
                  n-word-bytes)))
       (inst str value (@ thread-tn tls-index))))
 
-  (defun load-time-tls-index (symbol)
-    (let ((component (component-info *component-being-compiled*)))
-      (ash (or (position-if (lambda (x)
-                              (and (typep x '(cons (eql :tls-index)))
-                                   (eq (cadr x) symbol)))
-                            (ir2-component-constants component))
-               (vector-push-extend (list :tls-index symbol)
-                                   (ir2-component-constants component)))
-           word-shift)))
-
   (defun bind (bsp symbol tls-index tls-value &optional bsp-loaded)
     (unless bsp-loaded
       (load-binding-stack-pointer bsp)
@@ -441,11 +423,13 @@
            (tls-index (if known-symbol-p
                           (make-fixup symbol :symbol-tls-index)
                           tls-index)))
-      (cond (known-symbol-p
-             (inst movz tls-index-reg tls-index))
-            (t
-             ;; TODO: a fixup could replace this with an immediate
-             (inst load-constant tls-index (load-time-tls-index symbol))))
+      (if known-symbol-p
+          (inst movz tls-index-reg tls-index) ; Definitely small-enough imm operand
+          ;; Otherwise indirect via the unboxed constant pool.
+          ;; register-inline-constant will point to the same word given
+          ;; repeated use of same symbol within a single code component.
+          (load-inline-constant tls-index `(:fixup ,symbol :symbol-tls-index)))
+
       (inst ldr tls-value (@ thread-tn tls-index))
       (inst stp tls-value tls-index-reg (if (and bsp-loaded
                                                  (neq bsp-loaded :last))
@@ -640,36 +624,6 @@
 (define-full-setter instance-index-set * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-set)
 
-(define-vop (instance-set-multiple)
-  (:args (instance :scs (descriptor-reg))
-         (values :more t :scs (descriptor-reg any-reg)))
-  (:temporary (:sc descriptor-reg) val-temp)
-  (:info indices)
-  (:vop-var vop)
-  (:generator 1
-    (emit-gengc-barrier instance nil tmp-tn values)
-    (do ((tn-ref values (tn-ref-across tn-ref))
-         (indices indices (cdr indices)))
-        ((null tn-ref))
-      (let* ((value (tn-ref-tn tn-ref))
-             (source
-               (sc-case value
-                 (immediate
-                  (load-immediate vop value val-temp)
-                  val-temp)
-                 (constant
-                  (inst load-constant val-temp (tn-byte-offset value))
-                  val-temp)
-                 (control-stack
-                  (load-stack-tn val-temp value)
-                  val-temp)
-                 ((any-reg descriptor-reg)
-                  value))))
-        (inst str source
-              (@ instance (load-store-offset
-                           (- (ash (+ instance-slots-offset (car indices)) word-shift)
-                              instance-pointer-lowtag))))))))
-
 (define-vop (%instance-cas word-index-cas)
   (:policy :fast-safe)
   (:translate %instance-cas)
@@ -761,14 +715,14 @@
         (inst lsl pa-flag pa-flag card)
 
         (cond ((member :arm-v8.1 *backend-subfeatures*)
-               (inst ldset pa-flag pa-flag temp))
+               (inst ldset pa-flag zr-tn temp))
               (t
                (let ((loop (gen-label)))
                  (emit-label LOOP)
                  (inst ldaxr card temp)
                  (inst orr card card pa-flag)
-                 (inst stlxr pa-flag card temp)
-                 (inst cbnz (32-bit-reg pa-flag) LOOP))))
+                 (inst stlxr tmp-tn card temp)
+                 (inst cbnz (32-bit-reg tmp-tn) LOOP))))
         (inst b store))
       TRY-DYNAMIC-SPACE
       (load-foreign-symbol temp "gc_card_table_mask" :dataref t)

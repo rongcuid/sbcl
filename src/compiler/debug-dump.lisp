@@ -175,25 +175,23 @@
 (defvar *previous-form-number*)
 
 (defun encode-restart-location (location x)
-  (typecase x
-    (restart-location
-     (let ((offset (- (label-position (restart-location-label x))
-                      location))
-           (tn (restart-location-tn x))
-           (registers-size #.(integer-length (sb-size (sb-or-lose 'sb-vm::registers)))))
-       (if tn
-           (the fixnum (logior (ash offset registers-size)
-                               (tn-offset tn)))
-           offset)))
-    (cons (let ((last (cdr (last x))))
-            (if (restart-location-p last)
-                (let ((new (copy-list x)))
-                  (setf (cdr (last new))
-                        (encode-restart-location location last))
-                  new)
-                x)))
-    (t
-     x)))
+  (flet ((encode-restart (restart)
+           (let ((offset (- (label-position (restart-location-label restart))
+                            location))
+                 (tn (restart-location-tn restart))
+                 (registers-size #.(integer-length (sb-size (sb-or-lose 'sb-vm::registers)))))
+             (if tn
+                 (the fixnum (logior (ash offset registers-size)
+                                     (tn-offset tn)))
+                 offset))))
+    (typecase x
+      ((cons restart-location)
+       (cons (encode-restart (car x))
+             (cdr x)))
+      (restart-location
+       (encode-restart x))
+      (t
+       x))))
 
 (defun decode-restart-location (x)
   (declare (fixnum x))
@@ -407,7 +405,7 @@
                         (file-info-positions file-info))
      (if function
          (values :form (let ((direct-file-info (source-info-file-info info)))
-                         (when (eq :lisp (file-info-truename direct-file-info))
+                         (when (eq :lisp (file-info-%truename direct-file-info))
                            (elt (file-info-forms direct-file-info) 0)))
                  :function function)
          (values)))))
@@ -969,6 +967,19 @@
 (defun debug-info-for-component (component)
   (declare (type component component))
   (let* ((dfuns nil)
+         (simple-fun-headers
+          ;; Compute all simple-fun metadata and store into a simple-vector
+          (let* ((entries (ir2-component-entries (component-info component)))
+                 (nfuns (length entries))
+                 (i (* sb-vm:code-slots-per-simple-fun nfuns))
+                 (v (make-array i)))
+            (dolist (e entries v)
+              ;; Process in reverse order of ENTRIES.
+              (decf i sb-vm:code-slots-per-simple-fun)
+              (setf (svref v (+ i sb-vm:simple-fun-name-slot)) (entry-info-name e)
+                    (svref v (+ i sb-vm:simple-fun-arglist-slot)) (entry-info-arguments e)
+                    (svref v (+ i sb-vm:simple-fun-source-slot)) (entry-info-form/doc e)
+                    (svref v (+ i sb-vm:simple-fun-info-slot)) (entry-info-type/xref e)))))
          (var-locs (make-hash-table :test 'eq))
          (*byte-buffer* (make-array 10
                                     :element-type '(unsigned-byte 8)
@@ -994,11 +1005,24 @@
         (push (cons (label-position (block-label (lambda-block lambda)))
                     (compute-1-debug-fun lambda var-locs))
               dfuns)))
-    (make-compiled-debug-info
-     :name name
-     :package *package*
-     :fun-map (compute-packed-debug-funs (nreverse dfuns))
-     :contexts (compact-vector *contexts*))))
+    (let ((map (compute-packed-debug-funs (nreverse dfuns)))
+          (contexts (compact-vector *contexts*)))
+      #+sb-xc-host
+      (!make-compiled-debug-info name *package* map contexts simple-fun-headers)
+      #-sb-xc-host
+      (let ((di (%make-instance (+ (sb-kernel::type-dd-length compiled-debug-info)
+                                   (length simple-fun-headers)))))
+        (setf (%instance-layout di) #.(find-layout 'compiled-debug-info)
+              ;; The fixed slots except for SOURCE are declared readonly
+              (%instance-ref di (get-dsd-index compiled-debug-info name)) name
+              (%instance-ref di (get-dsd-index compiled-debug-info source)) nil
+              (%instance-ref di (get-dsd-index compiled-debug-info package)) *package*
+              (%instance-ref di (get-dsd-index compiled-debug-info fun-map)) map
+              (%instance-ref di (get-dsd-index compiled-debug-info contexts)) contexts)
+        (let ((i (get-dsd-index compiled-debug-info rest)))
+          (dovector (x simple-fun-headers di)
+            (setf (%instance-ref di i) x)
+            (incf i)))))))
 
 ;;; Write BITS out to BYTE-BUFFER in backend byte order. The length of
 ;;; BITS must be evenly divisible by eight.
@@ -1047,23 +1071,23 @@
 #+(and sb-core-compression (not sb-xc-host))
 (progn
   (defun compress (vector)
-    (with-alien ((compress-vector (function int (* char) size-t) :extern "compress_vector"))
-      (let* ((data (truly-the (simple-array * (*)) (%array-data vector))))
-        (with-pinned-objects (data)
-          (alien-funcall compress-vector (int-sap (get-lisp-obj-address data)) (length vector)))
-        data)))
+    (let ((backing (truly-the (simple-array * (*)) (%array-data vector))))
+      (with-pinned-objects (backing)
+        (with-alien ((compress-vector (function int unsigned size-t) :extern))
+          (alien-funcall compress-vector (get-lisp-obj-address backing) (length vector)))
+        backing)))
 
   (defun decompress (vector)
+    (declare (sb-c::tlab :system))
     (if (typep vector '(simple-array (signed-byte 8) (*)))
-        (with-alien ((decompress-vector (function (* unsigned-char) (* char) (* size-t)) :extern "decompress_vector")
-                     (size size-t))
-          (let* ((pointer
-                   (with-pinned-objects (vector)
-                     (alien-funcall decompress-vector (int-sap (get-lisp-obj-address vector)) (addr size))))
-                 (length size)
-                 (new (make-array length :element-type '(unsigned-byte 8))))
-            (loop for i below length
-                  do (setf (aref new i) (deref pointer i)))
-            (free-alien pointer)
-            new))
+        (with-alien ((decompress-vector (function int unsigned int system-area-pointer int) :extern))
+          (with-pinned-objects (vector)
+            (binding* ((sap (vector-sap vector))
+                       ((preamble skip) (sap-read-var-integer sap 0)) ; preamble = uncompressed size
+                       (output (make-array preamble :element-type '(unsigned-byte 8))))
+              (with-pinned-objects (output)
+                (alien-funcall decompress-vector
+                               (get-lisp-obj-address vector) skip
+                               (vector-sap output) preamble))
+              output)))
         vector)))

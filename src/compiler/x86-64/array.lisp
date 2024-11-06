@@ -119,19 +119,7 @@
   (:arg-types * (:constant t))
   (:conditional :e)
   (:generator 2
-    (inst cmp :byte (ea rank-disp array) (encode-array-rank rank))))
-
-(define-vop (array-vectorp simple-type-predicate)
-  ;; SIMPLE-TYPE-PREDICATE says that it takes stack locations, but that's no good.
-  (:args (array :scs (any-reg descriptor-reg)))
-  (:translate vectorp)
-  (:conditional :z)
-  (:info)
-  (:guard (lambda (node)
-            (let ((arg (car (sb-c::combination-args node))))
-              (csubtypep (sb-c::lvar-type arg) (specifier-type 'array)))))
-  (:generator 1
-    (inst cmp :byte (ea rank-disp array) (encode-array-rank 1)))))
+    (inst cmp :byte (ea rank-disp array) (encode-array-rank rank)))))
 
 (define-vop (simple-array-header-of-rank-p type-predicate)
   (:translate sb-c::simple-array-header-of-rank-p)
@@ -344,7 +332,7 @@
          (let ((ea (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
                            object index (index-scale n-word-bytes index))))
            ,@(when (eq type 'simple-vector)
-               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 2 vop) value)))
+               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 2 vop))))
            (emit-store ea value val-temp
                        ,(not (intersection '(signed-reg unsigned-reg) scs))))))
      (define-vop (,(symbolicate name "-C") dvset)
@@ -365,7 +353,7 @@
          ,@(unless (eq type 'simple-vector) '((unpoison-element object (+ index addend))))
          (let ((ea (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag) object)))
            ,@(when (eq type 'simple-vector)
-               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 1 vop) value)))
+               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 1 vop))))
            (emit-store ea value val-temp
                        ,(not (intersection '(signed-reg unsigned-reg) scs)))))))))
 (defmacro def-full-data-vector-frobs (type element-type &rest scs)
@@ -482,15 +470,16 @@
   (:translate data-vector-set-with-offset)
   (:policy :fast-safe)
   ;; Arg order is (VECTOR INDEX ADDEND VALUE)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (eql 0)) positive-fixnum)
+  (:arg-types simple-bit-vector tagged-num (:constant (eql 0)) positive-fixnum)
   (:args (bv :scs (descriptor-reg))
-         (index :scs (unsigned-reg (immediate
-                                    (typep (bit-base (floor (tn-value tn) 32)) '(signed-byte 32)))))
+         (index :scs (signed-reg unsigned-reg
+                                 (immediate
+                                  (typep (bit-base (floor (tn-value tn) 32)) '(signed-byte 32)))))
          (value :scs (immediate any-reg signed-reg unsigned-reg control-stack
                                 signed-stack unsigned-stack)))
-  (:temporary (:sc unsigned-reg) word temp)
   (:info addend)
   (:ignore addend)
+  (:temporary (:sc unsigned-reg) word temp)
   (:generator 6
     (unpoison-element bv index)
     (cond ((sc-is value immediate)
@@ -543,10 +532,10 @@
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector dvref)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg)))
+         (index :scs (signed-reg unsigned-reg)))
   (:info addend)
   (:ignore addend)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
   (:temporary (:sc unsigned-reg) temp)
   (:results (result :scs (any-reg)))
   (:result-types positive-fixnum)
@@ -578,10 +567,10 @@
 (define-vop (data-vector-ref-with-offset/simple-bit-vector-eq)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg)))
+         (index :scs (signed-reg unsigned-reg)))
   (:info addend)
   (:ignore addend)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
   (:temporary (:sc unsigned-reg) word)
   (:conditional :nc)
   (:vop-var vop)
@@ -599,10 +588,10 @@
                `(progn
                   (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type) dvref)
                     (:args (object :scs (descriptor-reg))
-                           (index :scs (unsigned-reg)))
+                           (index :scs (signed-reg unsigned-reg)))
                     (:info addend)
                     (:ignore addend)
-                    (:arg-types ,type positive-fixnum (:constant (integer 0 0)))
+                    (:arg-types ,type tagged-num (:constant (integer 0 0)))
                     (:results (result :scs (unsigned-reg) :from (:argument 0)))
                     (:result-types positive-fixnum)
                     (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
@@ -640,11 +629,11 @@
                           (inst and result ,(1- (ash 1 bits)))))))
                   (define-vop (,(symbolicate 'data-vector-set-with-offset/ type) dvset)
                     (:args (object :scs (descriptor-reg))
-                           (index :scs (unsigned-reg) :target ecx)
+                           (index :scs (signed-reg unsigned-reg) :target ecx)
                            (value :scs (unsigned-reg immediate)))
                     (:info addend)
                     (:ignore addend)
-                    (:arg-types ,type positive-fixnum (:constant (integer 0 0))
+                    (:arg-types ,type tagged-num (:constant (integer 0 0))
                                 positive-fixnum)
                     (:temporary (:sc unsigned-reg) word-index)
                     (:temporary (:sc unsigned-reg) old)

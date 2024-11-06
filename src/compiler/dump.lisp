@@ -17,6 +17,7 @@
 ;;; know about dumping to a fasl file. (We need to objectify the
 ;;; state because the fasdumper must be reentrant.)
 (defstruct (fasl-output
+            (:constructor make-fasl-output (stream))
             (:print-object (lambda (x s)
                              (print-unreadable-object (x s :type t)
                                (prin1 (namestring (fasl-output-stream x))
@@ -129,7 +130,7 @@
           ((unboxed-array (*))
            (and (sb-xc:typep y '(simple-array * 1))
                 (= (length x) (length y))
-                (equal (sb-xc:array-element-type x) (sb-xc:array-element-type y))
+                (equal (array-element-type x) (array-element-type y))
                 (or (typep x '(array nil (*)))
                     (dotimes (i (length x) t)
                       (unless (= (aref x i) (aref y i)) (return nil))))))
@@ -166,7 +167,7 @@
       (symbol (sxhash x))
       (number (sb-impl::number-sxhash x))
       (pathname (sb-impl::pathname-sxhash x))
-      (instance
+      ((or instance simple-vector)
        (let ((idmap (fasl-output-instance-id-table *compile-object*)))
          (values (ensure-gethash x idmap
                                  (let ((c (1+ (hash-table-count idmap))))
@@ -286,7 +287,7 @@
            (if (typep fop-symbol '(cons (eql quote) (cons symbol null)))
                (cadr fop-symbol)
                (error "Bad 1st arg to DUMP-FOP: ~S" fop-symbol)))
-         (val (or (gethash (intern (symbol-name fop-symbol) "SB-FASL")
+         (val (or (gethash (intern (symbol-name fop-symbol) #.(find-package "SB-FASL"))
                            *fop-name-to-opcode*)
                   (error "compiler bug: ~S is not a legal fasload operator."
                          fop-symbol)))
@@ -381,7 +382,7 @@
                          :direction :output
                          :if-exists :supersede
                          :element-type 'sb-assem:assembly-unit))
-           (res (make-fasl-output :stream stream)))
+           (res (make-fasl-output stream)))
       ;; Before the actual FASL header, write a shebang line using the current
       ;; runtime path, so our fasls can be executed directly from the shell.
       #-sb-xc-host ; cross-compiled fasls are not directly executable
@@ -654,6 +655,34 @@
   (sub-dump-object (denominator x) file)
   (dump-fop 'fop-ratio file))
 
+#+(and long-float x86)
+(defun dump-long-float (float file)
+  (declare (long-float float))
+  (let ((exp-bits (long-float-exp-bits float))
+        (high-bits (long-float-high-bits float))
+        (low-bits (long-float-low-bits float)))
+    ;; We could get away with DUMP-WORD here, since the x86 has 4-byte words,
+    ;; but we prefer to make things as explicit as possible.
+    ;;     --njf, 2004-08-16
+    (dump-integer-as-n-bytes low-bits 4 file)
+    (dump-integer-as-n-bytes high-bits 4 file)
+    (dump-integer-as-n-bytes exp-bits 2 file)))
+
+#+(and long-float sparc)
+(defun dump-long-float (float file)
+  (declare (long-float float))
+  (let ((exp-bits (long-float-exp-bits float))
+        (high-bits (long-float-high-bits float))
+        (mid-bits (long-float-mid-bits float))
+        (low-bits (long-float-low-bits float)))
+    ;; We could get away with DUMP-WORD here, since the sparc has 4-byte
+    ;; words, but we prefer to make things as explicit as possible.
+    ;;     --njf, 2004-08-16
+    (dump-integer-as-n-bytes low-bits 4 file)
+    (dump-integer-as-n-bytes mid-bits 4 file)
+    (dump-integer-as-n-bytes high-bits 4 file)
+    (dump-integer-as-n-bytes exp-bits 4 file)))
+
 (defun dump-integer (n file)
   (typecase n
     ((signed-byte 8)
@@ -861,8 +890,7 @@
 (defun dump-array (x file)
   (if (vectorp x)
       (dump-vector x file)
-      #-sb-xc-host (dump-multi-dim-array x file)
-      #+sb-xc-host (bug "Can't dump multi-dim array")))
+      (dump-multi-dim-array x file)))
 
 ;;; Dump the vector object. If it's not simple, then actually dump a
 ;;; simple realization of it. But we enter the original in the EQ or SIMILAR
@@ -952,6 +980,20 @@
                             0
                             (ceiling (* length bits-per-elt) sb-vm:n-byte-bits)
                             #+sb-xc-host bits-per-elt)))
+
+;;; Dump a multi-dimensional array. Note: any displacements are folded out.
+(defun dump-multi-dim-array (array file)
+  (note-potential-circularity array file)
+  (let ((rank (array-rank array)))
+    (dotimes (i rank)
+      (dump-integer (array-dimension array i) file))
+    (with-array-data ((vector array) (start) (end))
+      (if (and (= start 0) (= end (length vector)))
+          (sub-dump-object vector file)
+          (sub-dump-object (subseq vector start end) file)))
+    (dump-fop 'fop-array file rank)
+    (eq-save-object array file)))
+
 
 ;;; Dump string-ish things.
 
@@ -1029,12 +1071,13 @@
   (assert (<= (length +fixup-kinds+) 16))) ; fixup-kind fits in 4 bits
 
 (defconstant-eqx +fixup-flavors+
-  #(:assembly-routine
+ `#(:assembly-routine
     :card-table-index-mask :symbol-tls-index
     :alien-code-linkage-index :alien-data-linkage-index
     :foreign :foreign-dataref
     :code-object
-    :layout :immobile-symbol :fdefn-call :static-call
+    :layout :immobile-symbol
+    #+linkage-space ,@'(:linkage-cell :linkage-cell-ud)
     :symbol-value
     :layout-id)
   #'equalp)
@@ -1062,7 +1105,7 @@
 #-(or x86 x86-64) ; these two architectures provide an overriding definition
 (defun pack-fixups-for-reapplication (fixup-notes)
   (let (result)
-    (dolist (note fixup-notes (pack-code-fixup-locs nil nil result))
+    (dolist (note fixup-notes (pack-code-fixup-locs result))
       (let ((fixup (fixup-note-fixup note)))
         (when (eq (fixup-flavor fixup) :card-table-index-mask)
           (push (fixup-note-position note) result))))))
@@ -1149,8 +1192,7 @@
            (type fasl-output fasl-output))
   (let* ((2comp (component-info component))
          (constants (ir2-component-constants 2comp))
-         (header-length (length constants))
-         (n-fdefns 0))
+         (header-length (length constants)))
     (collect ((patches)
               (named-constants))
       ;; Dump the constants, noting any :ENTRY constants that have to
@@ -1170,8 +1212,6 @@
              (dump-fop 'fop-misc-trap fasl-output))
             (list
              (ecase kind
-               (:constant ; anything that has not been wrapped in a #<CONSTANT>
-                (dump-object payload fasl-output))
                (:entry
                 (let* ((info (leaf-info payload))
                        (handle (gethash info
@@ -1184,11 +1224,9 @@
                (:load-time-value
                 (dump-push payload fasl-output))
                (:fdefinition
-                ;; It's possible for other fdefns to be found in the header, but they can't
-                ;; have resulted from IR2 conversion. They would have had to come from
-                ;; something like (load-time-value (find-or-create-fdefn ...))
-                ;; which is fine, but they don't count for this purpose.
-                (incf n-fdefns)
+                ;; It's possible for other fdefns to be found in the header not resulting
+                ;; from IR2-CONVERT-GLOBAL-VAR, for example (L-T-V (find-or-create-fdefn ...)).
+                ;; Those fdefns would not use FOP-FDEFN.
                 (dump-object payload fasl-output)
                 (dump-fop 'fop-fdefn fasl-output))
                (:known-fun
@@ -1199,11 +1237,7 @@
                 (dump-specialized-vector (make-array (cdr entry)
                                                      :element-type '(unsigned-byte 8)
                                                      :initial-element #xFF)
-                                         fasl-output))
-               #+arm64
-               (:tls-index
-                (dump-object payload fasl-output)
-                (dump-fop 'fop-tls-index fasl-output)))))))
+                                         fasl-output)))))))
 
       ;; Dump the debug info.
       (let ((info (debug-info-for-component component)))
@@ -1221,9 +1255,6 @@
       ;; Fasl dumper/loader convention allows at most 3 integer args.
       ;; Others have to be written with explicit calls.
       (dump-integer-as-n-bytes (length (ir2-component-entries 2comp))
-                               4 ; output 4 bytes
-                               fasl-output)
-      (dump-integer-as-n-bytes (the (unsigned-byte 22) n-fdefns)
                                4 ; output 4 bytes
                                fasl-output)
       (dump-segment code-segment code-length fasl-output)
@@ -1287,25 +1318,8 @@
          (entries (ir2-component-entries 2comp))
          (nfuns (length entries))
          (code-handle
-           ;; fill in the placeholder elements of constants
-           ;; with the NAME, ARGLIST, TYPE, INFO slots of each simple-fun.
-           (let ((constants (ir2-component-constants 2comp))
-                 (wordindex (+ sb-vm:code-constants-offset
-                               (* sb-vm:code-slots-per-simple-fun nfuns))))
-             (dolist (entry entries)
-               ;; Process in reverse order of ENTRIES.
-               ;; See also MAKE-CORE-COMPONENT which does the same thing.
-               (decf wordindex sb-vm:code-slots-per-simple-fun)
-               (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
-                     `(:constant ,(entry-info-name entry))
-                     (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
-                     `(:constant ,(entry-info-arguments entry))
-                     (aref constants (+ wordindex sb-vm:simple-fun-source-slot))
-                     `(:constant ,(entry-info-form/doc entry))
-                     (aref constants (+ wordindex sb-vm:simple-fun-info-slot))
-                     `(:constant ,(entry-info-type/xref entry))))
              (dump-code-object component code-segment code-length fixups
-                               alloc-points file)))
+                               alloc-points file))
          (fun-index nfuns))
 
     (dolist (entry entries)
@@ -1345,20 +1359,15 @@
             (remhash entry (fasl-output-patch-table file)))))))
   (values))
 
-(defun dump-push-previously-dumped-fun (fun fasl-output)
-  (declare (type clambda fun))
-  (let ((handle (gethash (leaf-info fun)
-                         (fasl-output-entry-table fasl-output))))
-    (aver handle)
-    (dump-push handle fasl-output))
-  (values))
-
 ;;; Dump a FOP-FUNCALL to call an already-dumped top level lambda at
 ;;; load time.
 (defun fasl-dump-toplevel-lambda-call (fun fasl-output)
-  (declare (type clambda fun))
-  (dump-push-previously-dumped-fun fun fasl-output)
-  (dump-fop 'fop-funcall-for-effect fasl-output 0)
+  (declare (type clambda fun) (type fasl-output fasl-output))
+  (let ((handle (gethash (leaf-info fun)
+                         (fasl-output-entry-table fasl-output))))
+    (aver handle)
+    (dump-push handle fasl-output)
+    (dump-fop 'fop-funcall-for-effect fasl-output 0))
   (values))
 
 ;;; Dump some information to allow partial reconstruction of the
@@ -1383,12 +1392,7 @@
     (let ((res-handle (dump-pop file)))
       (dolist (info-handle (fasl-output-debug-info file))
         (dump-push res-handle file)
-        (symbol-macrolet
-            ((debug-info-source-index
-               (let ((dd (find-defstruct-description 'debug-info)))
-                 (dsd-index (find 'source (dd-slots dd)
-                                  :key #'dsd-name :test 'string=)))))
-          (dump-fop 'fop-structset file info-handle debug-info-source-index)))))
+        (dump-fop 'fop-structset file info-handle (get-dsd-index debug-info source)))))
 
   (setf (fasl-output-debug-info file) nil)
   (values))
@@ -1396,9 +1400,7 @@
 ;;;; dumping structures
 
 (defun dump-structure (struct file)
-  (unless (or (gethash struct (fasl-output-valid-structures file))
-              ;; Assume that DEBUG-FUNs are always valid to dump.
-              (typep struct 'debug-fun))
+  (unless (gethash struct (fasl-output-valid-structures file))
     (error "attempt to dump invalid structure:~%  ~S~%How did this happen?"
            struct))
   (note-potential-circularity struct file)
@@ -1478,13 +1480,13 @@
 
 ;;;; code coverage
 
-(defun dump-code-coverage-records (namestring cc file)
-  (declare (type string namestring)
-           (type list cc))
-  (dump-object namestring file)
+(defun dump-code-coverage-records (cc file)
+  (declare (type list cc))
   (dump-object cc file)
   (dump-fop 'fop-record-code-coverage file))
 
+;;; NOTE: this is unused at present and may never have been necessary-
+;;; full-calls can be inferred at load-time by tracking :LINKAGE-CELL fixups or FOP-FDEFN.
 (defun dump-emitted-full-calls (hash-table fasl)
   (let ((list (%hash-table-alist hash-table)))
     #+sb-xc-host ; enforce host-insensitive reproducible ordering

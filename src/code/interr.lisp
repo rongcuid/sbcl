@@ -127,10 +127,6 @@
 
 (deferr undefined-fun-error (fdefn-or-symbol)
   (let* ((name (etypecase fdefn-or-symbol
-                 #+untagged-fdefns
-                 ((unsigned-byte 61)
-                  (fdefn-name (%make-lisp-obj (logior (get-lisp-obj-address fdefn-or-symbol)
-                                                      sb-vm:other-pointer-lowtag))))
                  (symbol fdefn-or-symbol)
                  (fdefn (fdefn-name fdefn-or-symbol))))
          (condition
@@ -142,9 +138,9 @@
                            :name name
                            :not-yet-loaded
                            (cond ((and (boundp 'sb-c:*compilation*)
-                                       (member name (sb-c::fun-names-in-this-file
-                                                     sb-c:*compilation*)
-                                               :test #'equal))
+                                       (hashset-find (sb-c::fun-names-in-this-file
+                                                      sb-c:*compilation*)
+                                                     name))
                                   t)
                                  ((and (boundp 'sb-c:*lexenv*)
                                        (sb-c::fun-locally-defined-p
@@ -176,8 +172,8 @@
   (let* ((frame (find-interrupted-frame))
          (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
          (context (sb-di:error-context)))
-    (cond (context
-           (destructuring-bind (name type . restart) context
+    (cond ((typep context '(cons integer cons))
+           (destructuring-bind (restart name . type) context
                (restart-case
                    (error 'simple-program-error
                           :format-control "Function~@[ ~s~] declared to return ~s returned ~a value~:p"
@@ -188,10 +184,23 @@
                    (sb-vm::incf-context-pc *current-internal-error-context*
                                            restart)))))
           (t
-           (when (typep name '(cons (eql sb-pcl::fast-method)))
-             (decf nargs 2))
            (restart-case
-               (%program-error "invalid number of arguments: ~S" nargs)
+               (error 'simple-program-error
+                      :format-control "invalid number of arguments: ~S"
+                      :format-arguments (list (if (typep name '(cons (eql sb-pcl::fast-method)))
+                                                  (- nargs 2)
+                                                  nargs)))
+             (continue ()
+               :report (lambda (stream)
+                         (format stream "Ignore extra arguments"))
+               :test (lambda ()
+                       (and context
+                            (> nargs (cdr context))))
+               (destructuring-bind (restart . max) context
+                 (setf (sb-vm:boxed-context-register *current-internal-error-context* sb-vm::nargs-offset)
+                       max)
+                 (sb-vm::incf-context-pc *current-internal-error-context*
+                                         restart)))
              #+(or x86-64 arm64)
              (replace-function (value)
                :report (lambda (stream)
@@ -381,11 +390,12 @@
                                         'type-error)
                                     :datum object
                                     :expected-type expected-type
-                                    :context (and (not (integerp context))
-                                                  (not (eq context 'cerror))
-                                                  context))))
-              (cond ((integerp context)
-                     (restart-type-error type condition context))
+                                    :context (and (not (eq context 'cerror))
+                                                  (if (typep context '(cons integer))
+                                                      (cdr context)
+                                                      context)))))
+              (cond ((typep context '(cons integer))
+                     (restart-type-error type condition (car context)))
                     ((eq context 'cerror)
                      (restart-type-error type condition))
                     (t
@@ -398,6 +408,12 @@
   (def etypecase-failure-error etypecase-failure)
   (def ecase-failure-error ecase-failure)
   (def object-not-type-error object-not-type-error))
+
+(deferr check-type-error (value place type)
+  (declare (notinline check-type-error-trap))
+  (setf (sb-vm:boxed-context-register *current-internal-error-context*
+                                      (sb-c:sc+offset-offset (first *current-internal-error-args*)))
+        (check-type-error-trap place value type)))
 
 (deferr odd-key-args-error ()
   (%program-error "odd number of &KEY arguments"))

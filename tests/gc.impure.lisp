@@ -168,10 +168,10 @@
     (assert (= (sb-kernel:generation-of (sb-int:find-fdefn '(setf car)))
                (sb-kernel:generation-of #'car)))))
 
-(with-test (:name :static-fdefn-space)
+(with-test (:name :static-fdefn-space :skipped-on :linkage-space)
   (sb-int:dovector (name sb-vm:+static-fdefns+)
     (assert (eq (sb-ext:heap-allocated-p (sb-int:find-fdefn name))
-                (or #+(and immobile-code x86-64) :immobile :static)))))
+                :static))))
 
 ;;; SB-EXT:GENERATION-* accessors returned bogus values for generation > 0
 (with-test (:name :bug-529014)
@@ -302,7 +302,7 @@
   (assert (not (sb-kernel:immobile-space-addr-p
                 (+ sb-vm:fixedobj-space-start
                    sb-vm:fixedobj-space-size
-                   sb-vm:alien-linkage-table-space-size
+                   sb-vm:alien-linkage-space-size
                    sb-vm:text-space-size)))))
 
 (with-test (:name :unique-code-serialno :skipped-on :interpreter)
@@ -311,6 +311,9 @@
      (lambda (obj type size)
        (declare (ignore size))
        (when (and (= type sb-vm:code-header-widetag)
+                  ;; ppc64 allocates unusual-looking code when binding a
+                  ;; closure or funinstance to a global function name.
+                  #+ppc64 (sb-kernel:%instancep (sb-kernel:%code-debug-info obj))
                   (plusp (sb-kernel:code-n-entries obj)))
          (let ((serial (sb-kernel:%code-serialno obj)))
            (assert (zerop (aref a serial)))

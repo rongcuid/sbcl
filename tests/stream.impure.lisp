@@ -123,11 +123,11 @@
   (assert-error (read-byte (make-string-input-stream "abc"))
                 type-error))
 
-(with-test (:name (:default :element-type read-byte error))
- (assert-error (with-open-file (s "/dev/zero")
-                 (read-byte s))
-               #-win32 type-error
-               #+win32 sb-int:simple-file-error))
+(with-test (:name (:default :element-type read-byte error)
+            :skipped-on :win32)
+  (assert-error (with-open-file (s "/dev/zero")
+                  (read-byte s))
+      type-error))
 
 ;;; bidirectional streams getting confused about their position
 (with-test (:name (:direction :io))
@@ -829,17 +829,17 @@
   (%make-mock-fd-stream
    (mapcar (lambda (x) (substitute #\Newline #\| x)) buffer-chain)))
 
-(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start count eof-err-p)
+(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start end &optional eof-err-p)
   (cond ((mock-fd-stream-buffer-chain stream)
          (let* ((chars (pop (mock-fd-stream-buffer-chain stream)))
                 (n-chars (length chars)))
            ;; make sure the mock object is being used as expected.
-           (assert (>= count (length chars)))
+           (assert (>= end (length chars)))
            (replace char-buf chars :start1 start)
            (fill size-buf 1 :start start :end (+ start n-chars))
-           n-chars))
+           (+ start n-chars)))
         (t
-         (sb-impl::eof-or-lose stream eof-err-p 0))))
+         (sb-impl::eof-or-lose stream eof-err-p start))))
 
 (with-test (:name :read-chunk-from-frc-buffer)
   (let ((s (make-mock-fd-stream '("zabc" "d" "efgh" "foo|bar" "hi"))))
@@ -855,11 +855,11 @@
   (let ((s (make-mock-fd-stream '("zabc" "d" "efgh" "foo*bar" "hi")))
         (string (make-string 100)))
     (let ((endpos
-           (sb-impl::ansi-stream-read-string-from-frc-buffer string s 10 nil)))
+           (read-sequence string s :start 10)))
       (assert (and (= endpos 28)
                    (string= (subseq string 10 endpos) "zabcdefghfoo*barhi"))))
     (let ((endpos
-           (sb-impl::ansi-stream-read-string-from-frc-buffer string s 0 nil)))
+           (read-sequence string s)))
       (assert (= endpos 0)))))
 
 (with-test (:name :named-pipe-wait-eof)
@@ -879,3 +879,9 @@
         (read-char-no-hang cs)
         (assert (listen cs))))
     (delete-file file)))
+
+(with-test (:name :read-sequence-end
+            :skipped-on :win32)
+  (assert (=  (with-open-file (s "/dev/zero")
+                (read-sequence (make-string 4096) s :start 9))
+              4096)))

@@ -326,7 +326,7 @@ static int gc_and_save_cmd(char **ptr) {
         return 0;
     }
 #if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
-    current_thread = all_threads;
+    ASSIGN_CURRENT_THREAD(all_threads);
 #endif
     extern void gc_and_save(char*,bool,bool,bool,bool,int,int);
     gc_and_save(name, 0, 0, 0, 0, 0, 0); // never returns
@@ -628,7 +628,7 @@ int verify_lisp_hashtable(__attribute__((unused)) struct hash_table* ht,
                           __attribute__((unused)) FILE* file)
 {
     int errors = 0;
-#ifdef LISP_FEATURE_64_BIT
+#if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_64_BIT
     char *kinds[4] = {"EQ","EQL","EQUAL","EQUALP"};
     lispobj* data = VECTOR(ht->pairs)->data;
     uint32_t* hvdata = ht->hash_vector != NIL ?
@@ -638,50 +638,60 @@ int verify_lisp_hashtable(__attribute__((unused)) struct hash_table* ht,
     uint32_t* nvdata = (void*)VECTOR(ht->next_vector)->data;
     unsigned ivmask = vector_len(iv) - 1;
     int hwm = KV_PAIRS_HIGH_WATER_MARK(data);
+    sword_t state = (sword_t)ht->sw__hash_fun_state;
+
     if (file)
         fprintf(file,
-                "Table %p Kind=%d=%s Weak=%d Count=%d HWM=%d rehash=%d\n",
+                "Table %p Kind=%d=%s State=%ld Weak=%d Count=%d HWM=%d rehash=%d\n",
                 ht, hashtable_kind(ht), kinds[hashtable_kind(ht)],
-                hashtable_weakp(ht)?1:0,
+                state, hashtable_weakp(ht)?1:0,
                 (int)fixnum_value(ht->_count), hwm, (int)data[1]);
     int j;
-    for (j = 1; j <= hwm; j++) {
-        lispobj key = data[2*j];
-        lispobj val = data[2*j+1];
-        if (header_widetag(key) == UNBOUND_MARKER_WIDETAG ||
-            header_widetag(val) == UNBOUND_MARKER_WIDETAG) {
-            if (file) fprintf(file, "[%4d] %12lx %16lx\n", j, key, val);
-            continue;
+    // Flat hash tables are just vectors. Nothing to check.
+    if (state != -1) {
+        for (j = 1; j <= hwm; j++) {
+            lispobj key = data[2*j];
+            lispobj val = data[2*j+1];
+            if (header_widetag(key) == UNBOUND_MARKER_WIDETAG ||
+                header_widetag(val) == UNBOUND_MARKER_WIDETAG) {
+                if (file) fprintf(file, "[%4d] %12lx %16lx\n", j, key, val);
+                continue;
+            }
+            uint32_t h;
+            if (hvdata && hvdata[j] != 0xFFFFFFFF) {
+                h = hvdata[j];
+                // print the as-stored hash
+                if (file)
+                    fprintf(file, "[%4d] %12lx %16lx  %08x %4x (",
+                            j, key, val, h, h & ivmask);
+            } else {
+                // print the hash and then fuzzed hash;
+                if (state >= 0) {
+                    h = fixnum_value(funcall2(ht->hash_fun, key,
+                                              make_fixnum(state)));
+                } else {
+                    h = fixnum_value(funcall1(ht->hash_fun, key));
+                }
+                if (file)
+                    fprintf(file, "[%4d] %12lx %16lx %016lx (", j,
+                            key, val, (unsigned long int)h);
+            }
+            // show the chain
+            unsigned cell = ivdata[h & ivmask];
+            while (cell) {
+                if (file) fprintf(file, "%d", cell);
+                lispobj matchp = funcall2(ht->test_fun, key, data[cell*2]);
+                if (matchp != NIL) { if (file) fprintf(file, "\u2713"); break; }
+                if ((cell = nvdata[cell]) != 0 && file) putc(' ', file);
+            }
+            if (!cell) ++errors;
+            if (file) fprintf(file, cell ? ")\n" : ") *\n");
         }
-        uint32_t h;
-        if (hvdata && hvdata[j] != 0xFFFFFFFF) {
-            h = hvdata[j];
-            // print the as-stored hash
-            if (file)
-                fprintf(file, "[%4d] %12lx %16lx  %08x %4x (",
-                        j, key, val, h, h & ivmask);
-        } else {
-            // print the hash and then fuzzed hash;
-            lispobj h0 = funcall1(ht->hash_fun, key);
-            h = prefuzz_ht_hash(h0);
-            if (file)
-                fprintf(file, "[%4d] %12lx %16lx %016lx %08x %4x (", j,
-                        key, val, fixnum_value(h0), h, h & ivmask);
-        }
-        // show the chain
-        unsigned cell = ivdata[h & ivmask];
-        while (cell) {
-            if (file) fprintf(file, "%d", cell);
-            lispobj matchp = funcall2(ht->test_fun, key, data[cell*2]);
-            if (matchp != NIL) { if (file) fprintf(file, "\u2713"); break; }
-            if ((cell = nvdata[cell]) != 0 && file) putc(' ', file);
-        }
-        if (!cell) ++errors;
-        if (file) fprintf(file, cell ? ")\n" : ") *\n");
     }
 #endif
     return errors;
 }
+
 static int hashtable_cmd(char **ptr)
 {
     lispobj obj;
@@ -1189,7 +1199,7 @@ int load_gc_crashdump(char* pathname)
         lose("Didn't map dynamic space where expected: %p vs %p",
              dynspace, (char*)preamble.dynspace_start);
     checked_read("dynamic", fd, (char*)DYNAMIC_SPACE_START, dynspace_nbytes);
-    fprintf(stderr, "snapshot: %"PRIdPTR" pages in use (%ld bytes)\n",
+    fprintf(stderr, "snapshot: %"PAGE_INDEX_FMT" pages in use (%ld bytes)\n",
             next_free_page, dynspace_nbytes);
     checked_read("PTE", fd, page_table, sizeof (struct page) * next_free_page);
     checked_read("cardmark", fd, gc_card_mark, 1+gc_card_table_mask);

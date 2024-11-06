@@ -181,6 +181,7 @@
                    ,@(or fixnum=>fixnum `((move r x) (inst ,op r y)))))
                 (define-vop (,(symbolicate 'fast- translate '-c/fixnum=>fixnum)
                              fast-fixnum-binop-c)
+                  (:arg-refs x-ref)
                   (:translate ,translate)
                   (:generator 1
                    ,@(or c/fixnum=>fixnum
@@ -227,29 +228,66 @@
               ;; when Y = (ldb (byte 32 0) (fixnumize -1 n-fixnum-tag-bits))
               ;; Probably not very common, so not too important.
               (inst and :dword r y))
-           (t
-            (move r x)
-            (inst and r (constantize y))))))
+             ((and (not (plausible-signed-imm32-operand-p y))
+                   (let* ((int (sb-c::type-approximate-interval (tn-ref-type x-ref)))
+                          (mask (logandc1 (logior y fixnum-tag-mask)
+                                          (ldb (byte (+ (integer-length (sb-c::interval-high int)) n-fixnum-tag-bits) 0) -1))))
+                     (when (and (>= (sb-c::interval-low int) 0)
+                                (= (logcount mask) 1))
+                       (move r x)
+                       (inst btr r (1- (integer-length mask)))
+                       t))))
+             (t
+              (move r x)
+              (inst and r (constantize y))))))
     :c/unsigned=>unsigned
     ;; Probably should give it the preceding treatment here too.
     ;; Also, if the constant is #xFFFFFFFF, then just a MOV is enough
     ;; if the destination is a register.
     ((move r x)
-     (let ((y (constantize y)))
-       ;; ANDing with #xFFFF_FFFF_FFFF_FFFF is a no-op, other than
-       ;; the eflags state which we don't care about.
-       (unless (eql y -1) ; do nothing if this is true
-         (inst and r y)))))
+     ;; ANDing with #xFFFF_FFFF_FFFF_FFFF is a no-op, other than
+     ;; the eflags state which we don't care about.
+     (cond ((eql y most-positive-word))
+           ((and (not (plausible-signed-imm32-operand-p y))
+                 (= (logcount (logandc1 y most-positive-word)) 1))
+            (inst btr r (1- (integer-length (logandc1 y most-positive-word)))))
+           (t
+            (inst and r (constantize y)))))
+    :c/signed=>signed
+    ((move r x)
+     (cond ((and (not (plausible-signed-imm32-operand-p y))
+                 (= (logcount (logandc1 y most-positive-word)) 1))
+            (inst btr r (1- (integer-length (logandc1 y most-positive-word)))))
+           (t
+            (inst and r (constantize y))))))
 
   (define-binop logior 2 or
-    :c/unsigned=>unsigned
-    ((let ((y (constantize y)))
-       (cond ((and (gpr-tn-p r) (eql y -1)) ; special-case "OR reg, all-ones"
-              ;; I have yet to elicit this case. Can it happen?
-              (inst mov r -1))
+    :c/fixnum=>fixnum
+    ((let ((y (fixnumize y)))
+       (move r x)
+       (cond ((and (not (plausible-signed-imm32-operand-p y))
+                   (= (logcount y) 1))
+              (inst bts r (1- (integer-length y))))
              (t
-              (move r x)
-              (inst or r y))))))
+              (inst or r (constantize y))))))
+    :c/unsigned=>unsigned
+    ((cond ((and (gpr-tn-p r) (eql y -1)) ; special-case "OR reg, all-ones"
+            ;; I have yet to elicit this case. Can it happen?
+            (inst mov r -1))
+           ((and (not (plausible-signed-imm32-operand-p y))
+                 (= (logcount y) 1))
+            (move r x)
+            (inst bts r (1- (integer-length y))))
+           (t
+            (move r x)
+            (inst or r (constantize y)))))
+    :c/signed=>signed
+    ((move r x)
+     (cond ((and (not (plausible-signed-imm32-operand-p y))
+                 (= (logcount (ldb (byte n-word-bits 0) y)) 1))
+            (inst bts r (1- (integer-length (ldb (byte n-word-bits 0) y)))))
+           (t
+            (inst or r (constantize y))))))
 
   (define-binop logxor 2 xor
     :c/unsigned=>unsigned
@@ -1535,7 +1573,8 @@
 (define-vop (overflow+t)
   (:translate overflow+)
   (:args (x :scs (any-reg descriptor-reg))
-         (y :scs (any-reg)))
+         (y :scs (any-reg (immediate
+                           (typep (tn-value tn) 'sc-offset)))))
   (:arg-types (:or t tagged-num) tagged-num)
   (:arg-refs x-ref)
   (:info type)
@@ -1551,13 +1590,17 @@
         (generate-fixnum-test x)
         (inst jmp :nz error))
       (move r x)
-      (inst add r y)
+      (inst add r (sc-case y
+                    (any-reg y)
+                    (t
+                     (fixnumize (tn-value y)))))
       (inst jmp :o error))))
 
 (define-vop (overflow-t)
   (:translate overflow-)
   (:args (x :scs (any-reg descriptor-reg))
-         (y :scs (any-reg)))
+         (y :scs (any-reg (immediate
+                           (typep (tn-value tn) 'sc-offset)))))
   (:arg-types (:or t tagged-num) tagged-num)
   (:arg-refs x-ref)
   (:info type)
@@ -1573,7 +1616,10 @@
         (generate-fixnum-test x)
         (inst jmp :nz error))
       (move r x)
-      (inst sub r y)
+      (inst sub r (sc-case y
+                    (any-reg y)
+                    (t
+                     (fixnumize (tn-value y)))))
       (inst jmp :o error))))
 
 (define-vop (overflow-t-y)
@@ -2605,11 +2651,16 @@
          ;; the restricted case of 8 bits at (BYTE 8 8).
          (reducible-to-byte-p
           (and (eq size :word) (not (logtest #xFF y)))))
-    (cond ((not size)
-           ;; Ensure that both operands are acceptable
-           ;; by possibly loading one into TEMP
-           (multiple-value-setq (x y) (ensure-not-mem+mem x y temp))
-           (inst test :qword x y))
+    (cond  ((and (integerp y)
+                 (not (plausible-signed-imm32-operand-p y))
+                 (= (logcount (ldb (byte n-word-bits 0) y)) 1))
+            (change-vop-flags sb-assem::*current-vop* '(:c))
+            (inst bt x (1- (integer-length (ldb (byte n-word-bits 0) y)))))
+           ((not size)
+            ;; Ensure that both operands are acceptable
+            ;; by possibly loading one into TEMP
+            (multiple-value-setq (x y) (ensure-not-mem+mem x y temp))
+            (inst test :qword x y))
           ((sc-is x control-stack unsigned-stack signed-stack)
            ;; Otherwise, when using an immediate operand smaller
            ;; than 64 bits, narrow the reg/mem operand to match.
@@ -3836,7 +3887,7 @@
 (define-vop (logand-word-mask)
   (:translate logand)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
+  (:args (x :scs (descriptor-reg) :to :save))
   (:arg-types t (:constant word))
   (:results (r :scs (unsigned-reg)))
   (:info mask)
@@ -3846,12 +3897,15 @@
                               (= mask (ash most-positive-word -1)))))
       (assemble ()
         (move r x)
-        (generate-fixnum-test r)
-        (inst jmp :nz BIGNUM)
+        (unless (= n-fixnum-tag-bits 1)
+          (generate-fixnum-test r)
+          (inst jmp :nz BIGNUM))
         (if fixnum-mask-p
             (inst shr r n-fixnum-tag-bits)
             (inst sar r n-fixnum-tag-bits))
-        (inst jmp DONE)
+        (if (= n-fixnum-tag-bits 1)
+            (inst jmp :nc DONE)
+            (inst jmp DONE))
         BIGNUM
         (loadw r x bignum-digits-offset other-pointer-lowtag)
         (when fixnum-mask-p
@@ -3859,8 +3913,11 @@
         DONE
         (unless (or fixnum-mask-p
                     (= mask most-positive-word))
-          (inst and r (or (plausible-signed-imm32-operand-p mask)
-                          (constantize mask))))))))
+          (if (and (not (plausible-signed-imm32-operand-p mask))
+                   (= (logcount (logandc1 mask most-positive-word)) 1))
+              (inst btr r (1- (integer-length (logandc1 mask most-positive-word))))
+              (inst and r (or (plausible-signed-imm32-operand-p mask)
+                              (constantize mask)))))))))
 
 (in-package "SB-C")
 
@@ -4287,3 +4344,23 @@
     (let* ((step (svref steps (1- (length steps))))
            (tn (second step)))
       (inst lea :dword res (ea tn tn)))))
+
+(defknown zero-or-one ((unsigned-byte 32))
+    (integer 0 1)
+    (flushable))
+(define-vop (zero-or-one/ub32)
+  (:translate zero-or-one)
+  (:policy :fast-safe)
+  (:args (arg :scs (unsigned-reg)))
+  (:arg-types unsigned-num)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 1
+   (cond ((location= res arg)
+          (inst test arg arg)
+          (inst mov arg 0)
+          (inst set :nz arg))
+         (t
+          (inst xor res res)
+          (inst test arg arg)
+          (inst set :nz res)))))

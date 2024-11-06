@@ -573,6 +573,8 @@
 (defun check-fasl-header (stream)
   (maybe-skip-shebang-line stream)
   (let ((byte (read-byte stream nil))
+        (freeform-bytes
+         (make-array 256 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
         (results))
     (when byte
       ;; Read and validate constant string prefix in fasl header.
@@ -589,6 +591,7 @@
             ((= byte +fasl-header-string-stop-char-code+)
              t)
           (declare (fixnum byte count))
+          (vector-push-extend byte freeform-bytes)
           (when (and (< count fhsss-length)
                      (not (eql byte (char-code (schar fhsss count)))))
             (error 'invalid-fasl-header
@@ -639,9 +642,8 @@
             (error 'invalid-fasl-features
                    :stream stream
                    :expected expected
-                   :features faff-in-this-file)))
-        ;; success
-        (nreverse results)))))
+                   :features faff-in-this-file)))))
+    (values (nreverse results) freeform-bytes)))
 
 ;; Setting this variable gives you a trace of fops as they are loaded and
 ;; executed.
@@ -681,8 +683,9 @@
                       nil
                       nil)))))))
 
-(defstruct fasl-group
-  (fun-names))
+(defstruct (fasl-group (:constructor !make-fasl-group (header-label)))
+  (header-label nil :read-only t)
+  (fun-names (sb-c::make-fun-name-hashset) :read-only t))
 
 (defvar *current-fasl-group*)
 ;;;
@@ -693,10 +696,30 @@
 ;;; Dispatch to the right function for each fop.
 (defun load-fasl-group (fasl-input)
   (let ((stream (%fasl-input-stream fasl-input))
+        (header-label)
         (trace *show-fops-p*))
-    (unless (check-fasl-header stream)
-      (return-from load-fasl-group))
-    (let ((*current-fasl-group* (make-fasl-group)))
+    (declare (inline !make-fasl-group))
+    (multiple-value-bind (results freeform-bytes) (check-fasl-header stream)
+      (unless results
+        (return-from load-fasl-group))
+      (let* ((signature
+              #.(sb-xc:make-array
+                 15
+                 :initial-contents
+                 ;; (see OPEN-FASL-OUTPUT in src/compiler/dump)
+                 (map 'list #'sb-xc:char-code "compiled from \"")))
+             (len 15) ; length of signature
+             (pos1 (search signature freeform-bytes))
+             (pos2 (and pos1 (position (char-code #\newline) freeform-bytes
+                                       :start (+ pos1 len)))))
+        (when (and pos1 pos2
+                   (= (aref freeform-bytes (1- pos2)) (char-code #\"))
+                   (loop for p from (+ pos1 len) below (1- pos2)
+                         always (standard-char-p (code-char (aref freeform-bytes p)))))
+          (setq header-label
+                (map 'string 'code-char
+                     (subseq freeform-bytes (+ pos1 len) (1- pos2)))))))
+    (let ((*current-fasl-group* (!make-fasl-group header-label)))
       (catch 'fasl-group-end
         (setf (svref (%fasl-input-table fasl-input) 0) 0)
         (loop
@@ -917,13 +940,11 @@
 (define-fop 39 (fop-int-const2) (number-to-core 2))
 (define-fop 40 (fop-int-const-neg1) (number-to-core -1))
 
-(define-fop 70 (fop-ratio (num den))
-  #+sb-xc-host (number-pair-to-core num den sb-vm:ratio-widetag)
-  #-sb-xc-host (%make-ratio num den))
+(define-fop 70 :not-host (fop-ratio (num den))
+  (%make-ratio num den))
 
-(define-fop 71 (fop-complex (realpart imagpart))
-  #+sb-xc-host (number-pair-to-core realpart imagpart sb-vm:complex-rational-widetag)
-  #-sb-xc-host (%make-complex realpart imagpart))
+(define-fop 71 :not-host (fop-complex (realpart imagpart))
+  (%make-complex realpart imagpart))
 
 (macrolet ((fast-read-single-float ()
              '(make-single-float (fast-read-s-integer 4)))
@@ -1080,12 +1101,8 @@
 ;;; on any architecture where fixup application cares what the address of the code actually is.
 ;;; This means x86 is disqualified. You're just wasting your time if you try, as I did.
 (defmacro with-writable-code-instructions ((code-var total-nwords debug-info-var
-                                            n-fdefns n-funs)
+                                            n-funs)
                                            &key copy fixup)
-  (declare (ignorable n-fdefns))
-  ;; N-FDEFNS is important for PPC64, slightly important for X86-64, not important for
-  ;; any others, and doesn't even have a place to store it if lispwords are 32 bits.
-  ;; The :DEDUPLICATED-FDEFNS test in compiler-2.pure asserts that the value is valid
   (let ((body
          ;; The following operations need the code pinned:
          ;; 1. copying into code-instructions (a SAP)
@@ -1096,10 +1113,9 @@
          ;; of the store to the final word of unboxed data. Even if BYTE-BLT were
          ;; interrupted in between the store of any individual byte, this code
          ;; is GC-safe because we no longer need to know where simple-funs are embedded
-         ;; within the object to trace pointers. We *do* need to know where the funs
-         ;; are when transporting the object, but it's pinned within the body forms.
+         ;; within the object to trace pointers.
          `(,copy
-           (sb-c::code-header/trailer-adjust ,code-var ,total-nwords ,n-fdefns)
+           (sb-c::code-header/trailer-adjust ,code-var ,total-nwords)
            ;; Check that the code trailer matches our expectation on number of embedded simple-funs
            (aver (= (code-n-entries ,code-var) ,n-funs))
            ;; Until debug-info is assigned, it is illegal to create a simple-fun pointer
@@ -1175,16 +1191,10 @@
   ;; ... | constant0 constant1 ... constantN | DEBUG-INFO | FIXUPS-ITEMS ....   ||
   ;;     | <--------- n-constants ---------> |            | <-- n-fixup-elts -> ||
   (let* ((n-simple-funs (read-unsigned-byte-32-arg (fasl-input-stream)))
-         (n-fdefns (read-unsigned-byte-32-arg (fasl-input-stream)))
          (n-boxed-words (ash header -1))
          (n-constants (- n-boxed-words sb-vm:code-constants-offset))
          (stack-elts-consumed (+ n-constants 1 n-fixup-elts)))
     (with-fop-stack ((stack (operand-stack)) ptr stack-elts-consumed)
-      ;; We've already ensured that all FDEFNs the code uses exist.
-      ;; This happened by virtue of calling fop-fdefn for each.
-      (loop for stack-index from (+ ptr (* n-simple-funs sb-vm:code-slots-per-simple-fun))
-            repeat n-fdefns
-            do (aver (typep (svref stack stack-index) 'fdefn)))
       (binding* (((code total-nwords)
                   (sb-c:allocate-code-object
                    (if (oddp header) :immobile :dynamic)
@@ -1193,20 +1203,12 @@
                  (real-code code)
                  (debug-info (svref stack (+ ptr n-constants))))
         (with-writable-code-instructions
-            (code total-nwords debug-info n-fdefns n-simple-funs)
+            (code total-nwords debug-info n-simple-funs)
           :copy (read-n-bytes (fasl-input-stream) (code-instructions code) 0 n-code-bytes)
           :fixup (sb-c::apply-fasl-fixups code stack (+ ptr (1+ n-constants)) n-fixup-elts real-code))
         ;; Don't need the code pinned from here on
         (setf (sb-c::debug-info-source (%code-debug-info code))
               (%fasl-input-partial-source-info (fasl-input)))
-        (let ((stack-index (+ ptr (* n-simple-funs sb-vm:code-slots-per-simple-fun))))
-          ;; This is the moral equivalent of a warning from /usr/bin/ld
-          ;; that "gets() is dangerous." You're informed by both the compiler and linker.
-          (dotimes (i n-fdefns)
-            (let ((name (fdefn-name (svref stack (+ stack-index i)))))
-              (when (deprecated-thing-p 'function name)
-                (format *error-output* "~&; While loading ~S:" (sb-c::debug-info-name debug-info))
-                (check-deprecated-thing 'function name)))))
         ;; Boxed constants can be assigned only after figuring out where the range
         ;; of implicitly tagged words is, which requires knowing how many functions
         ;; are in the code component, which requires reading the code trailer.
@@ -1215,22 +1217,29 @@
         (let* ((header-index sb-vm:code-constants-offset)
                (stack-index ptr))
             (declare (type index header-index stack-index))
-            (dotimes (n (* n-simple-funs sb-vm:code-slots-per-simple-fun))
-              (setf (code-header-ref code header-index) (svref stack stack-index))
-              (incf header-index)
-              (incf stack-index))
-            (dotimes (i n-fdefns)
-              (sb-c::set-code-fdefn code header-index (svref stack stack-index))
-              (incf header-index)
-              (incf stack-index))
             (do () ((>= header-index n-boxed-words))
               (setf (code-header-ref code header-index) (svref stack stack-index))
               (incf header-index)
               (incf stack-index)))
+        (flet ((check-one-name (name)
+                 ;; This is the moral equivalent of a warning from /usr/bin/ld
+                 ;; that "gets() is dangerous." You're informed by both the compiler and linker.
+                 (when (deprecated-thing-p 'function name)
+                   (format *error-output* "~&; While loading ~S:"
+                           (sb-c::debug-info-name debug-info))
+                   (check-deprecated-thing 'function name))))
+          #+linkage-space ; Scan packed linkage index list for deprecated names
+          (dolist (index (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups code)))
+            (check-one-name (sb-vm::linkage-addr->name index :index)))
+          #-linkage-space
+          (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+                do (let ((thing (code-header-ref code i)))
+                     (when (fdefn-p thing)
+                       (check-one-name (fdefn-name thing))))))
         (when (typep (code-header-ref code (1- n-boxed-words))
                      '(cons (eql sb-c::coverage-map)))
           ;; Record this in the global list of coverage-instrumented code.
-          (atomic-push (make-weak-pointer code) (cdr sb-c:*code-coverage-info*)))
+          (atomic-push (make-weak-pointer code) (cdr *code-coverage-info*)))
         (possibly-log-new-code code "load")))))
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
@@ -1240,10 +1249,6 @@
 
 (define-fop 19 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
-
-#+arm64
-(define-fop 23 :not-host (fop-tls-index (name))
-  (ash (ensure-symbol-tls-index name) (- sb-vm:n-fixnum-tag-bits)))
 
 ;;; This FOP is only encountered in cross-compiled FASLs for cold load,
 ;;; and is a no-op except in cold load. A developer may want to load a
@@ -1259,11 +1264,8 @@
 
 ;;; Modify a slot of the code boxed constants.
 (define-fop 20 (fop-alter-code ((:operands index) code value) nil)
-  (flet (#+sb-xc-host
-         ((setf code-header-ref) (value code index)
-            (write-wordindexed code index value)))
-    (setf (code-header-ref code index) value)
-    (values)))
+  (setf (code-header-ref code index) value)
+  (values))
 
 ;;; Set the named constant value in the boxed constants, setting up
 ;;; backpatching information if the symbol is not yet bound. Forward
@@ -1310,8 +1312,11 @@
 
 ;;;; fops for code coverage
 
-(define-fop 120 :not-host (fop-record-code-coverage (namestring cc) nil)
-  (setf (gethash namestring (car sb-c:*code-coverage-info*)) cc)
+(define-fop 120 :not-host (fop-record-code-coverage (paths) nil)
+  (setf (gethash (sb-c::debug-source-namestring
+                  (%fasl-input-partial-source-info (fasl-input)))
+                 (car *code-coverage-info*))
+        (mapcar #'list paths))
   (values))
 
 ;;; Primordial layouts.

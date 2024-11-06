@@ -176,7 +176,7 @@ lose:
     lose("This runtime was not built with zstd-compressed core support... aborting")
 #else
 static void inflate_core_bytes(int fd, os_vm_offset_t offset,
-                               os_vm_address_t addr, int len)
+                               os_vm_address_t addr, uword_t len)
 {
 # ifdef LISP_FEATURE_WIN32
     /* Ensure the memory is committed so zstd doesn't segfault trying
@@ -248,7 +248,8 @@ static inline sword_t calc_adjustment(struct heap_adjust* adj, lispobj x)
 
 // Given a post-relocation object 'x', compute the address at which
 // it was originally expected to have been placed as per the core file.
-static inline lispobj inverse_adjust(struct heap_adjust* adj, lispobj x)
+__attribute__((unused)) static inline lispobj
+inverse_adjust(struct heap_adjust* adj, lispobj x)
 {
     int j;
     for (j = adj->n_ranges - 1 ; j >= 0 ; --j)
@@ -334,8 +335,7 @@ static void adjust_pointers(lispobj *where, sword_t n_words, struct heap_adjust*
 #include "align.h"
 static void
 adjust_code_refs(struct heap_adjust __attribute__((unused)) *adj,
-                 struct code __attribute__((unused)) *code,
-                 lispobj __attribute__((unused)) original_vaddr)
+                 struct code __attribute__((unused)) *code)
 {
 #if defined LISP_FEATURE_PERMGEN || defined LISP_FEATURE_IMMOBILE_SPACE
     // Dynamic space always gets relocated before immobile space does,
@@ -346,6 +346,7 @@ adjust_code_refs(struct heap_adjust __attribute__((unused)) *adj,
     struct varint_unpacker unpacker;
 
     varint_unpacker_init(&unpacker, code->fixups);
+    skip_data_stream(&unpacker); // first data stream comprises the linkage indices
     int prev_loc = 0, loc;
     while (varint_unpack(&unpacker, &loc) && loc != 0) {
         // For extra compactness, each loc is relative to the prior,
@@ -359,22 +360,6 @@ adjust_code_refs(struct heap_adjust __attribute__((unused)) *adj,
             lose("Absolute fixup @ %p exceeds 32 bits", fixup_where);
         if (adjusted != ptr)
             FIXUP32(UNALIGNED_STORE32(fixup_where, adjusted), fixup_where);
-    }
-    sword_t displacement = (lispobj)code - original_vaddr;
-    prev_loc = 0;
-    while (varint_unpack(&unpacker, &loc) && loc != 0) {
-        loc += prev_loc;
-        prev_loc = loc;
-        void* fixup_where = instructions + loc;
-        int32_t rel32operand = UNALIGNED_LOAD32(fixup_where);
-        int32_t abs_operand = (sword_t)fixup_where + 4 + rel32operand - displacement;
-        int32_t new_abs_operand = abs_operand + calc_adjustment(adj, abs_operand);
-        sword_t new_rel32operand = new_abs_operand - ((sword_t)fixup_where + 4);
-        // check for overflow before checking whether to write the new value
-        if (!(new_rel32operand >= INT32_MIN && new_rel32operand <= INT32_MAX))
-            lose("Relative fixup @ %p exceeds 32 bits", fixup_where);
-        if (new_rel32operand != rel32operand)
-            FIXUP_rel(UNALIGNED_STORE32(fixup_where, new_rel32operand), fixup_where);
     }
 #endif
 }
@@ -429,39 +414,38 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
                 if (bitmap_logbitp(i, bitmap)) adjust_pointers(slots+i, 1, adj);
             }
             continue;
-        case SYMBOL_WIDETAG:
-            { // Modeled on scav_symbol() in gc-common
+        case SYMBOL_WIDETAG: {
+            // Modeled on scav_symbol() in gc-common
             struct symbol* s = (void*)where;
 #ifdef LISP_FEATURE_64_BIT
-            adjust_pointers(where + 1, 4, adj);
             lispobj name = decode_symbol_name(s->name);
             lispobj adjusted_name = adjust_word(adj, name);
             // writeback the name if it changed
             if (adjusted_name != name) FIXUP(set_symbol_name(s, adjusted_name), &s->name);
+            adjust_pointers(&s->value, 1, adj);
+            adjust_pointers(&s->info, 1, adj);
+            adjust_pointers(&s->fdefn, 1, adj);
 #else
             adjust_pointers(&s->fdefn, 4, adj); // fdefn, value, info, name
 #endif
-            }
             continue;
-        case FDEFN_WIDETAG:
-            adjust_pointers(where+1, 2, adj);
+        }
+        case FDEFN_WIDETAG: {
+            struct fdefn* f = (void*)where;
+            adjust_pointers(&f->name, 1, adj);
+            adjust_pointers(&f->fun, 1, adj);
+#ifndef LISP_FEATURE_LINKAGE_SPACE
             // For most architectures, 'raw_addr' doesn't satisfy is_lisp_pointer()
             // so adjust_pointers() would ignore it. Therefore we need to
             // forcibly adjust it. This is correct whether or not there are tag bits.
-            adjust_word_at(where+3, adj);
+            adjust_word_at((lispobj*)&f->raw_addr, adj);
+#endif
             continue;
+        }
         case CODE_HEADER_WIDETAG:
             // Fixup the constant pool. The word at where+1 is a fixnum.
             code = (struct code*)where;
             adjust_pointers(where+2, code_header_words(code)-2, adj);
-#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
-            // Process each untagged fdefn pointer.
-            lispobj* fdefns_start = code->constants + code_n_funs(code)
-              * CODE_SLOTS_PER_SIMPLE_FUN;
-            int i;
-            for (i=code_n_named_calls(code)-1; i>=0; --i)
-                adjust_word_at(fdefns_start+i, adj);
-#endif
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64 || \
     defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64
             // Fixup absolute jump table
@@ -479,15 +463,11 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
                 adjust_pointers(&f->self, 1, adj);
 #endif
             });
-            {
-              // Now that the packed integer comprising the list of fixup locations
-              // has been fixed-up (if necessary), apply them to the code.
-              lispobj original_vaddr = inverse_adjust(adj, (lispobj)code);
-              // code->fixups, if a bignum pointer, was fixed up as part of
-              // the constant pool.
-              gencgc_apply_code_fixups((struct code*)original_vaddr, code);
-              adjust_code_refs(adj, code, original_vaddr);
-            }
+            // Now that the packed integer comprising the list of fixup locations
+            // has been fixed-up (if necessary), apply them to the code.
+            gencgc_apply_code_fixups((struct code*)inverse_adjust(adj, (lispobj)code),
+                                     code);
+            adjust_code_refs(adj, code);
             continue;
         case CLOSURE_WIDETAG:
             fix_fun_header_layout(where, adj);
@@ -570,8 +550,26 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
 #endif
 }
 
+uword_t* elf_linkage_space;
+int elf_linkage_table_count;
 static void relocate_heap(struct heap_adjust* adj)
 {
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    {
+    // Linkage space possibly needs altering even if all spaces were placed as requested
+    int i, n = linkage_table_count;
+    if (lisp_code_in_elf()) gc_assert(elf_linkage_space);
+    for (i=1; i<n; ++i) {
+        lispobj word = linkage_space[i];
+        // low bit on means it references code-in-ELF, otherwise dynamic space
+        if (word & 1) linkage_space[i] = word - 1 + TEXT_SPACE_START;
+        adjust_word_at(linkage_space+i, adj); // this is for ordinary space-relocation if needed
+        // And finally, if there is code-in-ELF, copy the entry
+        if (elf_linkage_space) elf_linkage_space[i] = linkage_space[i];
+    }
+    }
+#endif
+    if (!adj->n_ranges) return;
     if (!lisp_startup_options.noinform && SHOW_SPACE_RELOCATION) {
         int i;
         for (i = 0; i < adj->n_ranges; ++i)
@@ -596,10 +594,7 @@ static void relocate_heap(struct heap_adjust* adj)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     fix_space(FIXEDOBJ_SPACE_START, fixedobj_free_pointer, adj);
 #endif
-    fix_space(DYNAMIC_SPACE_START, (lispobj*)dynamic_space_highwatermark(),
-                   adj);
-    // FIXME: This fixes pointers in the space but I think it won't work
-    // if the space itself fails to map where requested.
+    fix_space(DYNAMIC_SPACE_START, (lispobj*)dynamic_space_highwatermark(), adj);
     fix_space(TEXT_SPACE_START, text_space_highwatermark, adj);
 }
 
@@ -685,15 +680,22 @@ __attribute__((unused)) static void check_dynamic_space_addr_ok(uword_t start, u
 #endif
 }
 
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+#define LISP_LINKAGE_SPACE_SIZE (1<<(N_LINKAGE_INDEX_BITS+WORD_SHIFT))
+#endif
+
+#if defined LISP_FEATURE_IMMOBILE_SPACE && defined LISP_FEATURE_ARM64
+#define LISP_LINKAGE_SPACE_SIZE 0
+#endif
 static os_vm_address_t reserve_space(int space_id, int attr,
                                      os_vm_address_t addr, os_vm_size_t size)
 {
+    __attribute__((unused)) int extra_request = 0;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID) {
-        // Carve out the text space from the earlier request that was made
-        // for the fixedobj space.
-        ALIEN_LINKAGE_TABLE_SPACE_START = FIXEDOBJ_SPACE_START + FIXEDOBJ_SPACE_SIZE;
-        return (os_vm_address_t)(ALIEN_LINKAGE_TABLE_SPACE_START + ALIEN_LINKAGE_TABLE_SPACE_SIZE);
+        extra_request = ALIEN_LINKAGE_SPACE_SIZE + LISP_LINKAGE_SPACE_SIZE;
+        size += extra_request;
+        addr -= extra_request; // compensate to try to put text space start where expected
     }
 #endif
     if (size == 0) return addr;
@@ -707,6 +709,13 @@ static os_vm_address_t reserve_space(int space_id, int attr,
 #endif
         addr = os_alloc_gc_space(space_id, attr, addr, size);
     if (!addr) lose("Can't allocate %#"OBJ_FMTX" bytes for space %d", size, space_id);
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID) {
+      ALIEN_LINKAGE_SPACE_START = (uword_t)addr;
+      linkage_space = (void*)((char*)addr + ALIEN_LINKAGE_SPACE_SIZE);
+      addr += extra_request;
+    }
+#endif
     return addr;
 }
 
@@ -726,8 +735,12 @@ static __attribute__((unused)) uword_t corespace_checksum(uword_t* base, int nwo
  * startup to avoid wasting time on all actions performed prior to re-exec.
  */
 
+lispobj* linkage_space;
+int linkage_table_count;
+
 static void
 process_directory(int count, struct ndir_entry *entry,
+                  __attribute__((unused)) sword_t linkage_table_data_page,
                   int fd, os_vm_offset_t file_offset,
                   int __attribute__((unused)) merge_core_pages,
                   struct coreparse_space *spaces,
@@ -755,9 +768,9 @@ process_directory(int count, struct ndir_entry *entry,
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         // ELF core without immobile space has alien linkage space below static space.
-        ALIEN_LINKAGE_TABLE_SPACE_START =
+        ALIEN_LINKAGE_SPACE_START =
             (uword_t)os_alloc_gc_space(ALIEN_LINKAGE_TABLE_CORE_SPACE_ID, 0, 0,
-                                       ALIEN_LINKAGE_TABLE_SPACE_SIZE);
+                                       ALIEN_LINKAGE_SPACE_SIZE);
 #endif
     } else
 #endif
@@ -766,7 +779,7 @@ process_directory(int count, struct ndir_entry *entry,
     {
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].desired_size +=
-            text_space_size + ALIEN_LINKAGE_TABLE_SPACE_SIZE;
+            text_space_size + ALIEN_LINKAGE_SPACE_SIZE;
 #endif
     }
 
@@ -839,22 +852,16 @@ process_directory(int count, struct ndir_entry *entry,
                 break;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
             case IMMOBILE_FIXEDOBJ_CORE_SPACE_ID:
-            case IMMOBILE_TEXT_CORE_SPACE_ID:
+                // arm64 does not care where this space is placed - it's not used
 #ifdef LISP_FEATURE_X86_64
-                if (addr + request > 0x80000000)
-                    lose("Won't map immobile space above 2GB");
+                if (addr + request > 0x80000000) lose("Won't map immobile space above 2GB");
 #endif
-                if (id == IMMOBILE_FIXEDOBJ_CORE_SPACE_ID)
-                    FIXEDOBJ_SPACE_START = addr;
-                else
-                    TEXT_SPACE_START = addr;
+                FIXEDOBJ_SPACE_START = addr;
                 break;
-#else
+#endif
             case IMMOBILE_TEXT_CORE_SPACE_ID:
                 TEXT_SPACE_START = addr;
                 break;
-#endif
-
             case DYNAMIC_CORE_SPACE_ID:
                 {
                 uword_t aligned_start = ALIGN_UP(addr, GENCGC_PAGE_BYTES);
@@ -915,6 +922,18 @@ process_directory(int count, struct ndir_entry *entry,
                entry->nwords, corespace_checksum((void*)addr, entry->nwords));
 #endif
     }
+
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    if (linkage_table_count) {
+        if (linkage_space == 0)
+            linkage_space = (void*)os_allocate(LISP_LINKAGE_SPACE_SIZE);
+        load_core_bytes(fd, file_offset+
+                        (1 + linkage_table_data_page) * os_vm_page_size,
+                        (char*)linkage_space,
+                        ALIGN_UP(linkage_table_count*N_WORD_BYTES, os_vm_page_size),
+                        0);
+    }
+#endif
 
     calc_asm_routine_bounds();
     struct cons spaceadj = {(lispobj)spaces, (lispobj)adj};
@@ -1027,6 +1046,14 @@ bool gc_allocate_ptes()
     void* result = os_alloc_gc_space(0, MOVABLE, 0,
                                      ALIGN_UP(num_gc_cards, BACKEND_PAGE_BYTES) + BACKEND_PAGE_BYTES);
     gc_card_mark = (unsigned char*)result + BACKEND_PAGE_BYTES;
+#elif defined LISP_FEATURE_PPC64
+    unsigned char* mem = successful_malloc(num_gc_cards + LISP_LINKAGE_SPACE_SIZE);
+    gc_card_mark = mem + LISP_LINKAGE_SPACE_SIZE;
+    /* Copy linkage entries from where they were allocated to where they're accessible
+     * off the GC card table register using negative indices. */
+    memcpy(mem, linkage_space, LISP_LINKAGE_SPACE_SIZE);
+    os_deallocate((void*)linkage_space, LISP_LINKAGE_SPACE_SIZE);
+    linkage_space = (lispobj*)mem;
 #else
     gc_card_mark = successful_malloc(num_gc_cards);
 #endif
@@ -1081,9 +1108,11 @@ static void gengcbarrier_patch_code_range(uword_t start, lispobj* limit)
         struct code* code = (void*)where;
         if (widetag_of(where) != CODE_HEADER_WIDETAG || !code->fixups) continue;
         varint_unpacker_init(&unpacker, code->fixups);
+#if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
         // There are two other data streams preceding the one we want
         skip_data_stream(&unpacker);
         skip_data_stream(&unpacker);
+#endif
         char* instructions = code_text_start(code);
         int prev_loc = 0, loc;
         while (varint_unpack(&unpacker, &loc) && loc != 0) {
@@ -1125,7 +1154,7 @@ void gc_load_corefile_ptes(int card_table_nbits,
 {
     if (next_free_page != n_ptes)
         lose("n_PTEs=%"PAGE_INDEX_FMT" but expected %"PAGE_INDEX_FMT,
-             n_ptes, next_free_page);
+             (int)n_ptes, next_free_page);
 
     gc_card_table_nbits = card_table_nbits;
     bool patchp = gc_allocate_ptes();
@@ -1182,9 +1211,14 @@ void gc_load_corefile_ptes(int card_table_nbits,
     generations[gen].bytes_allocated = bytes_allocated;
     gc_assert((ssize_t)bytes_allocated <= (ssize_t)(n_ptes * GENCGC_PAGE_BYTES));
 
+    /* Record the demarcation point in permgen space between objects mapped from core
+     * and new objects so that GC can potentially treat them differently.
+     * (below it: visit only if touched, above it: always visit) */
+    permgen_bounds[1] = (uword_t)permgen_space_free_pointer;
+
     // Adjust for discrepancies between actually-allocated space addresses
     // and desired addresses.
-    if (adj->n_ranges) relocate_heap(adj);
+    relocate_heap(adj);
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     /* Now determine page characteristics such as object spacing
@@ -1313,6 +1347,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
     lispobj initial_function = NIL;
     struct heap_adjust adj;
     memset(&adj, 0, sizeof adj);
+    sword_t linkage_table_data_page = -1;
 
     if (fd < 0) {
         fprintf(stderr, "could not open file \"%s\"\n", file);
@@ -1348,7 +1383,8 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         {IMMOBILE_FIXEDOBJ_CORE_SPACE_ID, FIXEDOBJ_SPACE_SIZE | 1, 0,
             0, &fixedobj_free_pointer},
-        {IMMOBILE_TEXT_CORE_SPACE_ID, 1, 0, 0, &text_space_highwatermark},
+        {IMMOBILE_TEXT_CORE_SPACE_ID, TEXT_SPACE_SIZE, 0, TEXT_SPACE_START,
+         &text_space_highwatermark},
 #else
         // Without the immobile-space feature, immobile-text-space is nonetheless valid.
         // editcore can put all code there, and then convert the space to an ELF section.
@@ -1369,17 +1405,27 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
         remaining_len = len - 2; /* (-2 to cancel the two ++ operations) */
         switch (val) {
         case BUILD_ID_CORE_ENTRY_TYPE_CODE:
-            stringlen = *ptr++;
-            --remaining_len;
+            // The first 2 data words are the GC selection and address of NIL,
+            // which are mainly of interest to 'editcore'. Here they are ignored.
+            stringlen = ptr[2];
+            ptr += 3; remaining_len -= 3;
             gc_assert(remaining_len * sizeof (core_entry_elt_t) >= stringlen);
-            if (stringlen+1 != sizeof build_id || memcmp(ptr, build_id, stringlen))
+            if (stringlen != (sizeof build_id-1) || memcmp(ptr, build_id, stringlen))
                 lose("core was built for runtime \"%.*s\" but this is \"%s\"",
                      (int)stringlen, (char*)ptr, build_id);
             break;
         case DIRECTORY_CORE_ENTRY_TYPE_CODE:
             process_directory(remaining_len / NDIR_ENTRY_LENGTH,
-                              (struct ndir_entry*)ptr, fd, file_offset,
+                              (struct ndir_entry*)ptr,
+                              linkage_table_data_page,
+                              fd, file_offset,
                               merge_core_pages, spaces, &adj);
+            break;
+        case LISP_LINKAGE_SPACE_CORE_ENTRY_TYPE_CODE:
+            linkage_table_count = ptr[0];
+            linkage_table_data_page = ptr[1];
+            if ((elf_linkage_space = (uword_t*)ptr[2]) != 0)
+                elf_linkage_table_count = linkage_table_count;
             break;
         case PAGE_TABLE_CORE_ENTRY_TYPE_CODE:
             // elements = gencgc-card-table-index-nbits, n-ptes, nbytes, data-page
@@ -1532,8 +1578,8 @@ static void graph_visit(lispobj referer, lispobj ptr, struct grvisit_context* co
             trace_sym(ptr, SYMBOL(ptr), context);
             break;
         case FDEFN_WIDETAG:
-            RECURSE(obj[1]);
-            RECURSE(obj[2]);
+            RECURSE(((struct fdefn*)obj)->name);
+            RECURSE(((struct fdefn*)obj)->fun);
             RECURSE(decode_fdefn_rawfun((struct fdefn*)obj));
             break;
         default:

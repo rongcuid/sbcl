@@ -17,6 +17,24 @@
                4
                (dstate-byte-order dstate)))
 
+#+ppc64
+(defun ds-annotate (value stream dstate)
+  ;; If the preceding instruction is ADDIS $LIP,$GC-CARD-TABLE,imm
+  ;; and this is LD $LIP,$LIP,imm then it's a linkage table ref.
+  (princ value stream)
+  (let* ((sap (dstate-segment-sap dstate))
+         (prev-inst (sap-ref-32 sap (+ (dstate-cur-offs dstate) -4)))
+         (this-inst (sap-ref-32 sap (+ (dstate-cur-offs dstate)))))
+    (when (and (= (ash prev-inst -16) #x3FF1)
+               (= (ash this-inst -16) #xEBFF))
+      (let* ((si-hi (sign-extend (ldb (byte 16 0) prev-inst) 16))
+             (si-lo value)
+             ;; BIAS is what the arg to ADDIS would be to get index 0 into the linkage space
+             (bias (ash 1 (- (+ sb-vm:n-linkage-index-bits sb-vm:word-shift) 16)))
+             (index (+ (ash (+ si-hi bias) 16) si-lo))
+             (name (sb-vm::linkage-addr->name index :rel)))
+        (note (lambda (stream) (princ name stream)) dstate)))))
+
 (defun maybe-add-notes (regno dstate)
   (let ((inst (current-instruction dstate))
         (symbolic-inst (sb-disassem::dstate-inst dstate)))

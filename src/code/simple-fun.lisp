@@ -50,10 +50,10 @@
 
 (macrolet ((new-closure (nvalues)
              ;; argument is the number of INFO words
-             #-(or x86 x86-64 arm64)
+             #-(or arm64 ppc64 x86 x86-64)
              `(sb-c::maybe-with-system-tlab (closure)
                (sb-vm::%alloc-closure ,nvalues (%closure-fun closure)))
-             #+(or x86 x86-64 arm64)
+             #+(or arm64 ppc64 x86 x86-64)
              `(with-pinned-objects ((%closure-fun closure))
                 ;; %CLOSURE-CALLEE manifests as a fixnum which remains
                 ;; valid across GC due to %CLOSURE-FUN being pinned
@@ -248,38 +248,22 @@
      (setf (%simple-fun-arglist (%fun-fun function)) new-value)))
   new-value)
 
-(macrolet ((access-slot (index)
-             `(code-header-ref
-               (fun-code-header fun)
-               (+ (* sb-vm:code-slots-per-simple-fun (%simple-fun-index fun))
-                  sb-vm:code-constants-offset ,index)))
-           (def (accessor index)
+(macrolet ((index (slot)
+             `(+ (* sb-vm:code-slots-per-simple-fun (%simple-fun-index fun))
+                 (get-dsd-index sb-c::compiled-debug-info rest)
+                 ,slot))
+           (def (accessor slot)
              `(progn
                 (defun (setf ,accessor) (newval fun)
                   (declare (simple-fun fun))
-                  ;; Prevent wild pointers due to 'purify' moving all code to
-                  ;; readonly space. (Can't have read-only pointing to dynamic)
-                  ;; There are a number of things we could do to "fix" this, none
-                  ;; particularly interesting or meritorious imho, e.g.:
-                  ;;   - Copy the name to static space
-                  ;;   - Use an external hash-table (a la named closures),
-                  ;;   - Implement some other notion of "forwarded" names
-                  ;;   - Track which pages of read-only [sic] space have been written
-                  ;;   - Scavenge all of read-only space always
-                  ;;   - Write-protect read-only space to completely prevent this
-                  (if #+cheneygc (and (eq (heap-allocated-p fun) :read-only)
-                                      (eq (heap-allocated-p newval) :dynamic))
-                      #-cheneygc nil
-                      (progn (warn ,(format nil "Can't assign ~A of ~~A" accessor) fun)
-                             newval)
-                      (setf (access-slot ,index) newval)))
+                  (let ((di (%code-debug-info (fun-code-header fun))))
+                    (aver (sb-c::compiled-debug-info-p di))
+                    (setf (%instance-ref di (index ,slot)) newval)))
                 (defun ,accessor (fun)
-                  (access-slot ,index)))))
-  ;; possible FIXME for the backends which treat the assembly trampolines
-  ;; as tagged functions (with fun-pointer-lowtag) - we might need to ensure
-  ;; that the code object reserves space for 4 NILs just in case a simple-fun
-  ;; accessor is called on it. I'm not entirely sure whether that's necessary.
-
+                  (let ((di (%code-debug-info (fun-code-header fun))))
+                    ;; metadataless functions return NIL for all these slots
+                    (when (sb-c::compiled-debug-info-p di)
+                      (%instance-ref di (index ,slot))))))))
   (def %simple-fun-name    sb-vm:simple-fun-name-slot)
   (def %simple-fun-arglist sb-vm:simple-fun-arglist-slot)
   (def %simple-fun-source  sb-vm:simple-fun-source-slot)
@@ -420,24 +404,6 @@
   (declare (type code-component code-obj))
   (ash (code-fun-table-count code-obj) -5))
 
-;;; Start and count of fdefns used in #'F synax or normal named call
-;;; (i.e. at the head of an expression)
-(defun code-header-fdefn-range (code-obj)
-  #-64-bit ; inefficient
-  (let ((start (+ sb-vm:code-constants-offset
-                  (* (code-n-entries code-obj) sb-vm:code-slots-per-simple-fun)))
-        (count 0))
-    (do ((i start (1+ i))
-         (limit (code-header-words code-obj)))
-        ((= i limit))
-      (if (fdefn-p (code-header-ref code-obj i)) (incf count) (return)))
-    (values start count))
-  #+64-bit
-  (values (+ sb-vm:code-constants-offset
-             (* (code-n-entries code-obj) sb-vm:code-slots-per-simple-fun))
-          (ash (sb-vm::%code-boxed-size code-obj)
-               (+ -32 sb-vm:n-fixnum-tag-bits))))
-
 ;;; Return the offset in bytes from (CODE-INSTRUCTIONS CODE-OBJ)
 ;;; to its FUN-INDEXth function.
 (declaim (inline %code-fun-offset))
@@ -577,23 +543,10 @@
            ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.
            ;; SPECIAL-FORM-FUNCTION is a subtype of UNDEFINED-FUNCTION.
              (error (if (eq kind :special) 'special-form-function 'undefined-function)
-                    :name  (second fun-name))))
+                    :name (second fun-name))))
           t
-          fun-name))
-        (fdefn (find-or-create-fdefn symbol)))
-
-    ;; In most cases, install the guard closure in the usual way.
-    #-(and x86-64 immobile-code) (setf (fdefn-fun fdefn) closure)
-
-    ;; Do something slightly different for immobile code: fmakunbound, assigning
-    ;; FUN = NIL and RAW-ADDR = UNDEFINED-TRAMP; then overwrite the NIL with the
-    ;; above closure. This is better than assigning a closure, because closures
-    ;; require a new closure-calling trampoline to be consed.
-    #+(and x86-64 immobile-code)
-    (progn (fdefn-makunbound fdefn)
-           (%primitive sb-vm::set-undefined-fdefn-fun fdefn closure))
-
-    fdefn))
+          fun-name)))
+    (fset symbol closure)))
 
 ;;;; Iterating over closure values
 

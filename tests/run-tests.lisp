@@ -224,6 +224,8 @@
       sb-c::*compile-file-elapsed-time*
       sb-c::*phash-lambda-cache*
       ,(maybe "SB-IMPL" "*RUN-GC-HOOKS*")
+      ,(maybe "SB-VM" "*FNAME-MAP-AVAILABLE-ELTS*")
+      ,(maybe "SB-VM" "*FNAME-MAP-OBSERVED-GC-EPOCH*")
       sb-impl::**finalizer-store**
       sb-impl::*finalizer-rehashlist*
       sb-impl::*finalizers-triggered*
@@ -234,6 +236,7 @@
       sb-impl::*user-hash-table-tests*
       sb-impl::*pn-dir-table*
       sb-impl::*pn-table*
+      sb-impl::*clear-resized-symbol-tables*
       sb-vm::*immobile-codeblob-tree*
       sb-vm::*dynspace-codeblob-tree*
       ,(maybe "SB-KERNEL" "*EVAL-CALLS*")

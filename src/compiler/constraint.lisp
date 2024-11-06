@@ -53,6 +53,8 @@
 (declaim (type (and (vector t) (not simple-array)) *constraint-universe*))
 (defvar *constraint-universe*)
 (defvar *blocks-to-terminate*)
+(defvar *constraint-blocks*)
+(defvar *constraint-blocks-p*)
 
 (defstruct (vector-length-constraint
             (:constructor make-vector-length-constraint (var))
@@ -667,7 +669,7 @@
 (defun add-combination-test-constraints (use constraints
                                          consequent-constraints
                                          alternative-constraints
-                                         quick-p)
+                                         quick-p &optional (nth-value 0))
   (flet ((add (fun lvar y &optional no-complement)
            (let ((x (ok-lvar-lambda-var lvar constraints)))
              (if no-complement
@@ -686,23 +688,28 @@
                                            alternative-constraints)))
          (prop (triples target)
            (map nil (lambda (constraint)
-                      (destructuring-bind (kind x y &optional not-p)
-                          constraint
-                        (when (and kind x y)
-                          (let ((x (if (lvar-p x)
-                                       (ok-lvar-lambda-var x constraints)
-                                       x)))
-                            (when x
-                              (add-test-constraint quick-p
-                                                   kind x y
-                                                   not-p constraints
-                                                   target))))))
+                      (cond ((not constraint))
+                            ((eq (car constraint) 'equality)
+                             (destructuring-bind (op x y) (cdr constraint)
+                               (add-equality-constraint op x y constraints target nil)))
+                            (t
+                             (destructuring-bind (kind x y &optional not-p)
+                                 constraint
+                               (when (and kind x y)
+                                 (let ((x (if (lvar-p x)
+                                              (ok-lvar-lambda-var x constraints)
+                                              x)))
+                                   (when x
+                                     (add-test-constraint quick-p
+                                                          kind x y
+                                                          not-p constraints
+                                                          target))))))))
                 triples)))
     (when (eq (combination-kind use) :known)
       (binding* ((info (combination-fun-info use) :exit-if-null)
                  (propagate (fun-info-constraint-propagate-if info) :exit-if-null))
         (multiple-value-bind (lvar type if else no-complement)
-            (funcall propagate use constraints)
+            (funcall propagate use constraints nth-value)
           (prop if consequent-constraints)
           (prop else alternative-constraints)
           (when (and lvar type)
@@ -741,9 +748,16 @@
                     (add 'typep (ok-lvar-lambda-var (ref-lvar node) constraints)
                          (specifier-type 'null) t)
                     (let ((use (principal-lvar-ref-use (ref-lvar use))))
-                      (when (and use
-                                 (not (ref-p use)))
-                        (process-node use))))
+                      (if use
+                          (unless (ref-p use)
+                            (process-node use))
+                          (multiple-value-bind (node nth-value) (mv-principal-lvar-ref-use (ref-lvar node))
+                            (when (combination-p node)
+                              (add-combination-test-constraints node constraints
+                                                                consequent-constraints
+                                                                alternative-constraints
+                                                                quick-p
+                                                                nth-value))))))
                    (combination
                     (unless (eq (combination-kind node) :error)
                       (let ((name (uncross
@@ -1096,24 +1110,38 @@
 (defun type-after-comparison (operator not-p current-type type)
   (case operator
     ((= eq)
-     (unless not-p
-       (multiple-value-bind (lo hi)
-           (if (numeric-type-p type)
-               (values (numeric-type-low type)
-                       (numeric-type-high type))
-               ;; Doesn't handle infinities
-               (let ((int (type-approximate-interval type)))
-                 (and int
-                      (values
-                       (interval-low int)
-                       (interval-high int)))))
-         (when (or lo hi)
-           (type-intersection current-type
-                              (type-union (make-numeric-type :low lo
-                                                             :high hi)
-                                          (make-numeric-type :complexp :complex
-                                                             :low lo
-                                                             :high hi)))))))
+     (multiple-value-bind (lo hi)
+         (if (numeric-type-p type)
+             (values (numeric-type-low type)
+                     (numeric-type-high type))
+             ;; Doesn't handle infinities
+             (let ((int (type-approximate-interval type)))
+               (and int
+                    (values
+                     (interval-low int)
+                     (interval-high int)))))
+       (if not-p
+           (when (and (csubtypep current-type (specifier-type 'integer))
+                      (integerp hi)
+                      (eql lo hi))
+             ;; Cut off an adjacent bound if it's not EQ
+             (multiple-value-bind (c-lo)
+                 (let ((int (type-approximate-interval current-type)))
+                   (and int
+                        (values
+                         (interval-low int)
+                         (interval-high int))))
+               (when (and c-lo
+                          (= hi c-lo))
+                 (type-intersection current-type
+                                    (make-numeric-type :low (1+ lo))))))
+           (when (or lo hi)
+             (type-intersection current-type
+                                (type-union (make-numeric-type :low lo
+                                                               :high hi)
+                                            (make-numeric-type :complexp :complex
+                                                               :low lo
+                                                               :high hi)))))))
     (t
      (multiple-value-bind (greater equal)
          (if not-p
@@ -1241,6 +1269,7 @@
          (maybe-add-eql-var-lvar-constraint node gen)
          (when preprocess-refs-p
            (constrain-ref-type node gen))))
+      (delay)
       (cast
        (let* ((lvar (cast-value node))
               (var (ok-lvar-lambda-var lvar gen))
@@ -1307,7 +1336,7 @@
                                  (conset= call-in gen))))
               (setf (combination-constraints-in node)
                     (copy-conset gen))
-              (when (boundp '*constraint-blocks*)
+              (when *constraint-blocks-p*
                 (enqueue-block-for-constraints (lambda-block fun))))))))))
   gen)
 
@@ -1561,8 +1590,6 @@
     (when (eql (car x) obj)
       (return-from nconc-new list))))
 
-(defvar *constraint-blocks*)
-
 (defun enqueue-block-for-constraints (block)
   (when (block-type-check block)
     (setq *constraint-blocks* (nconc-new block *constraint-blocks*))))
@@ -1587,7 +1614,8 @@
     ;; done, hence any inherited type constraints from such
     ;; constraints will be wrong as well.
     (dolist (join-types-p '(nil t))
-      (let ((*constraint-blocks* (copy-list rest-of-blocks)))
+      (let ((*constraint-blocks-p* t)
+            (*constraint-blocks* (copy-list rest-of-blocks)))
         ;; The rest of the blocks.
         (dolist (block rest-of-blocks)
           (aver (eq block (pop *constraint-blocks*)))
@@ -1618,10 +1646,15 @@
         (setf (if-alternative-constraints last) nil)
         (setf (if-consequent-constraints last) nil))))
 
-  (let (*blocks-to-terminate*)
+  (let (*blocks-to-terminate*
+        *constraint-blocks-p*)
     (dolist (block (find-and-propagate-constraints component))
       (unless (block-delete-p block)
         (use-result-constraints block)))
+    #+sb-devel
+    (when (and *compiler-trace-output*
+               (memq :constraints *compile-trace-targets*))
+      (print-constraints component))
     (loop for node in *blocks-to-terminate*
           do (maybe-terminate-block node nil)))
   (values))

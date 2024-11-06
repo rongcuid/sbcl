@@ -187,6 +187,22 @@
   (assert (typep array '(simple-array * (*))))
   (values array start end 0))
 
+;; We could probably just implement this by creating a displaced array
+;; if need be.
+(defmacro with-array-data (((data-var array &key offset-var)
+                            (start-var &optional (svalue 0))
+                            (end-var &optional (evalue nil))
+                            &key force-inline check-fill-pointer
+                                 array-header-p)
+                           &body forms
+                           &environment env)
+  (declare (ignore data-var array offset-var)
+           (ignore start-var svalue)
+           (ignore end-var evalue)
+           (ignore force-inline check-fill-pointer array-header-p)
+           (ignore forms env))
+  `(error "WITH-ARRAY-DATA not implemented on the host."))
+
 (defun %with-array-data/fp (array start end)
   (assert (typep array '(simple-array * (*))))
   (values array start end 0))
@@ -286,11 +302,6 @@
 (defun %instance-layout (instance)
   (declare (notinline classoid-layout))
   (classoid-layout (find-classoid (type-of instance))))
-(defun %instance-length (instance)
-  (declare (notinline layout-length))
-  ;; In the target, it is theoretically possible to have %INSTANCE-LENGTH
-  ;; exceeed layout length, but in the cross-compiler they're the same.
-  (layout-length (%instance-layout instance)))
 
 (defun %find-position (item seq from-end start end key test)
   (let ((position (position item seq :from-end from-end

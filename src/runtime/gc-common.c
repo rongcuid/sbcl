@@ -42,10 +42,10 @@
 #include "code.h"
 #include "align.h"
 #include "genesis/primitive-objects.h"
-#include "genesis/binding.h"
 #include "genesis/hash-table.h"
 #include "genesis/split-ordered-list.h"
 #include "genesis/static-symbols.h"
+#include "genesis/compiled-debug-info.h"
 #include "var-io.h"
 #include "search.h"
 #include "murmur_hash.h"
@@ -219,7 +219,9 @@ void heap_scavenge(lispobj *start, lispobj *end)
 // that must not contain any object headers.
 sword_t scavenge(lispobj *start, sword_t n_words)
 {
+#ifdef LISP_FEATURE_GENCGC
     gc_dcheck(compacting_p());
+#endif
     lispobj *end = start + n_words;
     lispobj *object_ptr;
     for (object_ptr = start; object_ptr < end; object_ptr++) {
@@ -505,9 +507,9 @@ trans_return_pc_header(lispobj object)
 }
 #endif /* RETURN_PC_WIDETAG */
 
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
+#if FUN_SELF_FIXNUM_TAGGED
 /* Closures hold a pointer to the raw simple-fun entry address instead of the
- * tagged object so that CALL [RAX+const] can be used to invoke it. */
+ * tagged object so that a native call instruction can be used more easily */
 static sword_t
 scav_closure(lispobj *where, lispobj header)
 {
@@ -809,10 +811,55 @@ static lispobj trans_boxed(lispobj object) {
 }
 
 /* Symbol */
+
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+static void scav_linkage_cell(int linkage_index)
+{
+    if (!linkage_index) return;
+    lispobj entrypoint = linkage_space[linkage_index];
+    if (!entrypoint) return;
+    lispobj taggedptr = linkage_val_to_fun_ptr(entrypoint);
+    lispobj new = taggedptr;
+    scav1(&new, new);
+    if (new != taggedptr) linkage_space[linkage_index] = new + (entrypoint - taggedptr);
+}
+#endif
+void scav_code_linkage_cells(__attribute__((unused)) struct code* c)
+{
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    const unsigned int smallvec_elts =
+        (GENCGC_PAGE_BYTES - offsetof(struct vector,data)) / N_WORD_BYTES;
+    lispobj integer = barrier_load(&c->fixups);
+    if (!integer) return; // do no work for leaf codeblobs
+    lispobj name_map = barrier_load(&SYMBOL(LINKAGE_NAME_MAP)->value);
+    gc_assert(simple_vector_p(name_map));
+    struct vector* outer_vector = VECTOR(name_map);
+    struct varint_unpacker unpacker;
+    varint_unpacker_init(&unpacker, integer);
+    int prev_index = 0, index;
+    while (varint_unpack(&unpacker, &index) && index != 0) {
+        index += prev_index;
+        prev_index = index;
+        int index_high = (unsigned int)index / smallvec_elts;
+        int index_low = (unsigned int)index % smallvec_elts;
+        lispobj smallvec = barrier_load(&outer_vector->data[index_high]);
+        gc_assert(other_pointer_p(smallvec));
+        struct vector* inner_vector = VECTOR(smallvec);
+        // Ensure liveness of function name
+        scavenge(&inner_vector->data[index_low], 1);
+    }
+#endif
+}
+
 static sword_t scav_symbol(lispobj *where,
                            __attribute__((unused)) lispobj header) {
     struct symbol* s = (void*)where;
 #ifdef LISP_FEATURE_64_BIT
+# ifdef LISP_FEATURE_LINKAGE_SPACE
+    // Skip the hash slot, it isn't a tagged descriptor
+    scavenge(&s->value, 3); // value, fdefn, info
+    scav_linkage_cell(symbol_linkage_index(s));
+# else
     /* The first 4 slots of a symbol are all boxed words, but vary in meaning
      * based on #+relocatable-static-space. Scanning the hash is harmless - though
      * unnecessary - at present, since it is of descriptor nature, be it fixnum,
@@ -820,6 +867,7 @@ static sword_t scav_symbol(lispobj *where,
      * 1 bit, we could make hash a raw slot in which case we'd have to use care
      * to avoid reading it. trace-object.inc uses three separate operations */
     scavenge(where + 1, 4);
+# endif
     lispobj name = decode_symbol_name(s->name);
     lispobj new = name;
     scavenge(&new, 1);
@@ -994,32 +1042,40 @@ static lispobj trans_bignum(lispobj object)
                                       unboxed_region, PAGE_TYPE_UNBOXED);
 }
 
-#ifndef LISP_FEATURE_X86_64
+// Return the lisp object that fdefn jumps to.
 lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    extern lispobj entrypoint_taggedptr(uword_t);
+    return entrypoint_taggedptr(linkage_space[fdefn_linkage_index(fdefn)]);
+#else
     lispobj raw_addr = (lispobj)fdefn->raw_addr;
     if (!raw_addr || points_to_asm_code_p(raw_addr))
         // technically this should return the address of the code object
         // containing asm routines, but it's fine to return 0.
         return 0;
     return raw_addr - FUN_RAW_ADDR_OFFSET;
-}
 #endif
+}
 
 static sword_t
 scav_fdefn(lispobj *where, lispobj __attribute__((unused)) object)
 {
     struct fdefn *fdefn = (struct fdefn *)where;
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    scavenge(where + 1, 3); // name, padding, function
+    scav_linkage_cell(fdefn_linkage_index(fdefn));
+#else
     scavenge(where + 1, 2); // 'name' and 'fun'
     lispobj obj = decode_fdefn_rawfun(fdefn);
     lispobj new = obj;
     scavenge(&new, 1);
     if (new != obj) fdefn->raw_addr += (sword_t)(new - obj);
+#endif
     // Payload length is not computed from the header
     return FDEFN_SIZE;
 }
 static lispobj trans_fdefn(lispobj object) {
-    return gc_copy_object(object, FDEFN_SIZE,
-                          small_mixed_region, PAGE_TYPE_SMALL_MIXED);
+    return gc_copy_object(object, FDEFN_SIZE, small_mixed_region, PAGE_TYPE_SMALL_MIXED);
 }
 static sword_t size_fdefn(lispobj __attribute__((unused)) *where) {
     return FDEFN_SIZE;
@@ -1264,16 +1320,6 @@ void smash_weak_pointers(void)
 
 
 /* Hash tables */
-
-#if N_WORD_BITS == 32
-#define EQ_HASH_MASK 0x1fffffff
-#elif N_WORD_BITS == 64
-#define EQ_HASH_MASK 0x1fffffffffffffff
-#endif
-
-/* Compute the EQ-hash of KEY. This must match POINTER-HASH in
- * target-hash-table.lisp.  */
-#define EQ_HASH(key) ((key) & EQ_HASH_MASK)
 
 /* List of weak hash tables chained through their NEXT-WEAK-HASH-TABLE
  * slot. Set to NULL at the end of a collection.
@@ -1964,7 +2010,9 @@ lispobj simple_fun_name_from_pc(char *pc, lispobj** pfun)
         struct simple_fun* fun = (void*)(insts + offsets[-i]);
         if ((char*)fun < pc) {
             if (pfun) *pfun = (lispobj*)fun;
-            return code->constants[i*CODE_SLOTS_PER_SIMPLE_FUN];
+            struct compiled_debug_info* cdi = (void*)native_pointer(code->debug_info);
+            lispobj* fundata = &cdi->rest;
+            return fundata[i*CODE_SLOTS_PER_SIMPLE_FUN];
         }
     }
     return 0; // oops, how did this happen?
@@ -3354,28 +3402,6 @@ extern void check_barrier (lispobj young, lispobj old, int wp) {
 }
 #endif
 
-// Return a native representation of the perturbed h0 supplied as a fixnum.
-unsigned prefuzz_ht_hash(lispobj h0)
-{
-#ifdef LISP_FEATURE_64_BIT
-    /* Cautiously compute in the Lisp representation
-     * to ensure total consistency with the Lisp code.
-     * e.g. (SB-IMPL::EQ-HASH -1s0) => -2323857407723175924
-     * All of the shifts are to the right, so we needn't consider
-     * overflow but we do need to kill the tag bit(s).
-     * The sum can wrap, but that's OK because it gets chopped at the end */
-#define fixnum_ashr(val,count) ((val>>count)&~(uword_t)FIXNUM_TAG_MASK)
-    sword_t sum = (h0 ^ make_fixnum(0x39516A7))
-      + fixnum_ashr(h0, 3)
-      + fixnum_ashr(h0, 12)
-      + fixnum_ashr(h0, 20);
-    // the mask looks wrong for 32-bit, but I'm not trying to debug 32-bit.
-    return fixnum_value(sum & (make_fixnum((1L<<31)-1)));
-#else
-    lose("Unimplemented");
-#endif
-}
-
 #ifdef LISP_FEATURE_MARK_REGION_GC
 static void maybe_fix_hash_table(struct hash_table* ht, bool fix_bad)
 {
@@ -3439,3 +3465,88 @@ void verify_hash_tables(bool fix_bad)
     walk_generation(verify_tables_in_range, -1, fix_bad);
 }
 #endif
+
+/* This limit is adequate for testing, but a better way to handle it
+ * would be to size the remset at half the objects in core permgen.
+ * If that limit is reached, then don't remember individual objects
+ * but instead flag all of permgen as needing to be scavenged. */
+#define REMSET_GLOBAL_MAX 20000
+lispobj permgen_remset[REMSET_GLOBAL_MAX];
+int permgen_remset_count;
+
+static void remset_append1(lispobj x)
+{
+    int n = permgen_remset_count;
+    if (n == REMSET_GLOBAL_MAX) lose("global remset overflow");
+    permgen_remset[n] = x;
+    ++permgen_remset_count;
+}
+
+void remset_union(lispobj remset)
+{
+    while (remset) {
+        struct vector* v = VECTOR(remset);
+        int count = fixnum_value(v->data[0]);
+        int i;
+        for (i=0; i<count; ++i) remset_append1(v->data[i+2]);
+        remset = v->data[1];
+    }
+}
+
+void remember_all_permgen()
+{
+    permgen_bounds[1] = PERMGEN_SPACE_START;
+    memset(permgen_remset, 0, permgen_remset_count*N_WORD_BYTES);
+    permgen_remset_count = 0;
+}
+
+void illegal_linkage_space_call() {
+    lose("jumped via obsolete linkage entry");
+}
+
+void scavenge_elf_linkage_space()
+{
+    // ELF space linkage cells, if present, are roots for GC.
+    lispobj modified_vector = SYMBOL(ELF_LINKAGE_CELL_MODIFIED)->value;
+    if (modified_vector == NIL) return;
+    struct vector* v = VECTOR(modified_vector);
+    uword_t* bits = v->data;
+    unsigned int nbits = vector_len(v);
+    unsigned int nwords = (nbits + N_WORD_BITS-1)/N_WORD_BITS;
+    unsigned int wordindex;
+    int ind_major = 0, ind_minor;
+    for (wordindex = 0; wordindex < nwords; ++wordindex, ind_major += N_WORD_BITS) {
+        uword_t word = bits[wordindex];
+        for ( ind_minor = 0 ; word != 0 ; word >>= 1, ++ind_minor ) {
+            // Unmodified cells can be ignored
+            if (!(word & 1)) continue;
+            int linkage_index = ind_major + ind_minor;
+            lispobj entrypoint = elf_linkage_space[linkage_index];
+            /* Entrypoint can't become illegal_linkage_space_call because only
+             * the cells associated with the non-ELF linkage space get swept
+             * (i.e. smashed in the manner of weak objects). */
+            if (!entrypoint) continue;
+            lispobj taggedptr = fun_taggedptr_from_self(entrypoint);
+            lispobj new = taggedptr;
+            scav1(&new, new);
+            if (new != taggedptr)
+                elf_linkage_space[linkage_index] = new + (entrypoint - taggedptr);
+        }
+    }
+}
+
+void sweep_linkage_space()
+{
+    // Erase linkage cells whose name got NILed in the weak vector clearing pass
+    struct vector* outer = VECTOR(SYMBOL(LINKAGE_NAME_MAP)->value);
+    int outer_len = vector_len(outer), index1 = 0, linkage_index = 0;
+    for ( ; index1 < outer_len ; ++index1) {
+        lispobj v = outer->data[index1];
+        if (!v) break;
+        struct vector* inner = VECTOR(v);
+        int index2 = 0, limit = vector_len(inner);
+        for ( ; index2 < limit ; ++index2, ++linkage_index )
+            if (inner->data[index2] == NIL && linkage_space[linkage_index])
+                linkage_space[linkage_index] = (uword_t)illegal_linkage_space_call;
+    }
+}

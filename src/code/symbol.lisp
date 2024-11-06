@@ -100,11 +100,11 @@ distinct from the global value. Can also be SETF."
 ;;; Don't strip encapsulations.
 (declaim (inline %symbol-function))
 (defun %symbol-function (symbol)
+  #+linkage-space (%primitive sb-vm::fdefn-fun symbol)
+  #-linkage-space
   (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
     (if (eql fdefn 0) nil (fdefn-fun (truly-the fdefn fdefn)))))
-(defun (setf %symbol-function) (newval symbol) ; OK to use only if fdefn exists
-  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
-    (setf (fdefn-fun (truly-the fdefn fdefn)) newval)))
+(defun (setf %symbol-function) (newval symbol) (fset symbol newval))
 
 (defun symbol-function (symbol)
   "Return SYMBOL's current function definition. Settable with SETF."
@@ -134,9 +134,9 @@ distinct from the global value. Can also be SETF."
     ;; I really think the code paths should be reconciled.
     ;; e.g. what's up with *USER-HASH-TABLE-TESTS* being checked
     ;; in %SET-FDEFINITION but not here?
+    (remove-specialized-xep symbol)
     (maybe-clobber-ftype symbol new-value)
-    (let ((fdefn (find-or-create-fdefn symbol)))
-      (setf (fdefn-fun fdefn) new-value))))
+    (fset symbol new-value)))
 
 ;;; Incredibly bogus kludge: the :CAS-TRANS option in objdef makes no indication
 ;;; that you can not use it on certain platforms, so then you do try to use it,
@@ -319,21 +319,18 @@ distinct from the global value. Can also be SETF."
   (let* ((new-id (cond ((not package) +package-id-none+)
                        ((package-id package))
                        (t +package-id-overflow+)))
-         (old-id (symbol-package-id symbol))
-         (name (symbol-name symbol)))
-    (with-pinned-objects (name)
-      (let ((name-bits (logior (ash new-id (- sb-vm:n-word-bits package-id-bits))
-                               (get-lisp-obj-address name))))
-        (declare (ignorable name-bits))
-        (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
-          (setf (info :symbol :package symbol) package))
-        #-compact-symbol (set-symbol-package-id symbol new-id)
-        #+compact-symbol
-        (with-pinned-objects (symbol)
-          (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
-                              (- (ash sb-vm:symbol-name-slot sb-vm:word-shift)
-                                 sb-vm:other-pointer-lowtag))
-                name-bits))))
+         (old-id (symbol-package-id symbol)))
+    (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
+      (setf (info :symbol :package symbol) package))
+    #-compact-symbol (set-symbol-package-id symbol new-id)
+    #+compact-symbol
+    (let ((disp #+big-endian 4
+                #+x86-64 1
+                #+(and little-endian (not x86-64)) 2))
+      (with-pinned-objects (symbol)
+        (setf (sap-ref-16 (int-sap (get-lisp-obj-address symbol))
+                          (- disp sb-vm:other-pointer-lowtag))
+              new-id)))
     ;; CLEAR-INFO is inefficient, so try not to call it.
     (when (and (= old-id +package-id-overflow+) (/= new-id +package-id-overflow+))
       (clear-info :symbol :package symbol))
@@ -394,26 +391,8 @@ distinct from the global value. Can also be SETF."
                    (not (read-only-space-obj-p name)))
           (logior-array-flags name sb-vm:+vector-shareable+))) ; Set "logically read-only" bit
        (name-hash (calc-symbol-name-hash name (length name)))
-       (symbol
-         (truly-the symbol
-          ;; If no immobile-space, easy: all symbols go in dynamic-space
-          #-immobile-space (sb-vm::%alloc-symbol name)
-          ;; If #+immobile-symbols, then uninterned symbols go in dynamic space, but
-          ;; interned symbols go in immobile space. Good luck IMPORTing an uninterned symbol-
-          ;; it'll work at least superficially, but if used as a code constant, the symbol's
-          ;; address may violate the assumption that it's an imm32 operand.
-          #+immobile-symbols
-          (if (eql kind 0) (sb-vm::%alloc-symbol name) (sb-vm::%alloc-immobile-symbol name))
-          #+(and immobile-space (not immobile-symbols))
-          (if (or (eql kind 1) ; keyword
-                  (and (eql kind 2) ; random interned symbol
-                       (plusp (length name))
-                       (char= (char name 0) #\*)
-                       (char= (char name (1- (length name))) #\*)))
-              (sb-vm::%alloc-immobile-symbol name)
-              (sb-vm::%alloc-symbol name)))))
-    #-salted-symbol-hash (%set-symbol-hash symbol name-hash)
-    #+salted-symbol-hash
+       (symbol #+x86-64 (symbol-allocator-macro kind name)
+               #-x86-64 (sb-vm::%alloc-symbol name)))
     (let ((salt (murmur-hash-word/fixnum
                  (word-mix name-hash (get-lisp-obj-address symbol)))))
       #+64-bit
@@ -609,6 +588,43 @@ distinct from the global value. Can also be SETF."
             (intern (%symbol-nameify prefix (incf *gentemp-counter*)) package)
           (unless accessibility (return sym))))))
 
+(defmacro frob-symbol-progv-optimize (sym bit)
+  (sb-c::if-vop-existsp (:translate reset-header-bits)
+    (ecase bit
+      (1 `(logior-header-bits ,sym sb-vm::+symbol-fast-bindable+))
+      (0 `(reset-header-bits ,sym sb-vm::+symbol-fast-bindable+)))
+
+    ;; This way avoids a race with a thread assigning the TLS index
+    ;; when the required vops don't exist, which matters if and only
+    ;; if #+(and sb-thread 64-bit).
+    ;; Consider two threads binding the same symbol using PROGV:
+    ;;  thread A                    Thread B
+    ;;  --------                    --------
+    ;;  SET BIT:                    SET BIT:
+    ;;    x := load header word        x := load header word
+    ;;    logior x, bit                logior x, bit
+    ;;    store header word            ...
+    ;;                                 ... (descheduled by kernel)
+    ;;  DYNBIND:                       ...
+    ;;    ensure-tls-index             ...
+    ;;                                 store header word ; BUG: clobbers TLS index
+    ;;                              DYNBIND:
+    ;;                                 ensure-tls-index ; BUG: picks a new TLS index
+    ;;
+    `(with-pinned-objects (,sym)
+       (let ((sap (int-sap (get-lisp-obj-address ,sym)))
+             (offset (+ (- sb-vm:other-pointer-lowtag)
+                        #+big-endian (- sb-vm:n-word-bytes 2)
+                        #+little-endian 1)))
+         ;; ASSUMPTION: byte stores are atomic and do not affect adjacent bytes
+         (setf (sap-ref-8 sap offset)
+               (,(ecase bit (1 'logior) (0 'logandc2)) (sap-ref-8 sap offset)
+                 sb-vm::+symbol-fast-bindable+))))))
+
+(defun unset-symbol-progv-optimize (symbol)
+  (frob-symbol-progv-optimize symbol 0)
+  symbol)
+
 (macrolet ((signal-type-error (action-description)
              `(let ((spec (type-specifier type)))
                 (cerror "Proceed anyway"
@@ -670,7 +686,7 @@ distinct from the global value. Can also be SETF."
                (when (eq action 'progv)
                  (let ((package (symbol-package symbol)))
                    (if (or (not package) (not (package-locked-p package)))
-                       (logior-header-bits symbol sb-vm::+symbol-fast-bindable+)))))
+                       (frob-symbol-progv-optimize symbol 1)))))
               (continuable
                (cerror "Modify the constant." complaint (describe-action) symbol))
               (t

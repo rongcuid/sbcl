@@ -22,6 +22,7 @@
 #include "queue.h"
 #include "os.h"
 #include "validate.h"
+#include "var-io.h"
 
 #include <stdio.h>
 #ifndef LISP_FEATURE_WIN32
@@ -317,7 +318,7 @@ void execute_full_mark_phase()
 #endif
 }
 
-static void local_smash_weak_pointers()
+__attribute__((unused)) static void local_smash_weak_pointers()
 {
     struct weak_pointer *wp, *next_wp;
     for (wp = weak_pointer_chain; wp != WEAK_POINTER_CHAIN_END; wp = next_wp) {
@@ -411,6 +412,7 @@ static void clobber_headered_object(lispobj* addr, sword_t nwords)
     }
 }
 
+__attribute__((unused))
 static uword_t sweep(lispobj* where, lispobj* end,
                      __attribute__((unused)) uword_t arg)
 {

@@ -223,11 +223,11 @@ exited. The offending thread can be accessed using THREAD-ERROR-THREAD."))
 a simple-string (not necessarily unique) or NIL."
   (thread-%name thread))
 (defun (setf thread-name) (name thread)
-  (setq name (possibly-base-stringize name))
-  (setf (thread-%name thread) name) ; will fail if non-simple
-  ;; Not all native thread APIs can set the name of a random thread, so only try to do it
-  ;; if changing your own name.
-  (when (eq thread *current-thread*) (try-set-os-thread-name name))
+  (let ((name (possibly-base-stringize-to-heap name)))
+    (setf (thread-%name thread) name) ; will fail if non-simple
+    ;; Not all native thread APIs can set the name of a random thread, so only try to do it
+    ;; if changing your own name.
+    (when (eq thread *current-thread*) (try-set-os-thread-name name)))
   name)
 
 (defmethod print-object ((thread thread) stream)
@@ -1754,14 +1754,11 @@ session."
   (setf (sap-ref-sap thread-sap (ash sb-vm::thread-arena-slot sb-vm:word-shift))
         (sb-vm::current-thread-offset-sap sb-vm::thread-arena-slot))
   #+win32
-  (/= 0 (alien-funcall (extern-alien "create_thread"
+  (/= 0 (alien-funcall (extern-alien "create_lisp_thread"
                                      (function unsigned system-area-pointer))
                        thread-sap))
   #-win32
-  (let ((attr (foreign-symbol-sap "new_lisp_thread_attr" t))
-        (c-tramp
-          (foreign-symbol-sap #+os-thread-stack "new_thread_trampoline_switch_stack"
-                              #-os-thread-stack "new_thread_trampoline")))
+  (let ((attr (foreign-symbol-sap "new_lisp_thread_attr" t)))
     (and (= 0 #+os-thread-stack
               (alien-funcall (extern-alien "pthread_attr_setstacksize"
                                            (function int system-area-pointer unsigned))
@@ -1788,10 +1785,10 @@ session."
                 (alien-funcall setguard attr 0)))
          (with-pinned-objects (thread)
            (= 0 (alien-funcall
-                 (extern-alien "pthread_create"
-                               (function int system-area-pointer system-area-pointer
+                 (extern-alien "create_lisp_thread"
+                               (function int system-area-pointer
                                          system-area-pointer system-area-pointer))
-                 (struct-slot-sap thread thread os-thread) attr c-tramp thread-sap))))))
+                 (struct-slot-sap thread thread os-thread) attr thread-sap))))))
 
 (defmacro free-thread-struct (memory)
   `(alien-funcall (extern-alien "free_thread_struct" (function void system-area-pointer))
@@ -1838,9 +1835,7 @@ session."
 ;;; It might work to just set *JOINABLE-THREADS* to NIL in the child, but it's better to prune
 ;;; the *ALL-THREADS* tree as well. Must be called with the *MAKE-THREAD-LOCK* held
 ;;; or interrupts inhibited or both.
-;;; Heuristic decides when to stop trying to free. Passing in #'IDENTITY means that
-;;; all joinables should be processed. Passing in #'CDR or #'CDDR returns early if there
-;;; are not at least 1 or 2 threads respectively that could be joined.
+;;; We try to keep up to RETAIN blocks of memory for reuse by later calls to MAKE-THREAD.
 (export '%dispose-thread-structs)
 (defun %dispose-thread-structs (&key (retain 0))
   (loop (unless (nthcdr retain *joinable-threads*) (return))
@@ -1858,7 +1853,7 @@ session."
 ;;; But there's no "atomic pthread_join + cancel-finalization", short of blocking
 ;;; signals around the join perhaps.
 ;;; One more thing- it's illegal to pthread_join() a thread more than once,
-;;; but we allow JOIN-THREAD more than one. I think that's a bug.
+;;; but we allow JOIN-THREAD more than once. I think that's a bug.
 ;;; Ours has the meaning of "get result if done, otherwise wait"
 ;;; which is not the same as deallocation of the thread's OS resources.
 (defun allocate-thread-memory ()
@@ -2075,7 +2070,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
   #-sb-thread (declare (ignore function name arguments))
   #-sb-thread (error "Not supported in unithread builds.")
   #+sb-thread
-  (let ((name (when name (possibly-base-stringize name))))
+  (let ((name (when name (possibly-base-stringize-to-heap name))))
     (assert (or (atom arguments) (null (cdr (last arguments))))
             (arguments)
             "Argument passed to ~S, ~S, is an improper list."

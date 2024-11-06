@@ -1316,6 +1316,12 @@
 
 (macrolet ((with-print-restrictions (&rest body)
              `(let ((*print-pretty* t)
+                    ;; Truncating end-of-line notes is not very informative, certainly
+                    ;; now that so many FDEFNs have compound names like
+                    ;;  #<SB-KERNEL:FDEFN (SB-IMPL::SPECIALIZED-XEP
+                    ;;                     F ..))
+                    ;; hence the extremely generous overriding value for right-margin.
+                    (*print-right-margin* 200)
                     (*print-lines* 2)
                     (*print-length* 4)
                     (*print-level* 4))
@@ -1839,10 +1845,15 @@
                         (when first-block-seen-p
                           (return)))
                        ((eq kind nil)
-                        (when nil-block-seen-p
-                          (return))
-                        (when first-block-seen-p
-                          (setf nil-block-seen-p t))))
+                        (let ((name (sb-c::compiled-debug-fun-name fmap-entry)))
+                          (cond ((and (typep name '(cons (eql sb-impl::specialized-xep)))
+                                      (eq (%fun-name function)
+                                          (second name)))
+                                 (setf first-block-seen-p t))
+                                (nil-block-seen-p
+                                 (return))
+                                (first-block-seen-p
+                                 (setf nil-block-seen-p t))))))
                  (setf last-debug-fun
                        (sb-di::make-compiled-debug-fun fmap-entry code)))))))
         (let ((max-offset (%code-text-size code)))
@@ -1979,16 +1990,17 @@
                (let* ((debug-fun (seg-debug-fun segment))
                       (name (and debug-fun (sb-di:debug-fun-name debug-fun))))
                  (when name
-                   (format stream " ~Vt ; " *disassem-note-column*)
-                   (case (sb-c::compiled-debug-fun-kind
-                          (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
-                     (:external
-                      (format stream "(XEP ~s)" name))
-                     (:optional
-                      (format stream "(&OPTIONAL ~s)" name))
-                     (:more
-                      (format stream "(&MORE ~s)" name))
-                     (t (prin1 name stream)))))))
+                   (format stream " ~Vt " *disassem-note-column*)
+                   (pprint-logical-block (stream nil :per-line-prefix "; ")
+                     (case (sb-c::compiled-debug-fun-kind
+                            (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                       (:external
+                        (format stream "(XEP ~s)" name))
+                       (:optional
+                        (format stream "(&OPTIONAL ~s)" name))
+                       (:more
+                        (format stream "(&MORE ~s)" name))
+                       (t (prin1 name stream))))))))
         ;; One origin per segment is printed. As with the per-line display,
         ;; the segment is thought of as immovable for rendering of addresses,
         ;; though in fact the disassembler transiently allows movement.
@@ -2040,7 +2052,7 @@
          (list it)))
       (sb-pcl::%method-function
        ;; user's code is in the fast-function
-       (cons fun (recurse (sb-pcl::%method-function-fast-function fun))))
+       (recurse (sb-pcl::%method-function-fast-function fun)))
       (funcallable-instance
        (list (%funcallable-instance-fun fun)))
       (function
@@ -2227,14 +2239,10 @@
       (let ((code sb-fasl:*assembler-routines*))
         (invert (sb-fasl::%asm-routine-table code)
                 (lambda (x) (sap-int (sap+ (code-instructions code) (car x)))))))
+    #-linkage-space
     (dovector (name sb-vm::+all-static-fdefns+)
-      ;; ENTER-ALIEN-CALLBACK is not fboundp until src/code/alien-callback
-      ;; is compiled, so don't fail in function-raw-address.
-      (when (fboundp name)
-        (let ((address
-                #+(and x86-64 immobile-code) (sb-vm::function-raw-address name :rel32)
-                #-(and x86-64 immobile-code) (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
-          (setf (gethash address addr->name) name))))
+      (let ((address (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
+        (setf (gethash address addr->name) name)))
     ;; Not really a routine, but it uses the similar logic for annotations
     #+(and sb-safepoint (not x86-64))
     (setf (gethash (- sb-vm:static-space-start sb-vm:gc-safepoint-trap-offset) addr->name)

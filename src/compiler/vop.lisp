@@ -336,9 +336,7 @@
   ;;    to compute <handle>.
   ;;
   ;; as well as a few other forms of magic - see DUMP-CODE-OBJECT.
-  ;; (:constant )
   ;; (:coverage-marks )
-  ;; (:tls-index )
 
   ;; A null entry in this vector is a placeholder for implementation
   ;; overhead that is eventually stuffed in somehow.
@@ -736,7 +734,8 @@
   (optimizer nil :type (or null function (cons function symbol)))
   (optional-results nil :type list)
   move-vop-p
-  (after-sc-selection nil :type (or null function) :read-only t))
+  (after-sc-selection nil :type (or null function) :read-only t)
+  gc-barrier)
 (!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 (declaim (inline vop-name))

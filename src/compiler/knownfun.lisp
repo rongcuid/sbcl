@@ -372,27 +372,46 @@
     (declare (type combination call))
     (let ((lvar (nth n (combination-args call))))
       (when lvar
-        (let ((type (lvar-type lvar)))
-          (cond ((and (not string-designator)
-                      (simplify-list-type type
-                                          :preserve-dimensions preserve-dimensions)))
-                ((not (csubtypep type (specifier-type 'vector)))
-                 (cond ((not string-designator) nil)
-                       ((csubtypep type (specifier-type 'character))
-                        (specifier-type `(simple-string 1)))
-                       ((and (constant-lvar-p lvar)
-                             (symbolp (lvar-value lvar)))
-                        (ctype-of (symbol-name (lvar-value lvar))))))
-                (preserve-vector-type
-                 type)
-                (t
-                 (let ((simplified (simplify-vector-type type)))
-                   (if (and preserve-dimensions
-                            (csubtypep simplified (specifier-type 'simple-array)))
-                       (type-intersection (specifier-type
-                                           `(simple-array * ,(ctype-array-dimensions type)))
-                                          simplified)
-                       simplified)))))))))
+        (let* ((type (lvar-type lvar))
+               (result type))
+          (unless string-designator
+            (let ((list-type (type-intersection type (specifier-type 'list))))
+              (unless (eq list-type *empty-type*)
+                (setf result
+                      (type-union
+                       result
+                       (simplify-list-type list-type
+                                           :preserve-dimensions preserve-dimensions))))))
+          (when string-designator
+            (when (types-equal-or-intersect type (specifier-type 'character))
+              (setf result
+                    (type-union
+                     (type-difference result (specifier-type 'character))
+                     (specifier-type '(simple-string 1)))))
+            (let ((symbol-type (type-intersection type (specifier-type 'symbol))))
+              (unless (eq symbol-type *empty-type*)
+                (setf result
+                      (type-union
+                       (type-difference result (specifier-type 'symbol))
+                       (if (member-type-p symbol-type)
+                           (sb-kernel::%type-union (mapcar-member-type-members
+                                                    (lambda (s) (ctype-of (symbol-name s)))
+                                                    symbol-type))
+                           (specifier-type 'simple-string)))))))
+          (unless preserve-vector-type
+            (let ((vector-type (type-intersection type (specifier-type 'vector))))
+              (unless (eq vector-type *empty-type*)
+                (let ((simplified (simplify-vector-type vector-type)))
+                  (setf result
+                        (type-union
+                         result
+                         (if (and preserve-dimensions
+                                  (csubtypep simplified (specifier-type 'simple-array)))
+                             (type-intersection (specifier-type
+                                                 `(simple-array * ,(ctype-array-dimensions vector-type)))
+                                                simplified)
+                             simplified)))))))
+          result)))))
 
 ;;; Derive the type to be the type specifier which is the Nth arg.
 (defun result-type-specifier-nth-arg (n)
@@ -475,38 +494,48 @@
 
 ;;; Return MAX MIN
 (defun sequence-lvar-dimensions (lvar)
-  (if (constant-lvar-p lvar)
-      (let ((value (lvar-value lvar)))
-        (and (proper-sequence-p value)
-             (let ((length (length value)))
-               (values length length))))
-      (let ((max 0) (min array-total-size-limit))
-        (block nil
-          (labels ((max-dim (type)
-                     ;; This can deal with just enough hair to handle type STRING,
-                     ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
-                     ;; if we really want to be more clever.
-                     (typecase type
-                       (union-type
-                        (mapc #'max-dim (union-type-types type)))
-                       (array-type (if (array-type-complexp type)
-                                       (return '*)
-                                       (process-dim (array-type-dimensions type))))
-                       (t (return '*))))
-                   (process-dim (dim)
-                     (if (typep dim '(cons integer null))
-                         (let ((length (car dim)))
-                           (setf max (max max length)
-                                 min (min min length)))
-                         (return '*))))
-            ;; If type derivation were able to notice that non-simple arrays can
-            ;; be mutated (changing the type), we could safely use LVAR-TYPE on
-            ;; any vector type. But it doesn't notice.
-            ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
-            ;; However that's probably not an important use, so the above
-            ;; logic restricts itself to simple arrays.
-            (max-dim (lvar-type lvar))
-            (values max min))))))
+  (cond ((constant-lvar-p lvar)
+         (let ((value (lvar-value lvar)))
+           (and (proper-sequence-p value)
+                (let ((length (length value)))
+                  (values length length)))))
+        ((csubtypep (lvar-type lvar) (specifier-type 'cons))
+         (values nil 1))
+        (t
+         (let ((max 0) (min array-total-size-limit))
+           (block nil
+             (labels ((max-dim (type)
+                        ;; This can deal with just enough hair to handle type STRING,
+                        ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
+                        ;; if we really want to be more clever.
+                        (typecase type
+                          (union-type
+                           (mapc #'max-dim (union-type-types type)))
+                          (array-type (if (array-type-complexp type)
+                                          (return '*)
+                                          (process-dim (array-type-dimensions type))))
+                          (t
+                           (cond ((csubtypep type (specifier-type 'cons))
+                                  (setf max array-total-size-limit
+                                        min (min min 1)))
+                                 ((csubtypep type (specifier-type 'null))
+                                  (setf min 0))
+                                 (t
+                                  (return '*))))))
+                      (process-dim (dim)
+                        (if (typep dim '(cons integer null))
+                            (let ((length (car dim)))
+                              (setf max (max max length)
+                                    min (min min length)))
+                            (return '*))))
+               ;; If type derivation were able to notice that non-simple arrays can
+               ;; be mutated (changing the type), we could safely use LVAR-TYPE on
+               ;; any vector type. But it doesn't notice.
+               ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
+               ;; However that's probably not an important use, so the above
+               ;; logic restricts itself to simple arrays.
+               (max-dim (lvar-type lvar))
+               (values max min)))))))
 
 ;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
 ;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
@@ -570,3 +599,38 @@
           (when (and (assert-lvar-type arg list-type policy)
                      (not trusted))
             (reoptimize-lvar arg)))))
+
+(defun nconc-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call))
+         (list-type (specifier-type 'list)))
+    ;; All but the last argument should be proper lists
+    (loop for (arg next) on args
+          while next
+          do
+          (add-annotation
+           arg
+           (make-lvar-proper-sequence-annotation
+            :kind 'proper-or-dotted-list))
+          (when (policy policy (> check-constant-modification 0))
+            (add-annotation arg
+                            (make-lvar-modified-annotation :caller 'nconc)))
+          (when (and (assert-lvar-type arg list-type policy)
+                     (not trusted))
+            (reoptimize-lvar arg)))))
+
+;;; It's either (number) or (real real)
+(defun atan-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call)))
+    (case (length args)
+      (1
+       (when (and (assert-lvar-type (car args) (specifier-type 'number) policy)
+                  (not trusted))
+         (reoptimize-lvar (car args))))
+      (2
+       (loop for arg in args
+             do
+             (when (and (assert-lvar-type arg (specifier-type 'real) policy)
+                        (not trusted))
+               (reoptimize-lvar arg)))))))

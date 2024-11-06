@@ -74,6 +74,8 @@ static void visit_pointer_words(lispobj* object, lispobj (*func)(lispobj, uword_
         lispobj name = decode_symbol_name(s->name);
         gc_assert(is_lisp_pointer(name));
         set_symbol_name(s, func(name, arg));
+    } else if (widetag == FDEFN_WIDETAG) {
+        // nothing to do
     } else if (widetag == CODE_HEADER_WIDETAG) {
         int boxedlen = code_header_words((struct code*)object), i;
         // first 4 slots are header, boxedlen, fixups, debuginfo
@@ -161,11 +163,13 @@ static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
 {
     walk_range((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, fun, arg);
     walk_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, fun, arg);
-    walk_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, fun, arg);
+    if (PERMGEN_SPACE_START)
+        walk_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, fun, arg);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     walk_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, fun, arg);
 #endif
-    walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
+    if (TEXT_SPACE_START)
+        walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
     struct pair pair = {fun, arg};
     walk_generation(walk_range_wrapper, -1, (uword_t)&pair);
 }

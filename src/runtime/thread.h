@@ -90,6 +90,9 @@ struct extra_thread_data
 #endif
     int arena_count; // number of structures in arena_saveareas
     arena_state* arena_savearea;
+    // opaque pointer to zstd decompression context so it doesn't matter whether
+    // core-compression and/or static linking are enabled.
+    void* zstd_dcontext;
     // These values influence get_alloc_start_page() when arenas are in use
     // and allocation switches back and forth between arena and heap.
     page_index_t mixed_page_hint;
@@ -113,9 +116,19 @@ extern int dynamic_values_bytes;
 #define for_each_thread(th) for(th=all_threads;th;th=0)
 #endif
 
+#ifndef LISP_FEATURE_SB_THREAD
+# define ASSIGN_CURRENT_THREAD(dummy)
+#elif defined LISP_FEATURE_GCC_TLS
+# define ASSIGN_CURRENT_THREAD(x) current_thread = x
+#elif !defined LISP_FEATURE_WIN32
+# define ASSIGN_CURRENT_THREAD(x) pthread_setspecific(current_thread, x)
+#else
+# define ASSIGN_CURRENT_THREAD(x) TlsSetValue(OUR_TLS_INDEX, x)
+#endif
+
 /* These are for use during GC, on the current thread, or on prenatal
  * threads only. */
-#if defined(LISP_FEATURE_SB_THREAD)
+#if defined LISP_FEATURE_SB_THREAD || defined LISP_FEATURE_X86_64
 #define get_binding_stack_pointer(thread)       \
     ((thread)->binding_stack_pointer)
 #define set_binding_stack_pointer(thread,value) \

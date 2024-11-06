@@ -311,8 +311,8 @@ used to specify the oldest generation guaranteed to be collected."
   (setf sb-c::*phash-lambda-cache* nil)
   ;; Clear caches depending on the generation being collected.
   (cond ((eql 0 gen)
-         ;; Drop strings because the hash is pointer-hash
-         ;; but there is no automatic cache rehashing after GC.
+         ;; Drop strings because the hash is address-based, but there
+         ;; is no automatic cache rehashing after GC.
          (sb-format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
          (sb-format::tokenize-control-string-cache-clear))
@@ -413,7 +413,7 @@ statistics are appended to it."
                (alien-funcall find-page-index address))))
 
 (defun pages-allocated ()
-  (loop for n below (extern-alien "next_free_page" signed)
+  (loop for n below (extern-alien "next_free_page" page-index-t)
         count (not (zerop (slot (deref sb-vm:page-table n) 'sb-vm::flags)))))
 
 #-mark-region-gc
@@ -428,8 +428,7 @@ statistics are appended to it."
              (when (simple-fun-p object)
                (setq addr (get-lisp-obj-address (fun-code-header object))))
              (let ((sap (int-sap (logandc2 addr sb-vm:lowtag-mask))))
-               (logand (if (fdefn-p object) (sap-ref-8 sap 1) (sap-ref-8 sap 3))
-                       #xF)))))))
+               (logand (sap-ref-8 sap 3) #xF)))))))
 
 #+mark-region-gc
 (defun generation-of (object)
@@ -531,6 +530,10 @@ Experimental: interface subject to change."
                     ((< sb-vm:read-only-space-start addr
                         (sap-int sb-vm:*read-only-space-free-pointer*))
                      :read-only)
+                    #+permgen
+                    ((< sb-vm:permgen-space-start addr
+                        (sap-int sb-vm:*permgen-space-free-pointer*))
+                     :permgen)
                     ;; Without immobile-space, the text range is
                     ;; more-or-less an extension of static space.
                     #-immobile-space

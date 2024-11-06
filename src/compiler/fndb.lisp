@@ -234,8 +234,8 @@
   ((or list package-designator) &optional package-designator) (eql t))
 (defknown find-all-symbols (string-designator) list (flushable))
 ;; private
-(defknown package-iter-step (fixnum index simple-vector list)
-  (values fixnum index simple-vector list symbol symbol))
+(defknown package-iter-step (sb-impl::pkg-iter)
+  (values (member :internal :external :inherited nil) package symbol))
 
 ;;;; from the "Numbers" chapter:
 
@@ -278,7 +278,7 @@
     (fixnum real fixnum) boolean
     (foldable flushable movable no-verify-arg-count))
 
-(defknown (check-range<=)
+(defknown (check-range<= check-range<<= check-range<=<)
     (fixnum t fixnum) boolean
     (foldable flushable movable no-verify-arg-count))
 
@@ -325,7 +325,8 @@
 
 (defknown atan
   (number &optional real) irrational
-  (movable foldable unsafely-flushable recursive))
+  (movable foldable unsafely-flushable recursive)
+  :call-type-deriver #'atan-call-type-deriver)
 
 (defknown (tan sinh cosh tanh asinh)
   (number) irrational (movable foldable flushable recursive))
@@ -356,6 +357,9 @@
 (defknown truncate
   (real &optional real) (values integer real)
   (movable foldable flushable recursive))
+
+(defknown (sb-kernel::truncate1 sb-kernel::floor1 sb-kernel::ceiling1) (real real) integer
+  (movable foldable flushable recursive no-verify-arg-count))
 
 (defknown unary-truncate (real) (values integer real)
   (movable foldable flushable no-verify-arg-count))
@@ -571,6 +575,9 @@
   (flushable))
 
 (defknown copy-seq (proper-sequence) consed-sequence (flushable)
+  :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t))
+
+(defknown list-copy-seq* (proper-list) list (flushable)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t))
 
 (defknown length (proper-sequence) index (foldable flushable dx-safe))
@@ -1016,12 +1023,11 @@
 (defknown sb-impl::|Vector| (&rest t) simple-vector (movable flushable))
 
 ;;; All but last must be of type LIST, but there seems to be no way to
-;;; express that in this syntax.
+;;; express that in this syntax, append-call-type-deriver does that.
 (defknown append (&rest t) t (flushable)
   :call-type-deriver #'append-call-type-deriver)
-(defknown sb-impl::append2 (list t) t
-  (flushable no-verify-arg-count)
-  :call-type-deriver #'append-call-type-deriver)
+(defknown sb-impl::append2 (proper-list t) t
+  (flushable no-verify-arg-count))
 
 (defknown copy-list (proper-or-dotted-list) list (flushable)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t))
@@ -1031,7 +1037,8 @@
 (defknown copy-tree (t) t (flushable recursive))
 (defknown revappend (proper-list t) t (flushable))
 
-(defknown nconc (&rest (modifying t :butlast t)) t ())
+(defknown nconc (&rest (modifying t :butlast t)) t ()
+  :call-type-deriver #'nconc-call-type-deriver)
 
 (defknown nreconc ((modifying list) t) t (important-result))
 (defknown butlast (proper-or-dotted-list &optional unsigned-byte) list (flushable))
@@ -1145,8 +1152,8 @@
      &key (:key (function-designator ((nth-arg 1 :sequence t)))))
     list (foldable flushable call))
 
-(defknown (memq assq) (t proper-list) list (foldable flushable))
-(defknown (delq delq1) (t (modifying list)) list (flushable))
+(defknown (memq assq) (t proper-list) list (foldable flushable no-verify-arg-count))
+(defknown (delq delq1) (t (modifying list)) list (flushable no-verify-arg-count))
 
 ;;;; from the "Hash Tables" chapter:
 
@@ -1165,10 +1172,41 @@
   (flushable)) ; not FOLDABLE, since hash table contents can change
 (defknown sb-impl::gethash3 (t hash-table t) (values t boolean)
   (flushable no-verify-arg-count)) ; not FOLDABLE, since hash table contents can change
+(defknown (sb-impl::gethash/eq-hash/flat
+           sb-impl::gethash/eq-hash/common
+           sb-impl::gethash/eq-hash/safe
+           sb-impl::gethash/eql-hash/flat
+           sb-impl::gethash/eql-hash
+           sb-impl::gethash/equal
+           sb-impl::gethash/equalp
+           sb-impl::gethash/any)
+    ;; Don't declare the HASH-TABLE argument type to avoid type
+    ;; checking overhead.
+    (t t t) (values t boolean)
+    (flushable no-verify-arg-count))
 (defknown %puthash (t (modifying hash-table) t) t
   (no-verify-arg-count)
   :derive-type #'result-type-last-arg)
+(defknown (sb-impl::puthash/eq-hash/flat
+           sb-impl::puthash/eq-hash/common
+           sb-impl::puthash/eq-hash/safe
+           sb-impl::puthash/eql-hash/flat
+           sb-impl::puthash/eql-hash
+           sb-impl::puthash/equal
+           sb-impl::puthash/equalp
+           sb-impl::puthash/any)
+    (t t t) t
+    (no-verify-arg-count))
 (defknown remhash (t (modifying hash-table)) boolean ())
+(defknown (sb-impl::remhash/eq-hash/flat
+           sb-impl::remhash/eq-hash/common
+           sb-impl::remhash/eq-hash/safe
+           sb-impl::remhash/eql-hash/flat
+           sb-impl::remhash/eql-hash
+           sb-impl::remhash/equal
+           sb-impl::remhash/equalp
+           sb-impl::remhash/any)
+    (t t) boolean ())
 (defknown maphash ((function-designator (t t)) hash-table) null (flushable call))
 (defknown clrhash ((modifying hash-table)) hash-table ())
 (defknown hash-table-count (hash-table) index (flushable))
@@ -1279,6 +1317,9 @@
   #|:derive-type #'result-type-last-arg|#)
 
 (defknown bit-vector-= (bit-vector bit-vector) boolean
+  (movable foldable flushable no-verify-arg-count))
+
+(defknown sb-impl::array-equalp (array array) boolean
   (movable foldable flushable no-verify-arg-count))
 
 (defknown array-has-fill-pointer-p (array) boolean
@@ -1521,7 +1562,7 @@
 
 ;; N.B., sb-simple-streams clobbers this; if this changes, make sure
 ;; sb-simple-streams follows along, where necessary.
-(defknown listen (&optional stream-designator) boolean (flushable))
+(defknown listen (&optional stream-designator) generalized-boolean (flushable))
 
 ;; N.B., sb-simple-streams clobbers this; if this changes, make sure
 ;; sb-simple-streams follows along, where necessary.
@@ -1776,6 +1817,7 @@
 (defknown method-combination-error (format-control &rest t) *)
 (defknown assert-error (t &rest t) null)
 (defknown check-type-error (t t type-specifier &optional (or null string)) t)
+(defknown check-type-error-trap (t t t) t)
 (defknown invoke-debugger (condition) nil)
 (defknown break (&optional format-control &rest t) null)
 (defknown make-condition (type-specifier &rest t) condition ())
@@ -2029,6 +2071,11 @@
 (defknown vector-hairy-data-vector-ref/check-bounds (vector index) t (foldable no-verify-arg-count))
 (defknown vector-hairy-data-vector-set/check-bounds (vector index t) t (no-verify-arg-count))
 
+(defknown string-hairy-data-vector-ref (string index) t (foldable flushable no-verify-arg-count))
+(defknown string-hairy-data-vector-set (string index t) t (no-verify-arg-count))
+(defknown string-hairy-data-vector-ref/check-bounds (string index) t (foldable no-verify-arg-count))
+(defknown string-hairy-data-vector-set/check-bounds (string index t) t (no-verify-arg-count))
+
 (defknown %caller-frame () t (flushable))
 (defknown %caller-pc () system-area-pointer (flushable))
 (defknown %with-array-data (array index (or index null))
@@ -2041,12 +2088,12 @@
 (defknown (%coerce-callable-to-fun %coerce-callable-for-call)
     (function-designator)
     function (flushable no-verify-arg-count))
-(defknown array-bounding-indices-bad-error (t t t) nil)
-(defknown sequence-bounding-indices-bad-error (t t t) nil)
+(defknown array-bounding-indices-bad-error (t t t) nil (no-verify-arg-count))
+(defknown sequence-bounding-indices-bad-error (t t t) nil (no-verify-arg-count))
 (defknown %find-position
     (t sequence t index sequence-end (function (t)) (function (t t)))
   (values t (or index null))
-  (flushable call))
+  (flushable call no-verify-arg-count))
 (defknown (%find-position-if %find-position-if-not)
   (function sequence t index sequence-end function)
   (values t (or index null))
@@ -2300,7 +2347,7 @@
 (defknown (sb-impl::%with-standard-io-syntax
            sb-impl::%with-rebound-io-syntax
            sb-impl::call-with-sane-io-syntax)
-    ((function ())) *)
+    ((function ())) * (no-verify-arg-count))
 (defknown sb-debug::funcall-with-debug-io-syntax ((function ((rest-args))) &rest t) *)
 (defknown sb-impl::%print-unreadable-object (t t t &optional (function ())) null)
 
@@ -2317,14 +2364,13 @@
            sb-thread::call-with-recursive-system-lock)
     ((function ()) t) *))
 
-#+round-float
 (progn
-  (defknown round-double (double-float #1=(member :round :floor :ceiling :truncate))
+  (defknown round-double (double-float #1=(member #+round-float :round :floor :ceiling :truncate))
       double-float
-      (foldable flushable movable always-translatable))
+      (foldable flushable movable #+round-float always-translatable))
 
   (defknown round-single (single-float #1#) single-float
-      (foldable flushable movable always-translatable)))
+      (foldable flushable movable #+round-float always-translatable)))
 
 (defknown (overflow* overflow+ overflow-
            overflow-ash)

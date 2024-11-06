@@ -3347,8 +3347,10 @@
              ;; addition in to catch SNaNs.
              #+x86
              (progn
-               (assert (ctu:asm-search "FADD" fun1))
-               (assert (not (ctu:asm-search "FADD" fun2))))
+               (assert (or (ctu:asm-search "FADDD " fun1)
+                           (ctu:asm-search "FADD-STI " fun1)))
+               (assert (not (or (ctu:asm-search "FADDD " fun2)
+                                (ctu:asm-search "FADD-STI " fun2)))))
              #+x86-64
              (let ((inst (if (typep result 'double-float)
                              "ADDSD" "ADDSS")))
@@ -3827,7 +3829,7 @@
       (assert (< d3 (* 10 short-avg))))))
 
 (with-test (:name :bug-384892)
-  (assert (equal
+  (assert (ctype=
            '(function (fixnum fixnum &key (:k1 boolean))
              (values (member t) &optional))
            (sb-kernel:%simple-fun-type
@@ -6073,10 +6075,16 @@
     ((5.0f-9) #C(-4.123312f37 -0.0))))
 
 (with-test (:name :reducing-constants.2)
-  (checked-compile-and-assert (:allow-style-warnings t)
-      `(lambda () (*  1.0 2 (expt 2 127)))
-    (() #-no-float-traps (condition 'floating-point-overflow)
-        #+no-float-traps sb-ext:single-float-positive-infinity)))
+  (let* ((style-warning-p nil)
+         (fun (checked-compile `(lambda () (* 1.0 2 (expt 2 127)))
+                               :allow-style-warnings t
+                               :condition-transform (lambda (x)
+                                                      (when (typep x 'style-warning)
+                                                        (setf style-warning-p t))
+                                                      x))))
+    (handler-case (funcall fun)
+      (floating-point-overflow () (assert style-warning-p))
+      (:no-error (x) (assert (not style-warning-p)) (assert (eql x sb-ext:single-float-positive-infinity))))))
 
 (with-test (:name (logbitp :past fixnum))
   (checked-compile-and-assert ()

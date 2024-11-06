@@ -499,8 +499,10 @@ possibly temporarily, because it might be used internally.")
    "HASHSET-INSERT-IF-ABSENT" "HASHSET-COUNT"
    "HASHSET-MUTEX" "MAP-HASHSET"
    ;; useful for DX keys that should persist to the heap
-   "SYS-COPY-STRUCT"
    "ENSURE-HEAP-LIST"
+   "SYS-COPY-STRUCT"
+   "SYS-TLAB-ADJOIN-EQ"
+   "SYS-TLAB-APPEND"
 
    ;; communication between the runtime and Lisp
 
@@ -542,6 +544,7 @@ possibly temporarily, because it might be used internally.")
    "UPDATE-SYMBOL-INFO"
    "WITH-GLOBALDB-NAME"
    "%BOUNDP"
+   "ENSURE-LINKAGE-INDEX"
 
    ;; Calling a list of hook functions, plus error handling.
 
@@ -621,6 +624,7 @@ possibly temporarily, because it might be used internally.")
    "C-STRING-ENCODING-ERROR"
    "C-STRING-DECODING-ERROR"
    "ATTEMPT-RESYNC" "FORCE-END-OF-FILE"
+   "FORM-SOURCE-BOUNDS"
 
    ;; not potential SB-EXT exports
    "GET-EXTERNAL-FORMAT" "GET-EXTERNAL-FORMAT-OR-LOSE"
@@ -863,6 +867,7 @@ possibly temporarily, because it might be used internally.")
 
    "ADDRESS-BASED-COUNTER-VAL"
    "DEFINE-FUNCTION-NAME-SYNTAX" "VALID-FUNCTION-NAME-P" ; should be SB-EXT?
+   "PERMANENT-FNAME-P" "FSET"
 
    "LEGAL-VARIABLE-NAME-P"
    "LEGAL-FUN-NAME-P" "LEGAL-FUN-NAME-OR-TYPE-ERROR"
@@ -959,6 +964,10 @@ possibly temporarily, because it might be used internally.")
 
    "*REPL-PROMPT-FUN*"
    "*REPL-READ-FORM-FUN*"
+
+   ;; for SB-COVER
+
+   "*CODE-COVERAGE-INFO*"
 
    ;; Character database access
 
@@ -1278,11 +1287,11 @@ interface stability.")
    "ST-ATIME" "ST-BLKSIZE" "ST-BLOCKS"
    "ST-CTIME" "ST-DEV" "ST-GID" "ST-MODE" "ST-MTIME" "ST-NLINK"
    "ST-RDEV" "ST-SIZE" "ST-UID" "STAT" "TIME-T"
-   "TIMEVAL" "TIMEZONE"
+   "TIMEVAL"
    "TIOCGPGRP"
    #-avoid-clock-gettime
    "CLOCK-GETTIME" "TV-SEC" "TV-USEC"
-   "TZ-DSTTIME" "TZ-MINUTESWEST" "UID-T" "UNIX-CLOSE"
+   "UID-T" "UNIX-CLOSE"
    "UNIX-CLOSEDIR" "UNIX-DIRENT-NAME" "UNIX-DUP"
    "UNIX-FILE-MODE" "UNIX-FSTAT"
    "UNIX-GETHOSTNAME" "UNIX-GETPID" "UNIX-GETRUSAGE"
@@ -1613,7 +1622,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%UNARY-TRUNCATE" "UNARY-TRUNCATE"
            "%UNARY-TRUNCATE/SINGLE-FLOAT"
            "%UNARY-TRUNCATE/DOUBLE-FLOAT"
-           "%UNARY-FROUND" "%UNARY-FTRUNCATE"
+           "%UNARY-FROUND"
 
            "%WITH-ARRAY-DATA"
            "%WITH-ARRAY-DATA/FP"
@@ -1661,7 +1670,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "CHARACTER-SET-TYPE-PAIRS"
            #+sb-unicode "CHARACTER-STRING-P"
            "CHARPOS"
-           "CHECK-FOR-CIRCULARITY" "CHECK-TYPE-ERROR" "CLOSED-FLAME"
+           "CHECK-FOR-CIRCULARITY"
+           "CHECK-TYPE-ERROR" "CHECK-TYPE-ERROR-TRAP"
+           "CLOSED-FLAME"
            "CLASS-CLASSOID"
            "CODE-COMPONENT" "CODE-COMPONENT-P"
            "CODE-HEADER-REF" "CODE-HEADER-SET" "CODE-HEADER-WORDS"
@@ -1752,6 +1763,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "VECTOR-HAIRY-DATA-VECTOR-REF"
            "VECTOR-HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS" "VECTOR-HAIRY-DATA-VECTOR-SET"
            "VECTOR-HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
+           "STRING-HAIRY-DATA-VECTOR-REF"
+           "STRING-HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS" "STRING-HAIRY-DATA-VECTOR-SET"
+           "STRING-HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
            "HAIRY-TYPE" "HAIRY-TYPE-P" "HAIRY-TYPE-SPECIFIER"
            "HANDLE-CIRCULARITY" "HOST" "ILL-BIN"
            "ILL-BOUT" "ILL-IN" "ILL-OUT" "INDEX-OR-MINUS-1"
@@ -1917,7 +1931,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "PARSE-UNKNOWN-TYPE"
            "PARSE-UNKNOWN-TYPE-SPECIFIER"
            "PATHNAME-DESIGNATOR" "PATHNAME-COMPONENT-CASE"
-           "POINTER-HASH"
            "POINTERP"
            #+(or x86 x86-64) "*PSEUDO-ATOMIC-BITS*"
            "PUNT-PRINT-IF-TOO-LONG"
@@ -1996,7 +2009,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "TWO-ARG-STRING/=" "TWO-ARG-STRING-LESSP" "TWO-ARG-STRING-GREATERP"
            "TWO-ARG-STRING-NOT-LESSP" "TWO-ARG-STRING-NOT-GREATERP" "TWO-ARG-STRING-NOT-EQUAL"
            "RANGE<" "RANGE<=" "RANGE<<=" "RANGE<=<"
-           "CHECK-RANGE<="
+           "CHECK-RANGE<=" "CHECK-RANGE<<=" "CHECK-RANGE<=<"
            "TYPE-*-TO-T"
            "TYPE-DIFFERENCE" "TYPE-INTERSECTION"
            "TYPE-INTERSECTION2" "TYPE-APPROX-INTERSECTION2"
@@ -2592,7 +2605,7 @@ be submitted as a CDR")
            "CLOSURE-INIT" "CLOSURE-REF" "CLOSURE-INIT-FROM-FP"
            "COMPARE-AND-SWAP-SLOT"
            "COMPILE-IN-LEXENV"
-           "COMPILE-FILES"
+           "COMPILE-FILES" "COMPILE-FORM-TO-FILE"
            "%COMPILER-DEFUN" "COMPILER-ERROR" "FATAL-COMPILER-ERROR"
            "COMPILER-NOTIFY"
            "COMPILER-STYLE-WARN" "COMPILER-WARN"
@@ -2770,11 +2783,6 @@ be submitted as a CDR")
 
            "BRANCH-IF" "MULTIWAY-BRANCH-IF-EQ"
            "JUMP-TABLE" "CASE-TO-JUMP-TABLE"
-           ;; for SB-COVER
-
-           "*CODE-COVERAGE-INFO*" "CODE-COVERAGE-RECORD-MARKED"
-           "CLEAR-CODE-COVERAGE" "RESET-CODE-COVERAGE"
-           "+CODE-COVERAGE-UNMARKED+"
            ;; for SB-INTROSPECT
 
            "MAP-PACKED-XREF-DATA" "MAP-SIMPLE-FUNS"))
@@ -2881,7 +2889,7 @@ structure representations")
            "CLOSURE-INFO-OFFSET"
            "CODE-BOXED-SIZE-SLOT"
            "CODE-CONSTANTS-OFFSET" "CODE-SLOTS-PER-SIMPLE-FUN"
-           "CODE-FIXUPS-SLOT"
+           "CODE-FIXUPS-SLOT" "CODE-LINKAGE-ELTS-SLOT"
            "CODE-DEBUG-INFO-SLOT"
            "CODE-HEADER-SIZE-SHIFT"
            "CODE-HEADER-WIDETAG" "COMPLEX-ARRAY-WIDETAG"
@@ -3000,6 +3008,7 @@ structure representations")
            "N-LOWTAG-BITS"
            "N-FIXNUM-TAG-BITS"
            "N-FIXNUM-BITS"
+           "N-LINKAGE-INDEX-BITS"
            "N-POSITIVE-FIXNUM-BITS"
            "NIL-VALUE"
            "NFP-SAVE-OFFSET"
@@ -3101,15 +3110,14 @@ structure representations")
            "*CONTROL-STACK-START*" "*CONTROL-STACK-END*"
            "CONTROL-STACK-POINTER-VALID-P"
            "DYNAMIC-SPACE-START"
-           "MAX-DYNAMIC-SPACE-END"
            "PAGE-TABLE"
            "FIND-PAGE-INDEX"
            "NEXT-FREE-PAGE"
            "READ-ONLY-SPACE-START" "READ-ONLY-SPACE-END"
            "STATIC-SPACE-START" "STATIC-SPACE-END" "*STATIC-SPACE-FREE-POINTER*"
            "STATIC-CODE-SPACE-START" "STATIC-CODE-SPACE-END" "*STATIC-CODE-SPACE-FREE-POINTER*"
-           "ALIEN-LINKAGE-TABLE-SPACE-START"
-           "ALIEN-LINKAGE-TABLE-SPACE-SIZE"
+           "ALIEN-LINKAGE-SPACE-START"
+           "ALIEN-LINKAGE-SPACE-SIZE"
            "ALIEN-LINKAGE-TABLE-ENTRY-SIZE"
            #+sb-safepoint "GC-SAFEPOINT-TRAP-OFFSET"
            "THREAD-STATE-WORD-SLOT"
@@ -3137,6 +3145,7 @@ structure representations")
            "N-WORD-BITS" "N-WORD-BYTES" "N-MACHINE-WORD-BITS" "N-MACHINE-WORD-BYTES"
            "WITH-PSEUDO-ATOMIC-FOREIGN-CALLS"
            "WITH-ARENA" "WITHOUT-ARENA" "FIND-CONTAINING-ARENA"
+           "THREAD-CURRENT-ARENA"
            "WORD" "WORD-REG-SC-NUMBER" "WORD-SHIFT"
            #+win32 "CONTEXT-RESTORE-TRAP"
            "ZERO-SC-NUMBER")
@@ -3386,6 +3395,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            ;; Sessions
 
            "MAKE-LISTENER-THREAD"
+           "GET-FOREGROUND"
            "RELEASE-FOREGROUND"
            "WITH-NEW-SESSION"
            ;; Semaphores

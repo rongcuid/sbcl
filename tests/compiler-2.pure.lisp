@@ -48,7 +48,7 @@
                    :allow-style-warnings t)
   ;; The sequence must contain a mixture of symbols and non-symbols
   ;; to call %FIND-POSITION. If only symbols, it makes no calls.
-  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g))))))
+  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g) :from-end t)))))
     ;; Assert that the default :TEST of #'EQL was strength-reduced to #'EQ
     (assert (equal calls '((sb-kernel:%find-position identity eq)))))
   (checked-compile-and-assert ()
@@ -2574,7 +2574,7 @@
                             (push name names)))))
              (assert (not dup-fdefns)))))
     (dolist (c (sb-vm:list-allocated-objects :all :type sb-vm:code-header-widetag))
-      (sb-int:binding* (((start count) (sb-kernel:code-header-fdefn-range c))
+      (sb-int:binding* (((start count) (ctu:code-header-fdefn-range c))
                         (end (+ start count)))
         ;; Within each subset of FDEFNs there should be no duplicates
         ;; by name. But there could be an fdefn that is in the union of the two sets.
@@ -4438,3 +4438,109 @@
               (* x))
          x))
     (() :dont-rebind))))
+
+(with-test (:name :multiple-uses-type-derivation)
+  (assert-type
+   (lambda (x a b)
+     (funcall (ecase x
+                (0 #'+)
+                (1 (lambda (x y) (- x y)))
+                (2 'logand))
+              a b))
+   number)
+  (assert-type
+   (lambda (x a b)
+     (let ((f (ecase x
+                (0 '+)
+                (2 'logand))))
+       (when a
+         (funcall f a b))))
+   (or null number)))
+
+(with-test (:name :multiple-uses-to-fdefn)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x a b)
+         (let ((fun (ecase x
+                      (0 'a)
+                      (1 'b))))
+           (when a
+             (funcall fun a b))))
+    ((0 nil 2) nil)
+    ((0 1 2) (condition 'undefined-function))))
+
+(with-test (:name :undefined-system-fun)
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         #'nil)
+    (() (condition 'undefined-function)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         #'(setf *standard-output*))
+    (() (condition 'undefined-function)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         (nil))
+    (() (condition 'undefined-function))))
+
+(with-test (:name :multiple-uses-type-mismatch-from-transforms)
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda (m)
+                         (sb-kernel:the* (fixnum :use-annotations t) (or m (make-array 10))))
+                      :allow-style-warnings t)))
+  (checked-compile
+   `(lambda (m s)
+      (declare (optimize speed))
+      (sb-kernel:the* (fixnum :use-annotations t) (or m (position 10 (the list s))))))
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda (m)
+                         (the fixnum (or m (make-array 10))))
+                      :allow-style-warnings t)))
+  (checked-compile
+   `(lambda (m s)
+      (declare (optimize speed))
+      (the fixnum (or m (position 10 (the list s)))))))
+
+(with-test (:name :if-bypass)
+  (assert-type
+   (lambda (x)
+     (declare ((or null vector) x)
+              (optimize speed))
+     (if (> (length x) 10)
+         x
+         (error "m")))
+   vector)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (evenp (if a 1 0)))
+   ((t) nil)
+   ((nil) t)))
+
+(declaim (inline inline-losing-type))
+(defun inline-losing-type (array)
+  (block nil
+    (cond ((typep array '(simple-array * (*)))
+           (return array))
+          (t (error "x")))))
+
+(with-test (:name :inline-losing-type)
+  (checked-compile-and-assert
+      ()
+      `(lambda (array)
+         (declare (type (or null array) array))
+         (aref (inline-losing-type array) 0))
+    ((#(1)) 1)))
+
+(with-test (:name :lvar-fun-type-specials)
+  (checked-compile `(lambda (y) (find t y :test *))))
+
+(with-test (:name :notinline-with-source-transforms)
+  (checked-compile `(lambda (x y z)
+                      (declare (notinline make-array))
+                      (make-array x y z))))

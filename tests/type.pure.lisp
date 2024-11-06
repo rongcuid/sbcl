@@ -305,8 +305,9 @@
                             (loop for d from c below size do
                                   (test a b c d op deriver))))))))))
 
-(with-test (:name (:type-derivation :logical-operations :scaling
-                                    :broken-on :mark-region-gc) :slow t)
+(with-test (:name (:type-derivation :logical-operations :scaling)
+            :broken-on :mark-region-gc
+            :slow t)
   (let ((type-x1 (sb-c::specifier-type `(integer ,(expt 2 10000)
                                                  ,(expt 2 10000))))
         (type-x2 (sb-c::specifier-type `(integer ,(expt 2 100000)
@@ -947,3 +948,32 @@
    (lambda (j)
      (sb-kernel:%other-pointer-p (the (and sequence (not vector)) j)))
    null))
+
+(with-test (:name :non-simple-arrays)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t) (not simple-array))))
+   ((#()) nil)
+   (((make-array 10 :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t) (not simple-array))))
+   ((#()) nil)
+   ((#2A()) nil)
+   (((make-array '(10 10) :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t 10) (not simple-array))))
+   ((#10(t)) nil)
+   (((make-array 10 :adjustable t)) t)
+   (((make-array '(2 5) :adjustable t)) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t 2) (not simple-array))))
+   ((#2A()) nil)
+   (((make-array '(2 2) :adjustable t)) t)
+   (((make-array 2 :adjustable t)) nil)))

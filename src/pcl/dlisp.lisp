@@ -73,7 +73,7 @@
     ;; of the vop operand restrictions or something that I don't understand.
     ;; Which is to say, PCL compilation reliably broke when changed to INDEX.
     (if applyp
-        (values (sb-impl::sys-tlab-append required '(&more .more-context. .more-count.))
+        (values (sys-tlab-append required '(&more .more-context. .more-count.))
                 required
                 '((sb-c:%listify-rest-args
                    .more-context. (the (and unsigned-byte fixnum)
@@ -193,7 +193,8 @@
   (let ((lambda `(lambda ,closure-variables
                    ,@(when (member 'miss-fn closure-variables)
                        `((declare (type function miss-fn))))
-                   (declare (optimize (sb-c:store-source-form 0)))
+                   (declare (optimize (sb-c:store-source-form 0)
+                                      (sb-c::store-xref-data 0)))
                    (declare (optimize (sb-c::store-closure-debug-pointer 3)))
                    #'(lambda ,args
                        (let () ; What is this LET doing?
@@ -255,8 +256,8 @@
                  `((let ((value ,read-form))
                      (return-from access (not (unbound-marker-p value))))))
                 (:makunbound
-                 `(progn (setf ,read-form +slot-unbound+)
-                         ,instance))
+                 `((progn (setf ,read-form +slot-unbound+)
+                          ,instance)))
                 (:writer
                  `((return-from access (setf ,read-form ,(car arglist)))))))
           (funcall miss-fn ,@arglist))))))

@@ -33,8 +33,8 @@
     (let ((name (uncross name)))
       (setq *undefined-warnings*
             (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
+                         (and (eq (undefined-warning-kind x) kind)
+                              (equal (undefined-warning-name x) name)))
                        *undefined-warnings*))))
   (values))
 
@@ -159,6 +159,8 @@
 ;;; the default.
 (defun undefine-fun-name (name)
   (when name
+    #-sb-xc-host
+    (sb-impl::remove-specialized-xep name)
     (macrolet ((frob (&rest types)
                  `(clear-info-values
                    name ',(mapcar (lambda (x)
@@ -322,11 +324,7 @@
     (if (eq kind 'always-bound)
         (setf (info :variable :always-bound name) info-value)
         (setf (info :variable :kind name) info-value)))
-  #-sb-xc-host (unset-symbol-progv-optimize name))
-
-#-sb-xc-host
-(defun unset-symbol-progv-optimize (symbol)
-  (reset-header-bits symbol sb-vm::+symbol-fast-bindable+))
+  #-sb-xc-host (sb-impl::unset-symbol-progv-optimize name))
 
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)

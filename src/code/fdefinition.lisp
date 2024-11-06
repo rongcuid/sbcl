@@ -17,27 +17,15 @@
 
 ;;;; fdefinition (fdefn) objects
 
-(defun make-fdefn (name)
-  #-(and x86-64 immobile-space) (make-fdefn name)
-  #+(and x86-64 immobile-space)
-  (let ((fdefn (truly-the (values fdefn &optional)
-                          (sb-vm::alloc-immobile-fdefn))))
-    (%primitive sb-vm::set-slot fdefn name 'make-fdefn
-                sb-vm:fdefn-name-slot sb-vm:other-pointer-lowtag)
-    (fdefn-makunbound fdefn)
-    fdefn))
-
-(defun undo-static-linkage (fdefn) (declare (ignore fdefn)))
-
+(declaim (ftype (sfunction (t) (or fdefn #+linkage-space symbol)) find-or-create-fdefn))
+#-linkage-space
+(progn
+(defun fset (fname fun)
+  (declare (type (or fdefn symbol list) fname))
+  (setf (fdefn-fun (if (fdefn-p fname) fname (find-or-create-fdefn fname))) fun))
 (defun (setf fdefn-fun) (fun fdefn)
-  (declare (type function fun)
-           (type fdefn fdefn))
-  (undo-static-linkage fdefn)
-  (sb-c::when-vop-existsp (:named sb-vm::set-fdefn-fun)
-    (%primitive sb-vm::set-fdefn-fun fun fdefn))
-  (sb-c::unless-vop-existsp (:named sb-vm::set-fdefn-fun)
-    (sb-vm::set-fdefn-fun fun fdefn))
-  fun)
+  (%primitive sb-vm::set-fdefn-fun fun fdefn)
+  fun))
 
 ;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
 ;;; Signal an error if name isn't valid.
@@ -46,6 +34,9 @@
 (defun find-fdefn (name)
   (declare (explicit-check))
   (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
+    ;; FDEFNs can only be created for names that aren't symbols with #+linkage-space
+    #+linkage-space (bug "FIND-FDEFN ~S" name)
+    #-linkage-space
     (let ((fdefn (sb-vm::%symbol-fdefn name))) ; slot default is 0, not NIL
       (return-from find-fdefn (if (eql fdefn 0) nil fdefn))))
   ;; Technically the ALLOW-ATOM argument of NIL isn't needed, but
@@ -104,20 +95,18 @@
                   symbol))
           (t def))))
 
-(defglobal *fdefn-of-nil* 0) ; God help you if you access this damn thing
-(declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
+#-linkage-space (define-load-time-global *fdefn-of-nil* (make-fdefn nil))
 (defun find-or-create-fdefn (name)
   (cond
     ((symbolp name)
+     #+linkage-space name
+     #-linkage-space
      (let ((fdefn (sb-vm::%symbol-fdefn name)))
-       (if (or (eq fdefn nil) (eq fdefn 0))
-           (let* ((new (make-fdefn name))
-                  (actual
-                   (if name
-                       (sb-vm::cas-symbol-fdefn name 0 new)
-                       (cas *fdefn-of-nil* 0 new))))
-             (if (eql actual 0) new (the fdefn actual)))
-           fdefn)))
+       (cond ((and fdefn (neq fdefn 0)) fdefn)
+             ((null name) *fdefn-of-nil*)
+             (t (let* ((new (make-fdefn name))
+                       (actual (sb-vm::cas-symbol-fdefn name 0 new)))
+                  (if (eql actual 0) new (the fdefn actual)))))))
     ((find-fdefn name))
     (t
       ;; We won't reach here if the name was not legal
@@ -220,7 +209,8 @@
                                (:copier nil))
   (type nil :type symbol)
   ;; the underlying definition prior to getting wrapped in a closure
-  (definition nil :type function))
+  (definition nil :type function)
+  (specialized-xep nil :type (or null function)))
 (declaim (freeze-type encapsulation-info))
 
 ;;; Find the encapsulation info that has been closed over.
@@ -270,14 +260,22 @@
       (when existing
         (setf underlying-fun (encapsulation-info-definition existing)))
       (let* ((info (make-encapsulation-info type underlying-fun))
+             (specialized-xep (info :function :specialized-xep name))
              (closure (named-lambda encapsulation (&rest args)
                         (apply function (encapsulation-info-definition info)
                                args))))
+        (when specialized-xep
+          (let* ((xep-name
+                   `(specialized-xep ,name ,@specialized-xep))
+                 (xep-fun (name->fun xep-name)))
+            (when xep-fun
+              (setf (encapsulation-info-specialized-xep info) xep-fun)
+              (remove-specialized-xep name nil))))
         (if predecessor
             ;; Become the successor of the existing predecessor
             (setf (encapsulation-info-definition predecessor) closure)
             ;; Was first in chain or didn't exist
-            (setf (fdefn-fun (find-fdefn name)) closure))))))
+            (fset name closure))))))
 
 (defun unencapsulate (name type)
   "Removes NAME's encapsulation of the specified TYPE if such exists."
@@ -286,11 +284,14 @@
         (unencapsulate-generic-function fun type)
         (multiple-value-bind (existing predecessor) (has-encap fun type)
           (when existing
-            (let ((next (encapsulation-info-definition existing)))
+            (let* ((next (encapsulation-info-definition existing))
+                   (specialized-xep (encapsulation-info-specialized-xep existing)))
               (if predecessor
                   (setf (encapsulation-info-definition predecessor) next)
                   ;; It's the first one, so change the fdefn object.
-                  (setf (fdefn-fun (find-fdefn name)) next)))))))))
+                  (fset name next))
+              (when specialized-xep
+                (fset (%fun-name specialized-xep) specialized-xep)))))))))
 
 
 ;;;; FDEFINITION
@@ -352,8 +353,20 @@
            :format-control "~S is not acceptable to ~S."
            :format-arguments (list object setter))))
 
-(defun (setf fdefinition) (new-value name)
-  "Set NAME's global function definition."
+(defun remove-specialized-xep (name &optional (clear-info t))
+  (let ((xep (info :function :specialized-xep name)))
+    (when xep
+      (let* ((xep-name
+               `(specialized-xep ,name ,@xep))
+             (fdefn (find-fdefn xep-name)))
+        (when fdefn
+          (fset fdefn
+                (compile nil (make-specialized-xep-stub name xep xep-name))))
+        (when clear-info
+          (clear-info :function :specialized-xep name)
+          (undefine-fun-name xep-name))))))
+
+(defun setf-fdefinition (new-value name clear-specialized-xep)
   (declare (type function new-value) (optimize (safety 1)))
   (declare (explicit-check))
   (err-if-unacceptable-function new-value '(setf fdefinition))
@@ -366,46 +379,55 @@
     (when (symbolp name)
       (let ((old (%symbol-function name)))
         (dolist (spec *user-hash-table-tests*)
-            (cond ((eq old (second spec))
-                   ;; test-function
-                   (setf (second spec) new-value))
-                  ((eq old (third spec))
-                   ;; hash-function
-                   (setf (third spec) new-value))))))
+          (cond ((eq old (second spec))
+                 ;; test-function
+                 (setf (second spec) new-value))
+                ((eq old (third spec))
+                 ;; hash-function
+                 (setf (third spec) new-value))))))
 
     (let ((fdefn (find-or-create-fdefn name)))
       (dolist (f *setf-fdefinition-hook*)
         (declare (type function f))
         (funcall f name new-value))
+      (when clear-specialized-xep
+        (remove-specialized-xep name))
+      ;; fdefn may be a symbol if #+linkage-space. fdefn-fun vop is fine with that
       (let ((encap-info (encapsulation-info (fdefn-fun fdefn))))
         (cond (encap-info
                (loop
                 (let ((more-info
-                       (encapsulation-info
-                        (encapsulation-info-definition encap-info))))
+                        (encapsulation-info
+                         (encapsulation-info-definition encap-info))))
                   (if more-info
                       (setf encap-info more-info)
                       (return (setf (encapsulation-info-definition encap-info)
                                     new-value))))))
               (t
-               (setf (fdefn-fun fdefn) new-value)))))))
+               (fset fdefn new-value)))))))
+
+(defun (setf fdefinition) (new-value name)
+  "Set NAME's global function definition."
+  (declare (type function new-value) (optimize (safety 1)))
+  (declare (explicit-check))
+  (setf-fdefinition new-value name t))
 
 ;;;; FBOUNDP and FMAKUNBOUND
 
 (defun fboundp (name)
   "Return true if name has a global function definition."
   (declare (explicit-check))
-  (awhen (find-fdefn name) (fdefn-fun it)))
+  #+linkage-space (fdefn-fun (if (symbolp name) name (find-fdefn name)))
+  #-linkage-space (awhen (find-fdefn name) (fdefn-fun it)))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
   (declare (explicit-check))
   (with-single-package-locked-error
       (:symbol name "removing the function or macro definition of ~A")
-    (let ((fdefn (find-fdefn name)))
-      (when fdefn
-        (undo-static-linkage fdefn)
-        (fdefn-makunbound fdefn)))
+    #+linkage-space (acond ((symbolp name) (fset name 0))
+                           ((find-fdefn name) (fset it 0)))
+    #-linkage-space (awhen (find-fdefn name) (fdefn-makunbound it))
     (undefine-fun-name name)
     name))
 

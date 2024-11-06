@@ -30,7 +30,6 @@
  * These values can be anything - they just have to be compatible between C and Lisp.
  * Lisp uses NULL-TN to set pseudo-atomic and THREAD-TN to clear it. */
 # define get_pseudo_atomic_atomic(th) (th)->pseudo_atomic_bits[0] != 0
-# define set_pseudo_atomic_atomic(th) (th)->pseudo_atomic_bits[0] = 1
 # define clear_pseudo_atomic_atomic(th) (th)->pseudo_atomic_bits[0] = 0
 // A 2-byte field allows for 'lhz' followed by 'twi'
 # define get_pseudo_atomic_interrupted(th) (th)->pseudo_atomic_bits[2] != 0
@@ -52,8 +51,6 @@
 
 #define get_pseudo_atomic_atomic(thread) \
     ((thread)->pseudo_atomic_bits & flag_PseudoAtomic)
-#define set_pseudo_atomic_atomic(thread) \
-    ((thread)->pseudo_atomic_bits |= flag_PseudoAtomic)
 #define clear_pseudo_atomic_atomic(thread) \
     ((thread)->pseudo_atomic_bits &= ~flag_PseudoAtomic)
 #define get_pseudo_atomic_interrupted(thread) \
@@ -69,12 +66,6 @@ static inline int
 get_pseudo_atomic_atomic(struct thread *thread)
 {
     return SymbolValue(PSEUDO_ATOMIC_ATOMIC, thread) != NIL;
-}
-
-static inline void
-set_pseudo_atomic_atomic(struct thread *thread)
-{
-    SetSymbolValue(PSEUDO_ATOMIC_ATOMIC, PSEUDO_ATOMIC_ATOMIC, thread);
 }
 
 static inline void
@@ -111,23 +102,17 @@ clear_pseudo_atomic_interrupted(struct thread *thread)
 
 /* x86 uses either a thread slot, or a single static symbol holding
  * the same value as the thread slot would hold.
- * The encoding of the values is strange - the entire word is onzero
- * whend pseudo-atomic, and the lowest bit should be 0.
+ * The encoding of the values is strange - the entire word is nonzero
+ * when pseudo-atomic, and the lowest bit should be 0.
  * If interrupted, the low bit becomes 1. This seems a little bogus because
  * symbol->value at that point can have "illegal" bits (non-descriptor).
  * I guess the reason it's allowed is GC can't ever see the bad value.
  * But it sure seems like it's asking for trouble */
 
-#ifdef LISP_FEATURE_X86_64
-# define LISPOBJ_ASM_SUFFIX "q"
-#else
-# define LISPOBJ_ASM_SUFFIX "l"
-#endif
-
-#ifdef LISP_FEATURE_SB_THREAD
-# define pa_bits thread->pseudo_atomic_bits
-#else
+#if defined LISP_FEATURE_X86 && !defined LISP_FEATURE_SB_THREAD
 # define pa_bits SYMBOL(PSEUDO_ATOMIC_BITS)->value
+#else
+# define pa_bits thread->pseudo_atomic_bits
 #endif
 
 #include "interr.h" // for lose()
@@ -139,19 +124,10 @@ get_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
     return (pa_bits & ~1) != 0;
 }
 
-// FIXME: all this seems unnecessary use of inline assembly
-
-static inline void
-set_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
-{
-    if (pa_bits) lose("set_pseudo_atomic_atomic: bits=%"OBJ_FMTX, pa_bits);
-    __asm__ volatile ("or" LISPOBJ_ASM_SUFFIX " $~1, %0" : "+m" (pa_bits));
-}
-
 static inline void
 clear_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
 {
-    __asm__ volatile ("and" LISPOBJ_ASM_SUFFIX " $1, %0" : "+m" (pa_bits));
+    __sync_fetch_and_and(&(pa_bits), 1); // leave the "interrupted" bit intact
 }
 
 static inline int
@@ -165,7 +141,7 @@ set_pseudo_atomic_interrupted(struct thread *thread)
 {
     if (!get_pseudo_atomic_atomic(thread))
         lose("set_pseudo_atomic_interrupted not in pseudo atomic");
-    __asm__ volatile ("or" LISPOBJ_ASM_SUFFIX " $1, %0" : "+m" (pa_bits));
+    __sync_fetch_and_or(&(pa_bits), 1);
 }
 
 static inline void
@@ -173,10 +149,9 @@ clear_pseudo_atomic_interrupted(struct thread *thread)
 {
     if (get_pseudo_atomic_atomic(thread))
         lose("clear_pseudo_atomic_interrupted in pseudo atomic");
-    __asm__ volatile ("and" LISPOBJ_ASM_SUFFIX " $~1, %0" : "+m" (pa_bits));
+    __sync_fetch_and_and(&(pa_bits), ~(uword_t)1);
 }
 #undef pa_bits
-#undef LISPOBJ_ASM_SUFFIX
 
 #else
 

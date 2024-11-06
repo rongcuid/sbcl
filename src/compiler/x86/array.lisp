@@ -71,19 +71,7 @@
   (:arg-types * (:constant t))
   (:conditional :e)
   (:generator 2
-    (inst cmp (make-ea :byte :disp rank-disp :base array) (encode-array-rank rank))))
-
-(define-vop (array-vectorp simple-type-predicate)
-  ;; SIMPLE-TYPE-PREDICATE says that it takes stack locations, but that's no good.
-  (:args (array :scs (any-reg descriptor-reg)))
-  (:translate vectorp)
-  (:conditional :z)
-  (:info)
-  (:guard (lambda (node)
-            (let ((arg (car (sb-c::combination-args node))))
-              (csubtypep (sb-c::lvar-type arg) (specifier-type 'array)))))
-  (:generator 1
-    (inst cmp (make-ea :byte :disp rank-disp :base array) (encode-array-rank 1)))))
+    (inst cmp (make-ea :byte :disp rank-disp :base array) (encode-array-rank rank)))))
 
 
 (defun power-of-two-limit-p (x)
@@ -254,10 +242,10 @@
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector dvref)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg)))
+         (index :scs (signed-reg unsigned-reg)))
   (:info addend)
   (:ignore addend)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
   (:results (result :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 4
@@ -275,10 +263,10 @@
       ,@(unless (= bits 1)
        `((define-vop (,(symbolicate 'data-vector-ref-with-offset/ type) dvref)
          (:args (object :scs (descriptor-reg))
-                (index :scs (unsigned-reg)))
+                (index :scs (signed-reg unsigned-reg)))
          (:info addend)
          (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0)))
+         (:arg-types ,type tagged-num (:constant (integer 0 0)))
          (:results (result :scs (unsigned-reg) :from (:argument 0)))
          (:result-types positive-fixnum)
          (:temporary (:sc unsigned-reg :offset ecx-offset) ecx)
@@ -314,11 +302,11 @@
                (inst and result ,(1- (ash 1 bits)))))))))
        (define-vop (,(symbolicate 'data-vector-set-with-offset/ type) dvset)
          (:args (object :scs (descriptor-reg) :to (:argument 2))
-                (index :scs (unsigned-reg) :target ecx)
+                (index :scs (signed-reg unsigned-reg) :target ecx)
                 (value :scs (unsigned-reg immediate)))
          (:info addend)
          (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0))
+         (:arg-types ,type tagged-num (:constant (integer 0 0))
                      positive-fixnum)
          (:temporary (:sc unsigned-reg) word-index)
          (:temporary (:sc unsigned-reg) old)

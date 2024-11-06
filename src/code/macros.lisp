@@ -113,7 +113,42 @@ tree structure resulting from the evaluation of EXPRESSION."
               entry-points
               (not (member name entry-points :test #'equal))))))
 
-(flet ((defun-expander (env name lambda-list body snippet &optional source-form)
+(defun specialized-xep-for-type-p (lambda-list name)
+  (let ((type (info :function :type name)))
+    (and #-(or arm64 x86-64) nil
+         (fun-type-p type)
+         (eq (info :function :where-from name) :declared)
+         (not (or (fun-type-optional type)
+                  (fun-type-keyp type)
+                  (fun-type-rest type)))
+         (multiple-value-bind (llks required) (parse-lambda-list lambda-list)
+           (and (zerop llks)
+                (= (length required)
+                   (length (fun-type-required type)))))
+         (or (loop for arg in (fun-type-required type)
+                   thereis (csubtypep arg (specifier-type 'double-float)))
+             (let ((return (fun-type-returns type)))
+               (and (values-type-p return)
+                    (not (or (values-type-optional return)
+                             (values-type-rest return)))
+                    (loop for value in (values-type-required return)
+                          thereis (csubtypep value (specifier-type 'double-float))))))
+         (cdr (type-specifier type)))))
+
+(defun make-specialized-xep-stub (name specialized
+                                  &optional (xep-name
+                                             `(specialized-xep ,name ,@specialized)))
+  (let ((vars (loop for arg in (car specialized)
+                    for i from 0
+                    collect (make-symbol (format nil "A~a" i)))))
+    (values
+     `(named-lambda ,xep-name ,vars
+        (declare (notinline ,name)
+                 (muffle-conditions warning))
+        (funcall ',name ,@vars))
+     xep-name)))
+
+(flet ((defun-expander (env name lambda-list body snippet &optional source-form always-store-source-form)
   (multiple-value-bind (forms decls doc) (parse-body body t)
     ;; Maybe kill docstring, but only under the cross-compiler.
     #+(and (not sb-doc) sb-xc-host) (setq doc nil)
@@ -138,7 +173,11 @@ tree structure resulting from the evaluation of EXPRESSION."
                            #-sb-xc-host sb-c:maybe-compiler-notify
                            "lexical environment too hairy, can't inline DEFUN ~S"
                            name)
-                          nil))))))
+                          nil)))))
+           (specialized-xep (and (not (or inline-thing
+                                          (info :function :info name)
+                                          (eq (info :function :inlinep name) 'notinline)))
+                                 (specialized-xep-for-type-p lambda-list name))))
       (when (and (eq snippet :constructor)
                  (not (typep inline-thing '(cons (eql sb-c:lambda-with-lexenv)))))
         ;; constructor in null lexenv need not save the expansion
@@ -147,29 +186,59 @@ tree structure resulting from the evaluation of EXPRESSION."
         (setq inline-thing (list 'quote inline-thing)))
       (when (and extra-info (not (keywordp extra-info)))
         (setq extra-info (list 'quote extra-info)))
-      (let ((definition
-              (if (block-compilation-non-entry-point name)
-                  `(progn
-                     (sb-c::%refless-defun ,named-lambda)
-                     ',name)
-                  `(%defun ',name ,named-lambda
-                           ,@(when (or inline-thing extra-info) `(,inline-thing))
-                           ,@(when extra-info `(,extra-info))))))
-       `(progn
-          (eval-when (:compile-toplevel)
-            (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
-          ,(if source-form
-               `(sb-c::with-source-form ,source-form ,definition)
-               definition)
-          ;; This warning, if produced, comes after the DEFUN happens.
-          ;; When compiling, there's no real difference, but when interpreting,
-          ;; if there is a handler for style-warning that nonlocally exits,
-          ;; it's wrong to have skipped the DEFUN itself, since if there is no
-          ;; function, then the warning ought not to have been issued at all.
-          ,@(when (typep name '(cons (eql setf)))
-              `((eval-when (:compile-toplevel :execute)
-                  (sb-c::warn-if-setf-macro ',name))
-                ',name))))))))
+      `(progn
+         ,@(let ((existing-specialized-xep (info :function :specialized-xep name)))
+             (if (and existing-specialized-xep
+                      (not (equal existing-specialized-xep specialized-xep)))
+                 (multiple-value-bind (xep xep-name)
+                     (make-specialized-xep-stub name existing-specialized-xep)
+                   `((progn
+                       (eval-when (:compile-toplevel)
+                         (clear-info :function :specialized-xep ',name))
+                       (when (fdefinition ',xep-name)
+                         (setf (fdefinition ',xep-name) ,xep)))))))
+         ,@(if specialized-xep
+               (let ((xep-name `(specialized-xep ,name ,@specialized-xep)))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t nil nil ',specialized-xep))
+                    (let ((xep (named-lambda ,xep-name ,(third named-lambda)
+                                 (declare (sb-c::source-form ,source-form))
+                                 ,@(cdddr named-lambda))))
+                      (sb-impl::%defun-specialized-xep
+                       ',name
+                       (named-lambda ,name ,lambda-list
+                         ,@(when *top-level-form-p* '((declare (sb-c::top-level-form))))
+                         (declare (muffle-conditions compiler-note))
+                         ,@(when doc (list doc))
+                         (multiple-value-prog1
+                             (funcall xep ,@lambda-list)
+                           ;; Avoid tail calls for unboxed returns.
+                           (values)))
+                       xep
+                       ',specialized-xep))))
+               (let ((definition
+                       (if (block-compilation-non-entry-point name)
+                           `(progn
+                              (sb-c::%refless-defun ,named-lambda)
+                              ',name)
+                           `(%defun ',name ,named-lambda
+                                    ,@(when (or inline-thing extra-info) `(,inline-thing))
+                                    ,@(when extra-info `(,extra-info))))))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
+                   ,(if (and source-form
+                             always-store-source-form)
+                        `(sb-c::with-source-form ,source-form ,definition)
+                        definition)
+                   ;; This warning, if produced, comes after the DEFUN happens.
+                   ;; When compiling, there's no real difference, but when interpreting,
+                   ;; if there is a handler for style-warning that nonlocally exits,
+                   ;; it's wrong to have skipped the DEFUN itself, since if there is no
+                   ;; function, then the warning ought not to have been issued at all.
+                   ,@(when (typep name '(cons (eql setf)))
+                       `((eval-when (:compile-toplevel :execute)
+                           (sb-c::warn-if-setf-macro ',name))
+                         ',name))))))))))
 
 ;;; This is one of the major places where the semantics of block
 ;;; compilation is handled. Substitution for global names is totally
@@ -177,17 +246,17 @@ tree structure resulting from the evaluation of EXPRESSION."
 ;;; (block-compile *compilation*) is true and entry points are
 ;;; specified, then we don't install global definitions for non-entry
 ;;; functions (effectively turning them into local lexical functions.)
-  (sb-xc:defmacro defun (&environment env name lambda-list &body body)
+  (sb-xc:defmacro defun (&whole whole &environment env name lambda-list &body body)
     "Define a function at top level."
     (check-designator name 'defun #'legal-fun-name-p "function name")
     #+sb-xc-host
     (unless (cl:symbol-package (fun-name-block-name name))
       (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
-    (defun-expander env name lambda-list body nil))
+    (defun-expander env name lambda-list body nil whole))
 
   ;; extended defun as used by defstruct
   (sb-xc:defmacro sb-c:xdefun (&environment env name snippet source-form lambda-list &body body)
-    (defun-expander env name lambda-list body snippet source-form)))
+    (defun-expander env name lambda-list body snippet source-form t)))
 
 ;;;; DEFCONSTANT, DEFVAR and DEFPARAMETER
 
@@ -283,7 +352,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   ;; Deoptimize after changing it to :CONSTANT, and not before, though tbh
   ;; if your code cares about the timing of PROGV relative to DEFCONSTANT,
   ;; well, I can't even.
-  #-sb-xc-host (sb-c::unset-symbol-progv-optimize name)
+  #-sb-xc-host (unset-symbol-progv-optimize name)
   name)
 
 (sb-xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
@@ -671,11 +740,12 @@ invoked. In that case it will store into PLACE and start over."
                     (type-specifier ctype)
                     type))))
     (if (symbolp expanded)
-        `(do ()
-             ((typep ,place ',type))
-           (setf ,place (check-type-error ',place ,place ',type
-                                          ,@(and type-string
-                                                 `(,type-string)))))
+        `(unless (typep ,place ',type)
+           (setf ,place
+                 ,(if type-string
+                      `(check-type-error-trap '(,place . ,type) ,place (the string ,type-string))
+                      `(check-type-error-trap ',place ,place ',type)))
+           nil)
         (let ((value (gensym)))
           `(do ((,value ,place ,place))
                ((typep ,value ',type))
@@ -1093,9 +1163,7 @@ invoked. In that case it will store into PLACE and start over."
                      ;; - if ERRORP is non-nil, though this isn't technically an "otherwise"
                      ;;   clause, in acts just like one.
                      (if errorp
-                         (setq errorp :none)
-                         (style-warn "T clause in ~S makes subsequent clauses unreachable:~%~S"
-                                     name specified-clauses)))
+                         (setq errorp :none)))
                    (when case-clauses ; try the TYPECASE into CASE reduction
                      (let ((typespec (ignore-errors (typexpand keyoid))))
                        (cond ((typep typespec '(cons (eql member) (satisfies proper-list-p)))
@@ -1124,7 +1192,30 @@ invoked. In that case it will store into PLACE and start over."
                               (unless (member (car tail) (cdr tail))
                                 (list (car tail))))
                             keys)))
-
+    (when (eq test 'typep)
+      (let (types)
+        (loop for key in keys
+              for clause in specified-clauses
+              do
+              (with-current-source-form (clause)
+                (let ((type (specifier-type key)))
+                  (when (and type
+                             (neq type *empty-type*))
+                    (let ((existing (loop for (prev . spec) in types
+                                          when (and (csubtypep type prev)
+                                                    (not (or (and (eq prev (specifier-type 'single-float))
+                                                                  (eq key 'short-float))
+                                                             #-long-float
+                                                             (and (eq prev (specifier-type 'double-float))
+                                                                  (eq key 'long-float))
+                                                             (and (csubtypep type (specifier-type 'array))
+                                                                  ;; Ignore due to upgrading
+                                                                  (sb-kernel::ctype-array-any-specialization-p prev)))))
+                                          return spec)))
+                      (if existing
+                          (style-warn "Clause ~s is shadowed by ~s"
+                                      key existing)
+                          (push (cons type key) types)))))))))
     ;; Try hash-based dispatch only if expanding for the compiler
     (when (and (neq errorp 'cerror)
                (sb-c::compiling-p lexenv)
@@ -1203,7 +1294,9 @@ invoked. In that case it will store into PLACE and start over."
           ;;    is /type equivalent/ to (or type1 type2 ...)"
           (when (symbolp unparsed)
             (return-from etypecase-error-spec `',unparsed))))))
-  `',types)
+  ;; This constant can make its way into generic function dispatch.
+  ;; The compiled code must not to point to an arena if one is active.
+  `',(ensure-heap-list types))
 
 (sb-xc:defmacro case (&whole form &environment env &rest r)
   (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
@@ -1370,6 +1463,58 @@ invoked. In that case it will store into PLACE and start over."
        (declare (type unsigned-byte ,var))
        ,@body)))
 
+(defun segregate-dolist-decls (var decls)
+  (collect ((bound-type-decls)
+            (bound-nontype-decls)
+            (free-decls))
+    (dolist (decl decls)
+      (aver (eq (car decl) 'declare))
+      (dolist (expr (cdr decl))
+        (let ((head (car expr))
+              (tail (cdr expr)))
+          (cond ((consp head) ; compound type specifier
+                 (when (member var tail) (bound-type-decls head))
+                 (awhen (remove var tail) (free-decls `(,head ,@it))))
+                ((not (symbolp head)) (free-decls expr)) ; bogus
+                (t
+                 (case head
+                   ((special dynamic-extent)
+                    ;; dynamic-extent makes no sense but this logic has to correctly
+                    ;; recognize all the standard atoms that DECLARE accepts.
+                    (when (member var tail) (bound-nontype-decls `(,head ,var)))
+                    (awhen (remove var tail) (free-decls `(,head ,@it))))
+                   (type
+                    (when (member var (cdr tail)) (bound-type-decls (cadr expr)))
+                    (awhen (remove var (cdr tail)) (free-decls `(type ,(cadr expr) ,@it))))
+                   ((ignore ignorable)
+                    (awhen (remove var tail) (free-decls `(,head ,@it))))
+                   ((optimize ftype inline notinline maybe-inline
+                     muffle-conditions unmuffle-conditions)
+                    (free-decls expr))
+                   (t
+                    ;; Assume that any decl pertaining to bindings must have the symbol appear
+                    ;; in TAIL. Is this true of custom decls? I would certainly think so.
+                    (cond ((not (member var tail)) (free-decls expr))
+                          ((info :declaration :known head)
+                           ;; Declaimed declaration can't be a type decl.
+                           (bound-nontype-decls expr))
+                          ((not (sb-c::careful-specifier-type head))
+                           ;; If can't be parsed, then what is it? A free decl is as good as anything
+                           (free-decls expr))
+                          ((contains-unknown-type-p (sb-c::careful-specifier-type head))
+                           ;; Stuff it into bound-nontype decls which is no worse
+                           ;; than what FILTER-DOLIST-DECLARATIONS could do.
+                           (bound-nontype-decls expr))
+                          (t
+                           ;; A valid type declaration can pertain to some non-bound vars and/or
+                           ;; the bound var, nicely handling (STRING x y iterationvar).
+                           (when (member var tail) (bound-type-decls head))
+                           (awhen (remove var tail) (free-decls `(,head ,@it))))))))))))
+    (values (mapcar (lambda (x) `(type ,x ,var)) (bound-type-decls))
+            (mapcar (lambda (x) `(type (or null ,x) ,var)) (bound-type-decls))
+            (bound-nontype-decls)
+            (free-decls))))
+
 (sb-xc:defmacro dolist ((var list &optional (result nil)) &body body &environment env)
   ;; We repeatedly bind the var instead of setting it so that we never
   ;; have to give the var an arbitrary value such as NIL (which might
@@ -1380,6 +1525,8 @@ invoked. In that case it will store into PLACE and start over."
   ;; since we don't want to use IGNORABLE on what might be a special
   ;; var.
   (binding* (((forms decls) (parse-body body nil))
+             ((iter-type-decl res-type-decl other-decl free-decl)
+              (segregate-dolist-decls var decls))
              (n-list (gensym "LIST"))
              (start (gensym "START"))
              ((clist members clist-ok)
@@ -1409,27 +1556,23 @@ invoked. In that case it will store into PLACE and start over."
                            ;; But it doesn't detect the mismatch because the SETF
                            ;; mixes in T with the initial type.
                            `(the* (list :use-annotations t :source-form ,list) ,list))))
+         ,@(when free-decl `((declare ,@free-decl)))
          (tagbody
             ,start
             (unless (endp ,n-list)
               (let ((,var ,(if clist-ok
                                `(truly-the (member ,@members) (car ,n-list))
                                `(car ,n-list))))
-                (declare (ignorable ,var))
-                ,@decls
+                (declare ,@iter-type-decl ,@other-decl (ignorable ,var))
                 (setq ,n-list (cdr ,n-list))
                 (tagbody ,@forms))
-              (go ,start))))
-       ,(if result
-            `(let ((,var nil))
-               ;; Filter out TYPE declarations (VAR gets bound to NIL,
-               ;; and might have a conflicting type declaration) and
-               ;; IGNORE (VAR might be ignored in the loop body, but
-               ;; it's used in the result form).
-               ,@(filter-dolist-declarations decls)
+              (go ,start)))
+         ;; still within the scope of decls pertinent to other than the VAR binding
+         ,@(when result
+            `((let ((,var nil))
+               ,@(if (or res-type-decl other-decl) `((declare ,@res-type-decl ,@other-decl)))
                ,var
-               ,result)
-            nil))))
+               ,result)))))))
 
 
 ;;;; Miscellaneous macros:

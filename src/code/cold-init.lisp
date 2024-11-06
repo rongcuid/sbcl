@@ -155,9 +155,7 @@
   ;; this to be initialized, so we initialize it right away.
   (show-and-call !random-cold-init)
 
-  ;; We can't do such much as a simple PROCLAIM without this global
-  ;; hash-table (because of WARN-IF-INLINE-FAILED/PROCLAIM)
-  (setf sb-c::*emitted-full-calls* (make-hash-table :test 'equal :synchronized t))
+  (setq sb-c::*compilation-unit* nil) ; its DEFVAR is not processed yet
 
   ;; All sorts of things need INFO and/or (SETF INFO).
   (/show0 "about to SHOW-AND-CALL !GLOBALDB-COLD-INIT")
@@ -168,10 +166,14 @@
   ;; And now *CURRENT-THREAD*
   (sb-thread::init-main-thread)
 
+  (show-and-call !hash-table-cold-init)
+
   ;; not sure why this is needed on some architectures. Dark magic.
+  #-linkage-space
   (setf (fdefn-fun (find-or-create-fdefn '%coerce-callable-for-call))
         #'%coerce-callable-to-fun)
   (show-and-call !loader-cold-init)
+  #+linkage-space (show-and-call sb-vm::!initialize-lisp-linkage-table)
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
   ;; It was fine if T because in that case the legality of the arg is certain.
   ;; And be extra paranoid - ensure that it really gets called.

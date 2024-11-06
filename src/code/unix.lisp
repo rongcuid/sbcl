@@ -73,18 +73,21 @@
                  (subseq x 3)
                  x)))
 
-(defmacro syscall ((name &rest arg-types) success-form &rest args)
+(defmacro syscall-type ((name return-type &rest arg-types) success-form &rest args)
   (when (eql 3 (mismatch "[_]" name))
     (setf name
           (concatenate 'string #+win32 "_" (subseq name 3))))
   `(locally
-    (declare (optimize (sb-c::float-accuracy 0)))
-    (let ((result (alien-funcall (extern-alien ,(libc-name-for name)
-                                               (function int ,@arg-types))
-                                ,@args)))
-      (if (minusp result)
-          (values nil (get-errno))
-          ,success-form))))
+       (declare (optimize (sb-c::float-accuracy 0)))
+     (let ((result (alien-funcall (extern-alien ,(libc-name-for name)
+                                                (function ,return-type ,@arg-types))
+                                  ,@args)))
+       (if (minusp result)
+           (values nil (get-errno))
+           ,success-form))))
+
+(defmacro syscall ((name &rest arg-types) success-form &rest args)
+  `(syscall-type (,name int ,@arg-types) ,success-form ,@args))
 
 ;;; This is like SYSCALL, but if it fails, signal an error instead of
 ;;; returning error codes. Should only be used for syscalls that will
@@ -101,6 +104,9 @@
 
 (defmacro int-syscall ((name &rest arg-types) &rest args)
   `(syscall (,(libc-name-for name) ,@arg-types) (values result 0) ,@args))
+
+(defmacro type-syscall ((name return-type &rest arg-types) &rest args)
+  `(syscall-type (,(libc-name-for name) ,return-type ,@arg-types) (values result 0) ,@args))
 
 (defmacro with-restarted-syscall ((&optional (value (gensym))
                                              (errno (gensym)))
@@ -320,9 +326,14 @@ corresponds to NAME, or NIL if there is none."
 
 (defun unix-read (fd buf len)
   (declare (type unix-fd fd)
-           (type (unsigned-byte 32) len))
-  (int-syscall (#-win32 "read" #+win32 "win32_unix_read"
-                int (* char) int) fd buf len))
+           (type index len))
+  (type-syscall (#-win32 "read" #+win32 "win32_unix_read"
+                 ssize-t
+                 int (* char) size-t)
+                fd buf
+                (min len
+                     #+(or darwin freebsd)
+                     (1- (expt 2 31)))))
 
 ;;; UNIX-WRITE accepts a file descriptor, a buffer, an offset, and the
 ;;; length to write. It attempts to write len bytes to the device
@@ -334,15 +345,17 @@ corresponds to NAME, or NIL if there is none."
   ;; full calls to SB-ALIEN-INTERNALS:DEPORT-ALLOC and DEPORT.
   (declare (optimize (debug 1)))
   (declare (type unix-fd fd)
-           (type (unsigned-byte 32) offset len))
+           (type index offset len))
   (flet ((%write (sap)
            (declare (system-area-pointer sap))
-           (int-syscall (#-win32 "write" #+win32 "win32_unix_write"
-                         int (* char) int)
-                        fd
-                        (with-alien ((ptr (* char) sap))
-                          (addr (deref ptr offset)))
-                        len)))
+           (type-syscall (#-win32 "write" #+win32 "win32_unix_write"
+                          ssize-t int (* char) size-t)
+                         fd
+                         (with-alien ((ptr (* char) sap))
+                           (addr (deref ptr offset)))
+                         (min len
+                              #+(or darwin freebsd)
+                              (1- (expt 2 31))))))
     (etypecase buf
       ((simple-array * (*))
        (with-pinned-objects (buf)
@@ -633,15 +646,21 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
       (note-dangerous-wait "poll(2)"))
     (let ((events (ecase direction
                     (:input (logior pollin pollpri))
-                    (:output pollout))))
+                    (:output pollout)))
+          (deadline (if (minusp to-msec)
+                        to-msec
+                        (+ (* (get-universal-time) 1000) to-msec))))
       (with-alien ((fds (struct pollfd)))
         (with-restarted-syscall (count errno)
-          (progn
+          (let ((timeout (if (minusp to-msec)
+                             -1
+                             (max 0 (- deadline (* 1000 (get-universal-time)))))))
+            (declare (fixnum timeout))
             (setf (slot fds 'fd) fd
                   (slot fds 'events) events
                   (slot fds 'revents) 0)
             (int-syscall ("poll" (* (struct pollfd)) int int)
-                         (addr fds) 1 to-msec))
+                         (addr fds) 1 timeout))
           (if (zerop errno)
               (let ((revents (slot fds 'revents)))
                 (or (and (eql 1 count) (logtest events revents))
@@ -713,29 +732,34 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 #-os-provides-poll
 (defun unix-simple-poll (fd direction to-msec)
-  (multiple-value-bind (to-sec to-usec)
-      (if (minusp to-msec)
-          (values nil nil)
-          (multiple-value-bind (to-sec to-msec2) (truncate to-msec 1000)
-            (values to-sec (* to-msec2 1000))))
-    (with-restarted-syscall (count errno)
-      (with-alien ((fds (struct fd-set)))
-        (fd-zero fds)
-        (fd-set fd fds)
-        (multiple-value-bind (read-fds write-fds)
-            (ecase direction
-              (:input
-               (values (addr fds) nil))
-              (:output
-               (values nil (addr fds))))
-          (unix-fast-select (1+ fd)
-                                    read-fds write-fds nil
-                                    to-sec to-usec)))
-      (case count
-        ((1) t)
-        ((0) nil)
-        (otherwise
-         (error "Syscall select(2) failed on fd ~D: ~A" fd (strerror)))))))
+  (flet ((msec-to-sec-usec (msec)
+           (multiple-value-bind (sec msec2) (truncate msec 1000)
+             (values sec (* msec2 1000)))))
+    (let ((deadline (if (minusp to-msec)
+                        to-msec
+                        (+ (* (get-universal-time) 1000) to-msec))))
+      (with-restarted-syscall (count errno)
+        (with-alien ((fds (struct fd-set)))
+          (fd-zero fds)
+          (fd-set fd fds)
+          (multiple-value-bind (to-sec to-usec)
+              (if (minusp to-msec)
+                  (values nil nil)
+                  (msec-to-sec-usec (max 0 (- deadline (* 1000 (get-universal-time))))))
+            (multiple-value-bind (read-fds write-fds)
+                (ecase direction
+                  (:input
+                   (values (addr fds) nil))
+                  (:output
+                   (values nil (addr fds))))
+              (unix-fast-select (1+ fd)
+                                read-fds write-fds nil
+                                to-sec to-usec))))
+        (case count
+          ((1) t)
+          ((0) nil)
+          (otherwise
+           (error "Syscall select(2) failed on fd ~D: ~A" fd (strerror))))))))
 
 ;;;; sys/stat.h
 
@@ -891,15 +915,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
   (alien-funcall (extern-alien "sb_nanosleep_float" (function (values) float))
                  seconds)
   nil)
-
-;;;; sys/time.h
-
-;;; Structure crudely representing a timezone. KLUDGE: This is
-;;; obsolete and should never be used.
-(define-alien-type nil
-  (struct timezone
-    (tz-minuteswest int)                ; minutes west of Greenwich
-    (tz-dsttime int)))                  ; type of dst correction
 
 
 ;; Type of the second argument to `getitimer' and

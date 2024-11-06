@@ -310,6 +310,7 @@
 ;;;; DEBUG-INFO structures
 
 (def!struct (debug-info
+             (:constructor nil)
              (:copier nil))
   ;; Some string describing something about the code in this component.
   (name (missing-arg) :type t :read-only t)
@@ -319,6 +320,8 @@
 
 (def!struct (compiled-debug-info
              (:include debug-info)
+             (:constructor !make-compiled-debug-info
+                           (name package fun-map contexts rest))
              (:copier nil)
              (:pure t))
   ;; The package that DEBUG-FUN-VARS were dumped relative
@@ -337,7 +340,8 @@
                                    (simple-array (signed-byte 8) (*))) :read-only t)
   ;; Location contexts
   ;; A (simple-array * (*)) or a context if there's only one context.
-  (contexts nil :type t :read-only t))
+  (contexts nil :type t :read-only t)
+  (rest))
 
 ;;;; file reading
 ;;;;
@@ -355,11 +359,14 @@
              (:copier nil)
              (:print-object (lambda (s stream)
                               (print-unreadable-object (s stream :type t)
-                                (princ (file-info-truename s) stream)))))
+                                (princ (or (file-info-pathname s) (file-info-%truename s))
+                                       stream)))))
   ;; If a file, the truename of the corresponding source file. If from
   ;; a Lisp form, :LISP. In COMPILE-FILE, this gets filled lazily
   ;; after the file gets opened.
-  (truename nil :type (or pathname null (eql :lisp)))
+  ;; Can also be :DEFER if you want to lazily populate the slot,
+  ;; or :FAIL if you want to prevent use of truenames.
+  (%truename nil :type (or pathname null (member :lisp :defer :fail)))
   ;; the external format that we'll call OPEN with, if NAME is a file.
   (external-format nil  :read-only t)
   ;; the defaulted, but not necessarily absolute file name (i.e. prior
@@ -387,6 +394,12 @@
   ;; And I doubt it changes anyone's mind about coding style anyway.
   ;; Typically this matters for DEFTYPE and DEFMACRO.
   (style-warning-tracker nil :type list))
+
+(defun file-info-truename (x)
+  (case (file-info-%truename x)
+    (:defer (setf (file-info-%truename x) (truename (file-info-pathname x))))
+    (:fail (error "Don't inquire FILE-INFO-TRUENAME"))
+    (t (file-info-%truename x))))
 
 ;;; The SOURCE-INFO structure provides a handle on all the source
 ;;; information for an entire compilation.

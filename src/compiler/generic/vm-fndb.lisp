@@ -87,13 +87,14 @@
 (defknown %other-pointer-subtype-p (t list) boolean
   (movable foldable flushable always-translatable))
 
+(defknown string-designator-p (t) boolean
+  (movable foldable flushable always-translatable))
+
 ;;; Predicates that don't accept T for the first argument type
 (defknown (float-infinity-p float-nan-p float-infinity-or-nan-p)
   (float) boolean (movable foldable flushable))
 
 ;;;; miscellaneous "sub-primitives"
-
-(defknown pointer-hash (t) fixnum (flushable))
 
 (defknown %sp-string-compare
   (simple-string simple-string index (or null index) index (or null index))
@@ -173,13 +174,12 @@
 ;;; Like SET-HEADER-DATA, but instead of writing the entire header,
 ;;; LOGIOR of the specified value into the "data" portion of the word.
 ;;; Returns the first argument, *not* the modified header data.
-(defknown logior-header-bits (t (unsigned-byte 16)) t
+(defknown logior-header-bits (t (unsigned-byte 24)) (values)
     (#+x86-64 always-translatable))
 ;;; ASSIGN-VECTOR-FLAGSS assign all and only the flags byte.
-;;; RESET- performs LOGANDC2 and returns no value.
-(defknown (assign-vector-flags reset-header-bits)
-  (t (unsigned-byte 16)) (values)
-  (#+x86-64 always-translatable))
+(defknown assign-vector-flags (t (unsigned-byte 16)) (values) (#+x86-64 always-translatable))
+;;; RESET- performs LOGANDC2
+(defknown reset-header-bits (t (unsigned-byte 24)) (values) (#+x86-64 always-translatable))
 ;;; test bits of "HeaderData" which start 8 bits over from the lsb
 (defknown (test-header-data-bit)
   (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (boolean)
@@ -192,7 +192,6 @@
 (defknown %array-rank (array) %array-rank
   (flushable))
 
-#+(or x86 x86-64 arm64)
 (defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
@@ -677,15 +676,18 @@
 (defknown make-fdefn (t) fdefn (flushable movable))
 (defknown fdefn-p (t) boolean (movable foldable flushable))
 (defknown fdefn-name (fdefn) t (foldable flushable))
-(defknown fdefn-fun (fdefn) (or function null) (flushable))
+(defknown fdefn-fun ((or fdefn #+linkage-space symbol)) (or function null) (flushable))
 (defknown (setf fdefn-fun) (function fdefn) function ())
 (defknown fdefn-makunbound (fdefn) (values) ())
 ;;; FDEFN -> FUNCTION, trapping if not FBOUNDP
-(defknown safe-fdefn-fun (fdefn) function ())
+;;; For the most part this simple-fun is not needed, as ir2 conversion directly selects
+;;; the vop of this name; however, the expansion of handler-bind puts in a call to it
+;;; to trap unbound handlers in safe code, and we want that to work in the interpreter.
+(defknown safe-fdefn-fun ((or fdefn #+linkage-space symbol)) function ())
 
 (defknown %simple-fun-type (function) t (flushable))
 
-#+(or x86 x86-64 arm64) (defknown sb-vm::%closure-callee (function) fixnum (flushable))
+#+(or arm64 ppc64 x86 x86-64) (defknown sb-vm::%closure-callee (function) fixnum (flushable))
 (defknown %closure-fun (function) function (flushable))
 
 (defknown %closure-index-ref (function index) t

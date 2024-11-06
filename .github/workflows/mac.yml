@@ -18,12 +18,10 @@ jobs:
     steps:
     - uses: actions/checkout@v1
     - name: instal host sbcl
-      run: brew install sbcl zstd
+      run: brew install sbcl
     - name: build
       env:  
         SBCL_MAKE_TARGET_2_OPTIONS: --disable-ldb --disable-debugger
-        CPATH: /opt/homebrew/include
-        LIBRARY_PATH: /opt/homebrew/lib
       run: ./make.sh ${{ matrix.options }} --with-sb-core-compression --xc-host='sbcl --lose-on-corruption --disable-ldb --disable-debugger'
     - name: make binary
       run: |
@@ -36,7 +34,7 @@ jobs:
         mv $name sbcl
         mv $name-binary.tar.bz2 sbcl/sbcl-mac-binary-${{ matrix.arch }}${{ matrix.options }}
     - name: save binary
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v4
       with:
         name: sbcl-mac-binary-${{ matrix.arch }}${{ matrix.options }}
         path: sbcl-mac-binary-${{ matrix.arch }}${{ matrix.options }}

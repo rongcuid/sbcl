@@ -199,6 +199,8 @@
                                         (>= debug speed)))))
              nil)
             ((and (basic-combination-p dest)
+                  (not (info :function :specialized-xep
+                             (lvar-fun-name (basic-combination-fun dest))))
                   (or (not (basic-combination-fun-info dest))
                       ;; fixed-args functions do not check their arguments.
                       (not (ir1-attributep (fun-info-attributes (basic-combination-fun-info dest))
@@ -230,14 +232,22 @@
                                              hairy-data-vector-ref
                                              hairy-data-vector-set))
                               (eq (car (basic-combination-args dest)) lvar)
-                              (type= (specifier-type 'vector)
-                                     (single-value-type (cast-type-to-check cast))))
-                         (change-full-call dest
-                                           (getf '(hairy-data-vector-set/check-bounds vector-hairy-data-vector-set/check-bounds
-                                                   hairy-data-vector-ref/check-bounds vector-hairy-data-vector-ref/check-bounds
-                                                   hairy-data-vector-ref vector-hairy-data-vector-ref
-                                                   hairy-data-vector-set vector-hairy-data-vector-set)
-                                                 (lvar-fun-name (basic-combination-fun dest) t))))
+                              (let ((type (single-value-type (cast-type-to-check cast)))
+                                    (fun-name (lvar-fun-name (basic-combination-fun dest) t)))
+                                (cond ((type= (specifier-type 'vector) type)
+                                       (change-full-call dest
+                                                         (getf '(hairy-data-vector-set/check-bounds vector-hairy-data-vector-set/check-bounds
+                                                                 hairy-data-vector-ref/check-bounds vector-hairy-data-vector-ref/check-bounds
+                                                                 hairy-data-vector-ref vector-hairy-data-vector-ref
+                                                                 hairy-data-vector-set vector-hairy-data-vector-set)
+                                                               fun-name)))
+                                      ((type= (specifier-type 'string) type)
+                                       (change-full-call dest
+                                                         (getf '(hairy-data-vector-set/check-bounds string-hairy-data-vector-set/check-bounds
+                                                                 hairy-data-vector-ref/check-bounds string-hairy-data-vector-ref/check-bounds
+                                                                 hairy-data-vector-ref string-hairy-data-vector-ref
+                                                                 hairy-data-vector-set string-hairy-data-vector-set)
+                                                               fun-name)))))))
                         #+(or arm64 x86-64)
                         ((lvar-fun-is (basic-combination-fun dest) '(values-list)))
                         ;; Not great
@@ -395,8 +405,9 @@
 (defun make-type-check-form (types cast)
   (let* ((temps (make-gensym-list (length types)))
          (context (cast-context cast))
-         (restart (and (eq context :restart)
-                       (setf context (make-restart-location)))))
+         (restart (and (typep context '(cons (eql :restart)))
+                       (setf context (cons (make-restart-location)
+                                           (cdr context))))))
     (lambda (dummy)
       `(multiple-value-bind ,temps ,dummy
          ,@(mapcar
@@ -411,7 +422,7 @@
                                                     type-to-report)
                                                 context))
                    ,@(and restart
-                          `((restart-point ,restart))))))
+                          `((restart-point ,(car restart)))))))
             temps
             types)
          (values ,@temps)))))
@@ -477,11 +488,27 @@
   (let* ((lvar (node-lvar cast))
          (dest (and lvar (lvar-dest lvar)))
          (value (cast-value cast))
-         (atype (cast-asserted-type cast)))
+         (atype (cast-asserted-type cast))
+         bad)
     (do-uses (use value)
-      (let ((dtype (node-derived-type use)))
-        (unless (or (values-types-equal-or-intersect dtype atype)
-                    (cast-mismatch-from-inlined-p cast use))
+      (unless (values-types-equal-or-intersect (node-derived-type use) atype)
+        (push use bad)))
+    (loop for use in bad
+          for path = (source-path-before-transforms use)
+          ;; Are all uses from the same transform bad?
+          when (or (not path)
+                   (and
+                    (do-uses (use value t)
+                      (unless (or (memq use bad)
+                                  (neq path (source-path-before-transforms use)))
+                        (return)))
+                    ;; maybe-delete-cast may have hoisted out a good use
+                    lvar
+                    (or (atom (lvar-uses lvar))
+                        (do-uses (use lvar t)
+                          (unless (eq path (source-path-before-transforms use))
+                            (return))))))
+          do
           (let* ((*compiler-error-context* use)
                  (dtype (node-derived-type use))
                  (what (when (and (combination-p dest)
@@ -505,7 +532,7 @@
                          :format-control
                          "~:[Result~;~:*~A~] is a ~/sb-impl:print-type/, ~
                        ~<~%~9T~:;not a ~/sb-impl:print-type/.~>"
-                         :format-arguments (list what dtype atype)))))))))
+                         :format-arguments (list what dtype atype)))))))
   (values))
 
 ;;; Loop over all blocks in COMPONENT that have TYPE-CHECK set,
@@ -565,7 +592,7 @@
                (convert-type-check cast types)
                (setf generated t))
               (:hairy
-               (when (policy cast (>= safety inhibit-warnings))
+               (when (policy cast (> speed inhibit-warnings))
                  (let* ((*compiler-error-context* cast)
                         (type (cast-asserted-type cast))
                         (value-type (coerce-to-values type)))
@@ -589,4 +616,3 @@
                (convert-hairy-type-check cast types)
                (setf generated t)))))))
     generated))
-

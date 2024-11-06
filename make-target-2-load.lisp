@@ -8,7 +8,7 @@
 
 ;; sb-xref-for-internals is actively harmful to tree-shaking.
 ;; Remove some symbols to make the hide-packages test pass.
-#+sb-xref-for-internals
+#+(and sb-xref-for-internals (not sb-devel))
 (progn
   (fmakunbound 'sb-kernel::type-class-fun-slot)
   (fmakunbound 'sb-kernel::new-ctype))
@@ -296,10 +296,10 @@ Please check that all strings which were not recognizable to the compiler
     (when (typep info 'sb-c::compiled-debug-info)
       (let ((map (sb-c::compiled-debug-info-fun-map info)))
         (when (typep map '(simple-array (unsigned-byte 8) (*)))
-          (sb-alien:with-alien ((compress-vector (function int (* char) size-t) :extern "compress_vector"))
+          (sb-alien:with-alien ((compress-vector (function int unsigned size-t) :extern))
             (sb-sys:with-pinned-objects (map)
               (sb-alien:alien-funcall compress-vector
-                                      (sb-sys:int-sap (sb-kernel:get-lisp-obj-address map))
+                                      (sb-kernel:get-lisp-obj-address map)
                                       (length map)))))))))
 (progn
   ;; Remove source forms of compiled-to-memory lambda expressions.
@@ -536,6 +536,23 @@ Please check that all strings which were not recognizable to the compiler
             (+ sum-delta-ext sum-delta-int))))
 
 (scan-format-control-strings)
+
+(macrolet ((def-backward-compatible-sb-c-specials (pairs) ; for UIOP + ASDF
+             `(progn
+                ,@(mapcar (lambda (pair)
+                            `(define-symbol-macro ,(car pair)
+                                 (,(sb-int:package-symbolicate "SB-C" "CU-" (cdr pair) "-COUNT")
+                                   sb-c::*compilation-unit*)))
+                          pairs))))
+  ;; coece to a strict boolean
+  (define-symbol-macro sb-c::*in-compilation-unit* (not (null sb-c::*compilation-unit*)))
+  ;; the "specials" are all SETFable when and only when *IN-COMPILATION-UNIT* is T
+  (def-backward-compatible-sb-c-specials
+      sb-c::((*aborted-compilation-unit-count* . "ABORTED")
+             (*compiler-error-count* . "ERROR")
+             (*compiler-warning-count*  . "WARNING")
+             (*compiler-style-warning-count* . "STYLE-WARNING")
+             (*compiler-note-count* . "NOTE"))))
 
 #+sb-devel
 (rename-package "COMMON-LISP" "COMMON-LISP" '("SB-XC" "CL"))

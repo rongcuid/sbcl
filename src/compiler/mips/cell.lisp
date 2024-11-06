@@ -30,7 +30,7 @@
   (:vop-var vop)
   (:generator 1
     (without-scheduling ()
-      (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) value name)
+      (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) name)
       (storew value object offset lowtag))))
 
 ;;;; Symbol hacking VOPs:
@@ -91,6 +91,26 @@
   (:translate symbol-global-value))
 (define-vop (fast-symbol-global-value fast-symbol-value)
   (:translate symbol-global-value))
+
+(define-vop (symbol-hash)
+  (:policy :fast-safe)
+  (:translate symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:sc unsigned-reg) tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum.
+    (inst li tmp #x1fffffff)
+    (inst and res res tmp)))
+
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:ignore tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srl res res 3))) ; shift out the 3 pseudorandom bits
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -190,14 +210,11 @@
   (:temporary (:scs (descriptor-reg)) symbol value)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
-    (let ((loop (gen-label))
-          (skip (gen-label))
-          (done (gen-label)))
       (move where arg)
       (inst beq where bsp-tn done)
       (inst nop)
 
-      (emit-label loop)
+      LOOP
       (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
       (inst beq symbol skip)
       (loadw value bsp-tn (- binding-value-slot binding-size))
@@ -206,13 +223,13 @@
         (storew value symbol symbol-value-slot other-pointer-lowtag))
       (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
 
-      (emit-label skip)
+      SKIP
       (storew zero-tn bsp-tn (- binding-value-slot binding-size))
       (inst addu bsp-tn bsp-tn (* -2 n-word-bytes))
       (inst bne where bsp-tn loop)
       (inst nop)
 
-      (emit-label done))))
+      DONE))
 
 
 

@@ -18,6 +18,7 @@
   (:export #:asm-search
            #:assert-consing
            #:assert-no-consing
+           #:code-header-fdefn-range
            #:compiler-derived-type
            #:count-full-calls
            #:find-code-constants
@@ -110,13 +111,35 @@
                               calls))))))))))
     (values calls compiled-fun)))
 
+(when (member :linkage-space sb-impl:+internal-features+) ; for below
+  (pushnew :linkage-space *features*))
+
+;;; Start and count of fdefns used in #'F synax or normal named call
+;;; (i.e. at the head of an expression).
+;;; SORT-BOXED-CONSTANTS ensures that FDEFNs precede other constants.
+;;; This does not have to be particularly efficient. It's only for tests.
+(defun code-header-fdefn-range (code-obj)
+  (let ((start sb-vm:code-constants-offset)
+        (count 0))
+    (do ((i start (1+ i))
+         (limit (code-header-words code-obj)))
+        ((= i limit))
+      (if (fdefn-p (code-header-ref code-obj i)) (incf count) (return)))
+    (values start count)))
+
 (defun find-named-callees (fun &key (name nil namep))
-  (sb-int:binding* ((code (fun-code-header (%fun-fun fun)))
-                    ((start count) (sb-kernel:code-header-fdefn-range code)))
-    (loop for i from start repeat count
-          for c = (code-header-ref code i)
-          when (or (not namep) (equal name (sb-kernel:fdefn-name c)))
-          collect (sb-kernel:fdefn-name c))))
+  (let ((code (fun-code-header (%fun-fun fun))))
+    #+linkage-space
+    (loop for index in (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups code))
+          for this = (sb-vm::linkage-addr->name index :index)
+          when (or (not namep) (equal this name))
+          collect this)
+    #-linkage-space
+    (sb-int:binding* (((start count) (code-header-fdefn-range code)))
+      (loop for i from start repeat count
+            for c = (code-header-ref code i)
+            when (or (not namep) (equal name (sb-kernel:fdefn-name c)))
+            collect (sb-kernel:fdefn-name c)))))
 
 (defun find-anonymous-callees (fun &key (type 'function))
   (let ((code (fun-code-header (%fun-fun fun))))
@@ -129,8 +152,7 @@
 ;;; constants that are present on behalf of %SIMPLE-FUN-foo accessors.
 (defun find-code-constants (fun &key (type t))
   (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from (+ sb-vm:code-constants-offset
-                        (* (code-n-entries code) sb-vm:code-slots-per-simple-fun))
+    (loop for i from sb-vm:code-constants-offset
           below (code-header-words code)
           for c = (code-header-ref code i)
           for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
@@ -194,6 +216,8 @@
                  (write-line toplevel-forms f)
                  (dolist (form toplevel-forms)
                    (prin1 form f))))
+           ;; Preserve all referenced callees. This has no effect on semantics
+           (sb-int:encapsulate 'sb-int:permanent-fname-p 'test-shim #'sb-int:constantly-nil)
            (multiple-value-bind (fasl warn fail)
                (let ((*error-output* error-stream))
                  (compile-file lisp :print nil :verbose nil
@@ -204,6 +228,7 @@
                (let ((*error-output* error-stream))
                  (load fasl :print nil :verbose nil)))
              (values warn fail error-stream)))
+      (sb-int:unencapsulate 'sb-int:permanent-fname-p 'test-shim)
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 

@@ -986,21 +986,7 @@ handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
 
     WITH_GC_AT_SAFEPOINTS_ONLY() {
         block_blockable_signals(&ctx->sigmask);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-        if (trap == trap_UndefinedFunction) {
-            lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(ctx) & ~LOWTAG_MASK);
-            if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
-                // Return to undefined-tramp
-                OS_CONTEXT_PC(ctx) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
-                // with RAX containing the FDEFN
-                *os_context_register_addr(ctx,reg_RAX) =
-                    make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
-            }
-        } else
-#endif
-        {
-            handle_trap(ctx, trap);
-        }
+        handle_trap(ctx, trap);
         thread_sigmask(SIG_SETMASK,&ctx->sigmask,NULL);
     }
 
@@ -1079,6 +1065,8 @@ handle_access_violation(os_context_t *ctx,
     return -1;
 }
 
+void lisp_memory_fault_warning(os_context_t *context, os_vm_address_t addr);
+
 static void
 signal_internal_error_or_lose(os_context_t *ctx,
                               EXCEPTION_RECORD *exception_record,
@@ -1089,6 +1077,11 @@ signal_internal_error_or_lose(os_context_t *ctx,
      * the exception to the lisp-side exception handler if it's
      * set up, or drop to LDB.
      */
+
+    if ((long int)exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        lisp_memory_fault_warning(ctx, fault_address);
+        undo_fake_foreign_function_call(ctx);
+    }
 
     if (internal_errors_enabled) {
         /* The exception system doesn't automatically clear pending
@@ -1129,17 +1122,7 @@ signal_internal_error_or_lose(os_context_t *ctx,
             (void*)(intptr_t)exception_record->ExceptionCode);
     fprintf(stderr, "Faulting IP: %p.\n",
             (void*)(intptr_t)exception_record->ExceptionAddress);
-    if ((long int)exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        MEMORY_BASIC_INFORMATION mem_info;
 
-        if (VirtualQuery(fault_address, &mem_info, sizeof mem_info)) {
-            fprintf(stderr, "page status: 0x%lx.\n", mem_info.State);
-        }
-
-        fprintf(stderr, "Was writing: %p, where: %p.\n",
-                (void*)exception_record->ExceptionInformation[0],
-                fault_address);
-    }
 
     fflush(stderr);
 
@@ -1749,9 +1732,10 @@ win32_write_console(HANDLE handle, void * buf, int count)
     }
 }
 
-int
-win32_unix_write(HANDLE handle, void * buf, int count)
+ssize_t
+win32_unix_write(HANDLE handle, void * buf, size_t requested_count)
 {
+    int count = requested_count > INT_MAX ? INT_MAX : requested_count;
     DWORD written_bytes;
     OVERLAPPED overlapped;
     struct thread * self = get_sb_vm_thread();
@@ -1824,9 +1808,10 @@ win32_unix_write(HANDLE handle, void * buf, int count)
 }
 
 
-int
-win32_unix_read(HANDLE handle, void * buf, int count)
+ssize_t
+win32_unix_read(HANDLE handle, void * buf, size_t requested_count)
 {
+    int count = requested_count > INT_MAX ? INT_MAX : requested_count;
     OVERLAPPED overlapped = {.Internal=0};
     DWORD read_bytes = 0;
     struct thread * self = get_sb_vm_thread();
