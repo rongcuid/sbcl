@@ -79,6 +79,14 @@
 ;;; the size of a stream in-buffer
 (defconstant +ansi-stream-in-buffer-length+ 512)
 
+;;; the amount of space we leave at the start of the in-buffer for
+;;; unreading
+;;;
+;;; (It's 4 instead of 1 to allow word-aligned copies.)
+(defconstant +ansi-stream-in-buffer-extra+
+  4) ; FIXME: should be symbolic constant
+
+
 (deftype ansi-stream-in-buffer ()
   `(simple-array (unsigned-byte 8) (,+ansi-stream-in-buffer-length+)))
 
@@ -117,7 +125,6 @@
 ;;; streams extension)
 (defstruct (ansi-stream (:constructor nil)
                         (:copier nil))
-
   ;; input buffer
   ;;
   ;; (If a stream does not have an input buffer, then the IN-BUFFER
@@ -140,7 +147,11 @@
   ;; A character FD-STREAM uses this method to transfer octets from the
   ;; source buffer into characters of the destination buffer.
   (n-bin #'ill-bin :type                        ; n-byte input function
-   (sfunction (stream (simple-unboxed-array (*)) (or ansi-stream-csize-buffer null) index index t) index))
+   (sfunction (stream (or (simple-unboxed-array (*)) system-area-pointer)
+                      (or ansi-stream-csize-buffer null) index index
+                      ;; EOF-ERROR-P, not used by character streams
+                      &optional t)
+              index))
 
   ;; output functions
   (cout #'ill-out :type function)               ; WRITE-CHAR function
@@ -151,9 +162,10 @@
   (misc #'no-op-placeholder :type (function (stream (integer 0 17) t) *))
 
   ;; Absolute character position, acting also as a generalized boolean
-  ;; in lieu of testing FORM-TRACKING-STREAM-P to see if we must
-  ;; maintain correctness of the slot in ANSI-STREAM-UNREAD-CHAR.
-  (input-char-pos nil :type (or null index)))
+  ;; in lieu of testing FORM-TRACKING-STREAM-P.
+  (input-char-pos nil :type (or null (or (integer #.(- +ansi-stream-in-buffer-length+)
+                                                  0)
+                                         index))))
 
 ;;; SYNONYM-STREAM type is needed by ANSI-STREAM-{INPUT,OUTPUT}-STREAM-P
 ;;; and also needed by OPEN (though not obviously), which is compiled
@@ -343,7 +355,7 @@
 ;;; using integers eliminates the load of many code header constants.
 ;;; Streams which don't want to handle every operation (don't end in a T clause)
 ;;; should specify :DEFAULT NIL to avoid an error.
-(defmacro stream-misc-case ((operation &key (default 'error)) &rest clauses)
+(defmacro stream-misc-case ((operation &key (default 'error)) &body clauses)
   (let* ((otherwise)
          (clauses
           (mapcar (lambda (clause)

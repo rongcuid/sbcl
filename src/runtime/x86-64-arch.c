@@ -164,33 +164,34 @@ void visit_context_registers(void (*proc)(os_context_register_t, void*),
 }
 #endif
 
-os_context_register_t *
-os_context_flags_addr(os_context_t *context)
-{
 #if defined __linux__
     /* KLUDGE: As of kernel 2.2.14 on Red Hat 6.2, there's code in the
      * <sys/ucontext.h> file to define symbolic names for offsets into
      * gregs[], but it's conditional on __USE_GNU and not defined, so
      * we need to do this nasty absolute index magic number thing
      * instead. */
-    return (os_context_register_t*)&context->uc_mcontext.gregs[17];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[17]
 #elif defined LISP_FEATURE_SUNOS
-    return &context->uc_mcontext.gregs[REG_RFL];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[REG_RFL]
 #elif defined LISP_FEATURE_FREEBSD || defined(__DragonFly__)
-    return &context->uc_mcontext.mc_rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.mc_rflags
 #elif defined __HAIKU__
-    return &context->uc_mcontext.rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.rflags
 #elif defined LISP_FEATURE_DARWIN
-    return CONTEXT_ADDR_FROM_STEM(rflags);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,rflags)
 #elif defined __OpenBSD__
-    return &context->sc_rflags;
+#   define CONTEXT_FLAGS(c) c->sc_rflags
 #elif defined __NetBSD__
-    return CONTEXT_ADDR_FROM_STEM(RFLAGS);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,RFLAGS)
 #elif defined _WIN64
-    return (os_context_register_t*)&context->win32_context->EFlags;
+#   define CONTEXT_FLAGS(c) c->win32_context->EFlags
 #else
 #error unsupported OS
 #endif
+
+os_context_register_t *os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)&(CONTEXT_FLAGS(context));
 }
 
 void arch_skip_instruction(os_context_t *context)
@@ -307,7 +308,7 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     *(pc-2) = 0x00240c81;
     *(pc-1) = 0x9d000001;
 #else
-    *os_context_flags_addr(context) |= 0x100;
+    CONTEXT_FLAGS(context) |= 0x100;
 #endif
 
     single_stepping = pc;
@@ -350,7 +351,7 @@ restore_breakpoint_from_single_step(os_context_t * context)
     *(single_stepping-2) = single_step_save2;
     *(single_stepping-1) = single_step_save3;
 #else
-    *os_context_flags_addr(context) &= ~0x100;
+    CONTEXT_FLAGS(context) &= ~0x100;
 #endif
     /* Re-install the breakpoint if possible. */
     if (((char *)OS_CONTEXT_PC(context) > (char *)single_stepping) &&
@@ -392,22 +393,6 @@ sigtrap_handler(int __attribute__((unused)) signal,
      * number of bytes will follow, the first is the length of the byte
      * arguments to follow. */
     trap = *(unsigned char *)OS_CONTEXT_PC(context);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    if (trap == trap_UndefinedFunction) {
-        // The interrupted PC pins this fdefn. Sigtrap is delivered on the ordinary stack,
-        // not the alternate stack.
-        // (FIXME: an interior pointer to an fdefn _should_ pin it, but doesn't)
-        lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(context) & ~LOWTAG_MASK);
-        if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
-            // Return to undefined-tramp
-            OS_CONTEXT_PC(context) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
-            // with RAX containing the FDEFN
-            *os_context_register_addr(context,reg_RAX) =
-                make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
-            return;
-        }
-    }
-#endif
     handle_trap(context, trap);
 }
 
@@ -513,7 +498,7 @@ arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-    char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+    char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
     if (datap) {
         *(uword_t *)reloc_addr = (uword_t)target_addr;
         return;
@@ -596,20 +581,6 @@ lispobj entrypoint_taggedptr(uword_t entrypoint) {
         gc_assert(widetag == SIMPLE_FUN_WIDETAG || widetag == FUNCALLABLE_INSTANCE_WIDETAG);
     }
     return make_lispobj(phdr, FUN_POINTER_LOWTAG);
-}
-
-/* Return the lisp object that fdefn's raw_addr slot jumps to.
- * In the event that the referenced object was forwarded, this returns the un-forwarded
- * object (the forwarded value is used to assert some invariants though).
- * If the fdefn jumps to the UNDEFINED-FDEFN routine, then return 0.
- *
- * Some legacy baggage is evident: in the first implementation of immobile fdefns,
- * an fdefn used a 'jmp rel32' (relative to itself), and so you could decode the
- * jump target only given the address of the fdefn. That is no longer true; fdefns use
- * absolute jumps. Therefore it is possible to call entrypoint_taggedptr() with any
- * raw_addr, whether or not you know the fdefn whence the raw_addr was obtained. */
-lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
-    return entrypoint_taggedptr((uword_t)fdefn->raw_addr);
 }
 
 #ifdef LISP_FEATURE_SB_THREAD

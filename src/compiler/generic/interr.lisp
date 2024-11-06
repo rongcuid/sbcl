@@ -109,6 +109,7 @@
    ("attempt to THROW to a non-existent tag" unseen-throw-tag 1)
    ("division by zero" division-by-zero 1)
    ("Object is of the wrong type." object-not-type 2)
+   ("check-type error" check-type 3)
    ("ECASE failure" ecase-failure 2)
    ("ETYPECASE failure" etypecase-failure 2)
    ("odd number of &KEY arguments" odd-key-args 0)
@@ -244,7 +245,8 @@
   ((or index list) object-not-index-or-list)
   condition
   sb-pcl::fast-method-call
-  ((or symbol string) object-not-or-symbol-string)
+  ((or symbol string) object-not-symbol-or-string)
+  ((or symbol string character) object-not-string-designator)
   ((and unsigned-byte fixnum) object-not-unsigned-fixnum)
   bit-index))
 

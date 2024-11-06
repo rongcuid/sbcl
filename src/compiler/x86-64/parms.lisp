@@ -16,7 +16,7 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 1)
 
-(defconstant +backend-fasl-file-implementation+ :x86-64)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :x86-64)
 (defconstant-eqx +fixup-kinds+ #(:abs32 :*abs32 :rel32 :absolute) #'equalp)
 
 ;;; This size is supposed to indicate something about the actual granularity
@@ -89,7 +89,8 @@
 (gc-space-setup #x50000000
                      :read-only-space-size 0
                      :fixedobj-space-size #.(* 60 1024 1024)
-                     :text-space-size #.(* 130 1024 1024)
+                     :text-space-size #.(* 160 1024 1024)
+                     :text-space-start #xB800000000
                      :dynamic-space-start #x1000000000)
 
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
@@ -98,12 +99,25 @@
 #-(or linux darwin)
 (gc-space-setup #x20000000
                      :read-only-space-size 0
-                     :dynamic-space-start #x1000000000
+                     :fixedobj-space-size #.(* 60 1024 1024)
+                     :text-space-size #.(* 130 1024 1024)
+                     :text-space-start #x1000000000
+                     :dynamic-space-start #x1100000000
                      #+openbsd :dynamic-space-size #+openbsd #x2fff0000)
 
 (defconstant alien-linkage-table-growth-direction :up)
 (defconstant alien-linkage-table-entry-size 16)
 
+#+(and sb-xc-host (not immobile-space))
+(defparameter lisp-linkage-space-addr #x1500000000) ; arbitrary
+#+(and sb-xc-host immobile-space)
+(progn
+(defparameter lisp-linkage-space-addr
+  ;; text space:
+  ;;   | ALIEN LINKAGE | LISP LINKAGE | CODE OBJECTS ...
+  ;;   |<------------->|<------------>| ....
+  (- text-space-start (* (ash 1 n-linkage-index-bits) 8)))
+(defparameter alien-linkage-space-start (- lisp-linkage-space-addr alien-linkage-space-size)))
 
 (defenum (:start 8)
   halt-trap
@@ -113,7 +127,6 @@
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  undefined-function-trap
   invalid-arg-count-trap
   memory-fault-emulation-trap
   #+sb-safepoint global-safepoint-trap
@@ -145,10 +158,11 @@
 (defconstant-eqx +static-symbols+
  `#(,@+common-static-symbols+
     #+(and immobile-space (not sb-thread)) function-layout
+    ;; I had trouble making alien_stack_pointer use the thread slot for #-sb-thread
+    ;; because WITH-ALIEN binds SB-C:*ALIEN-STACK-POINTER* in an ordinary LET.
+    ;; That being so, it has to use the #-sb-thread mechanism of placing the new value
+    ;; in the symbol's value slot for compatibility with UNBIND and all else.
     #-sb-thread *alien-stack-pointer*    ; a thread slot if #+sb-thread
-     ;; interrupt handling
-    #-sb-thread *pseudo-atomic-bits*     ; ditto
-    #-sb-thread *binding-stack-pointer* ; ditto
     ;; Since the text space and alien linkage table might both get relocated on startup
     ;; under #+immobile-space, an alien callback wrapper can't wire in the address
     ;; of a word that holds the C function pointer to callback_wrapper_trampoline.
@@ -159,10 +173,9 @@
     *cpu-feature-bits*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-    `#(sb-impl::install-hash-table-lock update-object-layout
-       ,@common-static-fdefns)
-  #'equalp)
+;; No static-fdefns are actually needed, but #() here causes the
+;; "recursion in known function" error to occur in ltn
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 #+sb-simd-pack
 (progn
@@ -186,14 +199,3 @@
         simd-pack-256-ub8 simd-pack-256-ub16 simd-pack-256-ub32 simd-pack-256-ub64
         simd-pack-256-sb8 simd-pack-256-sb16 simd-pack-256-sb32 simd-pack-256-sb64)
     #'equalp))
-
-(defconstant undefined-fdefn-header
-  ;; This constant is constructed as follows: Take the INT opcode
-  ;; plus the undefined-fun trap byte, then the bytes of the 'disp' field
-  ;; of the JMP instruction that would overwrite the INT instruction.
-  ;;   INT3 <trap-code> = CC **
-  ;;   JMP [RIP+16]     = FF 25 10 00 00 00 00
-  ;; When assigning a function we'll change the first two bytes to 0xFF 0x25.
-  ;; The 'disp' field will aready be correct.
-  (logior (ash undefined-function-trap 8)
-          (+ #x100000 (or #+int4-breakpoints #xCE #xCC))))

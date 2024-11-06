@@ -21,10 +21,10 @@
 ;;; so accounting for the fixnum tag and 1 bit for the sign,
 ;;; this leaves 30 bits. Of course this number is ridiculous
 ;;; as a call with that many args would consume 8 GB of stack,
-;;; but it's surely not as ridiculous as MOST-POSITIVE-FIXNUM.
+;;; but it's surely not as ridiculous as ARRAY-DIMENSION-LIMIT.
 (defconstant call-arguments-limit
   #+x86-64 (ash 1 30)
-  #-x86-64 most-positive-fixnum
+  #-x86-64 array-dimension-limit
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
 (defconstant lambda-parameters-limit call-arguments-limit
@@ -71,7 +71,7 @@
   ;; constants. This coalescing is distinct from the coalescing done
   ;; in the dumper, since the effect here is to reduce the number of
   ;; boxed constants appearing in a code component.
-  (similar-constants (sb-fasl::make-similarity-table) :read-only t :type hash-table))
+  (similar-constants (make-similarity-table) :read-only t :type hash-table))
 (declaim (freeze-type ir1-namespace))
 
 (sb-impl::define-thread-local *ir1-namespace*)
@@ -89,7 +89,7 @@
 ;;; Bind this to a stream to capture various internal debugging output.
 (defvar *compiler-trace-output* nil)
 ;;; These are the default, but the list can also include
-;;; :pre-ir2-optimize, :symbolic-asm.
+;;; :pre-ir2-optimize, :constraints.
 (defvar *compile-trace-targets* '(:ir1 :ir2 :vop :symbolic-asm :disassemble))
 (defvar *current-path*)
 (defvar *current-component*)
@@ -111,7 +111,7 @@
 ;;; In particular, ELF cores shrink the immobile code space down to just enough
 ;;; to contain all code, plus about 1/2 MiB of spare, which means that you can't
 ;;; subsequently compile a whole lot into immobile space.
-;;; The value is changed to :AUTO in make-target-2-load.lisp which supresses
+;;; The value is changed to :AUTO in make-target-2-load.lisp which suppresses
 ;;; codegen optimizations for immobile space, but nonetheless prefers to allocate
 ;;; the code there, falling back to dynamic space if there is no room left.
 ;;; These controls exist whether or not the immobile-space feature is present.
@@ -185,27 +185,6 @@
 ;;; 2 implies an even length boxed header; 1 implies no restriction.
 (defconstant code-boxed-words-align (+ 2 #+(or x86 x86-64) -1))
 
-;;; Used as the CDR of the code coverage instrumentation records
-;;; (instead of NIL) to ensure that any well-behaving user code will
-;;; not have constants EQUAL to that record. This avoids problems with
-;;; the records getting coalesced with non-record conses, which then
-;;; get mutated when the instrumentation runs. Note that it's
-;;; important for multiple records for the same location to be
-;;; coalesced. -- JES, 2008-01-02
-(defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%)
-
-;;; Stores the code coverage instrumentation results.
-;;; The CAR is a hashtable. The CDR is a list of weak pointers to code objects
-;;; having coverage marks embedded in the unboxed constants.
-;;; Keys in the hashtable are namestrings, the
-;;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
-;;; for a path that has not been visited, and T for one that has.
-#-sb-xc-host
-(progn
-  (define-load-time-global *code-coverage-info*
-    (list (make-hash-table :test 'equal :synchronized t)))
-  (declaim (type (cons hash-table) *code-coverage-info*)))
-
 ;;; Unique number assigned into high 4 bytes of 64-bit code size slot
 ;;; so that we can sort the contents of text space in a more-or-less
 ;;; predictable manner based on the order in which code was loaded.
@@ -221,10 +200,22 @@
         ;; And who knows what the host considers "simple".
         #-sb-xc-host (not simple-array)))
 
-(defstruct (compilation (:copier nil)
+(defun make-fun-name-hashset ()
+  (make-hashset 32
+                (lambda (a b) (or (eq a b) (and (consp a) (consp b) (equal a b))))
+                ;; We don't emulate sb-xc:sxhash thoroughly enough to hash compound names
+                ;; (lists are rejected) but it doesn't actually matter what the hash is
+                ;; for duplicate name detection.
+                #+sb-xc-host #'cl:sxhash
+                #-sb-xc-host #'sxhash))
+
+(defstruct (compilation (:constructor make-compilation
+                                      (&key coverage-metadata msan-unpoison
+                                       block-compile entry-points compile-toplevel-object))
+                        (:copier nil)
                         (:predicate nil)
                         (:conc-name ""))
-  (fun-names-in-this-file)
+  (fun-names-in-this-file (make-fun-name-hashset))
   ;; for constant coalescing across code components, and/or for situations
   ;; where SIMILARP does not do what you want.
   (constant-cache)
@@ -235,13 +226,6 @@
   (coverage-metadata nil :type (or (cons hash-table hash-table) null) :read-only t)
   (msan-unpoison nil :read-only t)
   (sset-counter 1 :type fixnum)
-  ;; Map of function name -> something about how many calls were converted
-  ;; as ordinary calls not in the scope of a local or global notinline declaration.
-  ;; Useful for finding functions that were supposed to have been converted
-  ;; through some kind of transformation but were not.
-  ;; FIXME: this should be scoped to a compile/load but there are
-  ;; apparently some difficulties in doing so.
-  ; (emitted-full-calls (make-hash-table :test 'equal))
   ;; if emitting a cfasl, the fasl stream to that
   (compile-toplevel-object nil :read-only t)
   ;; The current block compilation state.  These are initialized to
@@ -262,7 +246,7 @@
   ;; compiler to dump symbols in such a way that the loader can
   ;; reconstruct them in the correct package.
   (package-environment-changed nil :type boolean)
-  ;; Bidrectional map between IR1/IR2/assembler abstractions and a corresponding
+  ;; Bidirectional map between IR1/IR2/assembler abstractions and a corresponding
   ;; small integer or string identifier. One direction could be done by adding
   ;; the ID as slot to each object, but we want both directions.
   ;; These could just as well be scoped by WITH-IR1-NAMESPACE, but
@@ -287,15 +271,31 @@
 #+linux ; shadow space differs by OS
 (defconstant sb-vm::msan-mem-to-shadow-xor-const #x500000000000)
 
-(define-load-time-global *emitted-full-calls*
-    (make-hash-table :test 'equal #-sb-xc-host :synchronized #-sb-xc-host t))
+(defstruct (compilation-unit (:conc-name cu-) (:predicate nil) (:copier nil)
+                             (:constructor make-compilation-unit ()))
+  ;; Count of the number of compilation units dynamically enclosed by
+  ;; the current active WITH-COMPILATION-UNIT that were unwound out of.
+  (aborted-count 0 :type fixnum)
+  ;; Keep track of how many times each kind of condition happens.
+  (error-count 0 :type fixnum)
+  (warning-count 0 :type fixnum)
+  (style-warning-count 0 :type fixnum)
+  (note-count 0 :type fixnum)
+  ;; Map of function name -> something about how many calls were converted
+  ;; as ordinary calls not in the scope of a local or global notinline declaration.
+  ;; Useful for finding functions that were supposed to have been converted
+  ;; through some kind of transformation but were not.
+  (emitted-full-calls (make-hash-table :test 'equal))
+  ;; hash-table of hash-tables:
+  ;;  outer: GF-Name -> hash-table
+  ;;  inner: (qualifiers . specializers) -> lambda-list
+  (methods nil :type (or null hash-table)))
+;;; This is a COMPILATION-UNIT if we are within a WITH-COMPILATION-UNIT form (which
+;;; normally causes nested uses to be no-ops).
+(defvar *compilation-unit* nil)
 
 (defmacro get-emitted-full-calls (name)
-;; Todo: probably remove the wrapping cons. It was for globaldb
-;; which is particularly inefficient at updates (because it can only
-;; use an R/C/U paradigm, and so conses on every insert,
-;; unlike a hash-table which can just update the cell)
-  `(gethash ,name *emitted-full-calls*))
+  `(awhen *compilation-unit* (gethash ,name (cu-emitted-full-calls it))))
 
 ;; Return the number of calls to NAME that IR2 emitted as full calls,
 ;; not counting calls via #'F that went untracked.
@@ -313,11 +313,16 @@
          (= (logand status 3) #b01)
          (ash status -2)))) ; the call count as tracked by IR2
 
+;;; FIXME: the math here is very suspicious-looking. If the flag bits are #b11
+;;; then they can rollover into the counts. And we're ORing counts. Wtf is this doing???
+;;; Well, it doesn't matter really. This is used only in FOP-NOTE-FULL-CALLS which is called
+;;; only if DUMP-EMITTED-FULL-CALLS emits that fop. But that function is never invoked.
 (defun accumulate-full-calls (data)
   (loop for (name status) in data
         do
-        (let ((existing (gethash name *emitted-full-calls* 0)))
-          (setf (gethash name *emitted-full-calls*)
+        (let* ((table (cu-emitted-full-calls *compilation-unit*))
+               (existing (gethash name table 0)))
+          (setf (gethash name table)
                 (logior (+ (logand existing #b11) ; old flag bits
                            (logand status #b11))  ; new flag bits
                         (logand existing -4)      ; old count

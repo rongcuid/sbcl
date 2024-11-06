@@ -19,13 +19,14 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <stdlib.h>
 #include "genesis/sbcl.h"
+#include "lispobj.h"
 #include "runtime.h"
 #include "globals.h"
 #include "os.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include <wchar.h>
 #include "arch.h"
 #include "genesis/compiled-debug-info.h"
 #include "genesis/hash-table.h"
@@ -42,6 +43,29 @@
 # include <dlfcn.h>
 #endif
 
+lispobj asm_routine_name(char* pc, struct hash_table* ht)
+{
+    struct code *c = (void*)asm_routines_start;
+    int offset = pc - code_text_start(c);
+
+    if (ht) { // cold-init will have no hash-table
+        struct vector* v = (void*)native_pointer(ht->pairs);
+        int len = vector_len(v);
+        int i;
+        for (i = 2; i < len; i += 2) {
+            if (lowtag_of(v->data[i+1]) != LIST_POINTER_LOWTAG) continue;
+            struct cons* c = CONS(v->data[i+1]);
+            struct cons* cdr = CONS(c->cdr);
+            int from_byteindex = fixnum_value(c->car);
+            int to_byteindex = fixnum_value(cdr->car);
+            if (offset >= from_byteindex && offset <= to_byteindex) {
+                return v->data[i];
+            }
+        }
+    }
+    return (lispobj)NULL;
+}
+
 lispobj
 debug_function_name_from_pc (struct code* code, void *pc)
 {
@@ -49,24 +73,37 @@ debug_function_name_from_pc (struct code* code, void *pc)
 
     if (instancep(code->debug_info))
         di = (void*)native_pointer(code->debug_info);
-    else if (listp(code->debug_info) && instancep(CONS(code->debug_info)->car))
-        di = (void*)native_pointer(CONS(code->debug_info)->car);
     else
         return (lispobj)NULL;
 
+    if (pc >= (void*)asm_routines_start && pc < (void*)asm_routines_end) {
+#ifdef LISP_FEATURE_DARWIN_JIT
+        return asm_routine_name(pc, (struct hash_table *)(CONS(code->debug_info)->car));
+#else
+        return asm_routine_name(pc, (struct hash_table *)di);
+#endif
+    }
+
     uword_t offset = (char*)pc - code_text_start(code);
 
-    struct vector *v;
-    int i, len;
-
-    v = VECTOR(di->fun_map);
-
-    len = vector_len(v);
+    struct vector *v = VECTOR(di->fun_map);
+    sword_t len = vector_len(v);
     unsigned char *map = (unsigned char*)v->data;
+
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-    int compressed = widetag_of(&v->header) == SIMPLE_ARRAY_SIGNED_BYTE_8_WIDETAG;
-    if (compressed)
-        map = decompress_vector(di->fun_map, (size_t*)&len);
+    int uncompressed_len = 0;
+    if (widetag_of(&v->header) == SIMPLE_ARRAY_SIGNED_BYTE_8_WIDETAG) {
+        int offset = 0;
+        uncompressed_len = read_var_integer(map, &offset);
+        /* os_allocate should never acquire a global lock.
+         * This causes a ton of system-call overhead in the 'debug.pure' regression test,
+         * but implementing a thread-local cache of the last-used allocation within backtrace
+         * just to speed up an artificial use would be the wrong thing to do,
+         * as it would potentially introduce yet another way to fail */
+        map = (void*)os_allocate(uncompressed_len);
+        decompress_vector(di->fun_map, offset, map, uncompressed_len);
+        len = uncompressed_len;
+    }
 #endif
 
     uword_t code_start_pc = 0;
@@ -76,7 +113,7 @@ debug_function_name_from_pc (struct code* code, void *pc)
     lispobj last_name = 0;
     lispobj name = di->name;
 
-    i = 0;
+    int i = 0;
     while (i < len) {
         unsigned char options = map[i++];
         unsigned char flags = map[i++];
@@ -175,8 +212,7 @@ debug_function_name_from_pc (struct code* code, void *pc)
         lose("failed to parse debug function name");
   done:
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-    if (compressed)
-        free(map);
+    if (uncompressed_len) os_deallocate((void*)map, uncompressed_len);
 #endif
     return last_name;
 }
@@ -290,12 +326,13 @@ static void __attribute__((unused))
 print_entry_points (struct code *code, FILE *f)
 {
     int n_funs = code_n_funs(code);
+    struct compiled_debug_info* cdi = (void*)native_pointer(barrier_load(&code->debug_info));
     for_each_simple_fun(index, fun, code, 0, {
         if (widetag_of(&fun->header) != SIMPLE_FUN_WIDETAG) {
             fprintf(f, "%p: bogus function entry", fun);
             return;
         }
-        print_entry_name(barrier_load(&code->constants[CODE_SLOTS_PER_SIMPLE_FUN*index]),
+        print_entry_name(barrier_load(CODE_SLOTS_PER_SIMPLE_FUN*index + &cdi->rest),
                          f);
         if ((index + 1) < n_funs) fprintf(f, ", ");
     });
@@ -484,11 +521,12 @@ lisp_backtrace(int nframes)
             absolute_pc = (char*)info.pc;
             printf("pc=%p ", absolute_pc);
         }
-
+#ifdef reg_LRA
         // If LRA does not match the PC, print it. This should not happen.
         if (info.lra != make_lispobj(absolute_pc, OTHER_POINTER_LOWTAG)
             && info.lra != NIL)
             printf("LRA=%p ", (void*)info.lra);
+#endif
 
         int fpvalid = (lispobj*)info.frame >= thread->control_stack_start
           && (lispobj*)info.frame < thread->control_stack_end;
@@ -614,29 +652,6 @@ describe_thread_state(void)
     printf("Pending handler = %p\n", data->pending_handler);
 }
 
-static char* asm_routine_name(char* pc)
-{
-    struct code *c = (void*)asm_routines_start;
-    int offset = pc - code_text_start(c);
-    struct hash_table* ht = (void*)native_pointer(c->debug_info);
-    struct vector* v = (void*)native_pointer(ht->pairs);
-    int len = vector_len(v);
-    int i;
-    for (i = 2; i < len; i += 2) {
-        if (lowtag_of(v->data[i+1]) != LIST_POINTER_LOWTAG) continue;
-        struct cons* c = CONS(v->data[i+1]);
-        struct cons* cdr = CONS(c->cdr);
-        int from_byteindex = fixnum_value(c->car);
-        int to_byteindex = fixnum_value(cdr->car);
-        if (offset >= from_byteindex && offset <= to_byteindex) {
-            struct symbol* sym = SYMBOL(v->data[i]);
-            struct vector* string = VECTOR(decode_symbol_name(sym->name));
-            return (char*)string->data;
-        }
-    }
-    return "?";
-}
-
 static void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
 #ifdef BACKTRACE_SHOW_FRAME_SIZE
     // This display is a little confusing.  It's the size of the frame that this
@@ -650,8 +665,6 @@ static void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
         lispobj name = debug_function_name_from_pc(code, pc);
         if (name)
             print_entry_name(barrier_load(&name), f);
-        else if (pc >= (char*)asm_routines_start && pc < (char*)asm_routines_end)
-            fprintf(f, "%s (asm)", asm_routine_name(pc));
         else
             fprintf(f, "{code_serialno=%x}", code_serialno(code));
     } else if (gc_managed_heap_space_p((uword_t)pc)) {

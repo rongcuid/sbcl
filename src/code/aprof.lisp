@@ -96,10 +96,8 @@
 (defun patch-code (code locs enable &aux (n 0) (n-patched 0))
   (let* ((enable-counted (sb-fasl:get-asm-routine 'sb-vm::enable-alloc-counter))
          (enable-sized (sb-fasl:get-asm-routine 'sb-vm::enable-sized-alloc-counter))
-         (enable-counted-indirect
-          (sb-x86-64-asm::asm-routine-indirect-address enable-counted))
-         (enable-sized-indirect
-          (sb-x86-64-asm::asm-routine-indirect-address enable-sized))
+         (enable-counted-indirect (sb-vm::asm-routine-indirect-address enable-counted))
+         (enable-sized-indirect (sb-vm::asm-routine-indirect-address enable-sized))
          (stack (make-array 1 :element-type 'sb-vm:word))
          (insts (code-instructions code)))
     (declare (dynamic-extent stack))
@@ -587,7 +585,7 @@
 ;;; Return a name for PC-OFFSET in CODE. PC-OFFSET is relative to
 ;;; CODE-INSTRUCTIONS.
 (defun pc-offset-to-fun-name (pc-offset code)
-  (if (eq sb-vm::*assembler-routines* code)
+  (if (eq sb-fasl:*assembler-routines* code)
       (block nil
         (maphash (lambda (k v) ; FIXME: OAOO violation, at least twice over
                    (when (<= (car v) pc-offset (cadr v))

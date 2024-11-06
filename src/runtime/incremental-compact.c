@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "os.h"
 #include "gc.h"
@@ -190,6 +191,18 @@ static inline lispobj *forward_slot(lispobj *slot, lispobj *source) {
 }
 
 static void fix_slot(lispobj *slot, lispobj *source, enum source source_type) {
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+  if (source_type == SOURCE_LINKAGE_CELL) {
+    /* Source (the cell) can't move but I don't know how to pass nullptr or NIL
+     * as the source while also allowing the value to move. We have to check the
+     * source type and avoid calling forward_slot */
+    lispobj entrypoint = *slot; // this is the function entry address
+    lispobj* funobj = (lispobj*)entrypoint - 2; // KLUDGE: base pointer from entry point
+    if (forwarding_pointer_p(funobj))
+        *slot = fun_self_from_taggedptr(forwarding_pointer_value(funobj));
+    return;
+  }
+#endif
   /* TLS may not be moved, and isn't really an object.
    * mr_preserve_range eventually calls fix_slot with
    * source == NULL to indicate that the source cannot move.
@@ -217,9 +230,7 @@ static void fix_slot(lispobj *slot, lispobj *source, enum source source_type) {
     break;
   case SOURCE_ZERO_TAG:
     /* I'm only guessing that this line is right. It's hard to test because compaction
-     * is unlikely to occur when there are lockfree lists containing logically-deleted nodes.
-     * The only other use of zero tag is for #+UNTAGGED-FDEFNS on ppc64, but soft marking
-     * and hence mark-region are not supported on that architecture */
+     * is unlikely to occur when there are lockfree lists containing logically-deleted nodes. */
     *slot = (lispobj)native_pointer(follow_fp(*slot));
     break;
   case SOURCE_CLOSURE: {
@@ -229,13 +240,9 @@ static void fix_slot(lispobj *slot, lispobj *source, enum source source_type) {
     closure->fun = fun_self_from_taggedptr(follow_fp(fun_taggedptr_from_self(closure->fun)));
     break;
   }
-  case SOURCE_SYMBOL_NAME: {
-    /* SOURCE_SYMBOL_NAME can only be the source type of the s->name
-     * slot. */
-    struct symbol *s = (struct symbol*)source;
-    set_symbol_name(s, follow_fp(decode_symbol_name(s->name)));
-    break;
-  }
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+  default: lose("Can't happen");
+#else
   case SOURCE_FDEFN_RAW: {
     /* SOURCE_FDEFN_RAW can only be the source type of the fdefn->raw_addr
      * slot. */
@@ -243,6 +250,7 @@ static void fix_slot(lispobj *slot, lispobj *source, enum source source_type) {
     lispobj obj = decode_fdefn_rawfun(f);
     f->raw_addr += (sword_t)(follow_fp(obj) - obj);
   }
+#endif
   }
 }
 

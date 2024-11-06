@@ -19,6 +19,7 @@
 #include "genesis/sbcl.h"
 #include "gc-assert.h"
 #include "gc-typedefs.h"
+#include "globals.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -114,6 +115,32 @@ char *page_card_mark_string(page_index_t page, char *result);
 extern int valid_tagged_pointer_p(lispobj);
 extern lispobj *component_ptr_from_pc(char *pc);
 
+extern void sweep_linkage_space();
+
+extern page_index_t page_table_pages;
+/* Find the page index within the page_table for the given
+ * address. Return -1 on failure. */
+static inline page_index_t find_page_index(void *addr)
+{
+    if (addr >= (void*)DYNAMIC_SPACE_START) {
+        // Do not directly assign this computation to a variable of type 'page_index_t'
+        // because an excessively high address could chop high bits off, making the
+        // result look in range by accident.
+        uword_t index = ((uintptr_t)addr -
+                         (uintptr_t)DYNAMIC_SPACE_START) / GENCGC_PAGE_BYTES;
+        if (index < (uword_t)page_table_pages)
+            return index;
+    }
+    return (-1);
+}
+
+/* Calculate the start address for the given page number. */
+static inline char *page_address(page_index_t page_num)
+{
+    return (void*)(DYNAMIC_SPACE_START + (page_num * GENCGC_PAGE_BYTES));
+}
+
+#define PAGE_INDEX_FMT "d"
 #include "immobile-space.h" // provides dummy stubs if #-immobile-space
 #ifdef LISP_FEATURE_MARK_REGION_GC
 #include "pmrgc-impl.h"
@@ -154,5 +181,11 @@ extern void prepare_pages(bool commit, page_index_t start, page_index_t end,
 extern _Atomic(char) *page_execp;
 static inline void set_page_executable(page_index_t i, bool val) { page_execp[i] = val; }
 #endif
+
+extern void remset_union(lispobj);
+extern lispobj remset_transfer_list;
+void remember_all_permgen();
+extern int permgen_remset_count;
+extern lispobj permgen_remset[];
 
 #endif /* _GC_H_ */

@@ -84,12 +84,6 @@ static inline bool page_boxed_p(page_index_t page) {
     return boxed_type_p(page_table[page].type & PAGE_TYPE_MASK);
 }
 
-/* Calculate the start address for the given page number. */
-inline char *page_address(page_index_t page_num)
-{
-    return (void*)(DYNAMIC_SPACE_START + (page_num * GENCGC_PAGE_BYTES));
-}
-
 /* Calculate the address where the allocation region associated with
  * the page starts. */
 static inline void *
@@ -1059,7 +1053,19 @@ collect_garbage(generation_index_t last_gen)
      * So we need to close them for those two cases.
      */
     struct thread *th;
-    for_each_thread(th) gc_close_thread_regions(th, 0);
+    for_each_thread(th) {
+        gc_close_thread_regions(th, 0);
+#ifdef LISP_FEATURE_PERMGEN
+        // transfer the thread-local remset to the global remset
+        remset_union(th->remset);
+        th->remset = 0;
+#endif
+    }
+#ifdef LISP_FEATURE_PERMGEN
+    // transfer the remsets from threads that exited
+    remset_union(remset_transfer_list);
+    remset_transfer_list = 0;
+#endif
     ensure_region_closed(code_region, PAGE_TYPE_CODE);
     if (gencgc_verbose > 2) fprintf(stderr, "[%d] BEGIN gc(%d)\n", n_lisp_gcs, last_gen);
 
@@ -1246,6 +1252,12 @@ collect_garbage(generation_index_t last_gen)
     // This could be done in the background somehow maybe.
     page_index_t max_nfp = initial_nfp > next_free_page ? initial_nfp : next_free_page;
     memset(gc_page_pins, 0, max_nfp);
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    sweep_linkage_space();
+#endif
+    // It's confusing to see 'from_space=5' and such in the next *pre* GC verification
+    from_space = -1;
+    new_space = 0;
 }
 
 /* Initialization of gencgc metadata is split into two steps:
@@ -1701,14 +1713,6 @@ static int verify_headered_object(lispobj* object, sword_t nwords,
         sword_t nheader_words = code_header_words(code);
         /* Verify the boxed section of the code data block */
         state->min_pointee_gen = ARTIFICIALLY_HIGH_GEN;
-#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
-        {
-        lispobj* pfdefn = code->constants + code_n_funs(code) * CODE_SLOTS_PER_SIMPLE_FUN;
-        lispobj* end = pfdefn + code_n_named_calls(code);
-        for ( ; pfdefn < end ; ++pfdefn)
-            if (*pfdefn) CHECK(*pfdefn | OTHER_POINTER_LOWTAG, pfdefn);
-        }
-#endif
         for (i=2; i <nheader_words; ++i) CHECK(object[i], object+i);
 #ifndef NDEBUG // avoid "unused" warnings on auto vars of for_each_simple_fun()
         // Check the SIMPLE-FUN headers
@@ -1745,6 +1749,9 @@ static int verify_headered_object(lispobj* object, sword_t nwords,
         CHECK(s->value, &s->value);
         CHECK(s->fdefn, &s->fdefn);
         CHECK(s->info, &s->info);
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+        CHECK(linkage_cell_function(symbol_linkage_index(s)), &s->fdefn);
+#endif
         CHECK(decode_symbol_name(s->name), &s->name);
         return 0;
     }
@@ -1752,7 +1759,11 @@ static int verify_headered_object(lispobj* object, sword_t nwords,
         struct fdefn* f = (void*)object;
         CHECK(f->name, &f->name);
         CHECK(f->fun, &f->fun);
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+        CHECK(linkage_cell_function(fdefn_linkage_index(f)), &f->fun);
+#else
         CHECK(decode_fdefn_rawfun(f), (lispobj*)&f->raw_addr);
+#endif
         return 0;
     }
     for (i=1; i<nwords; ++i) CHECK(object[i], object+i);
@@ -1918,7 +1929,7 @@ static void check_free_pages()
         if (page_free_p(p))
             for_lines_in_page(l, p)
                 if (allocs[l])
-                    lose("You call page #%ld free, despite the fact it's obviously got allocation bits.", p);
+                    lose("You call page #%d free, despite the fact it's obviously got allocation bits.", p);
 }
 
 /* Return the number of verification errors found.
@@ -1966,6 +1977,7 @@ int verify_heap(__attribute__((unused)) lispobj* cur_thread_approx_stackptr,
     state.object_addr = 0;
     state.object_gen = 0;
     for_each_thread(th) {
+        if (th->state_word.state == STATE_DEAD) continue;
         if (verbose)
             fprintf(stderr, " [thread bindings]");
         if (verify((lispobj)th->binding_stack_start,
@@ -1986,6 +1998,9 @@ int verify_heap(__attribute__((unused)) lispobj* cur_thread_approx_stackptr,
     // Just don't worry about NIL, it's seldom the problem
     // if (verify(NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, &state, 0)) goto out;
     if (verify(STATIC_SPACE_OBJECTS_START, static_space_free_pointer, &state, 0)) goto out;
+    if (verbose)
+        fprintf(stderr, " [permgen]");
+    if (verify(PERMGEN_SPACE_START, permgen_space_free_pointer, &state, 0)) goto out;
     if (verbose)
         fprintf(stderr, " [dynamic]");
     state.flags |= VERIFYING_GENERATIONAL;

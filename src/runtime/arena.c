@@ -170,8 +170,10 @@ static page_index_t close_heap_region(struct alloc_region* r, int page_type) {
     return result;
 }
 
+int inhibit_arena_use = 0;
 void switch_to_arena(lispobj arena_taggedptr)
 {
+    if (inhibit_arena_use) return;
     struct arena* arena = (void*)native_pointer(arena_taggedptr);
     struct thread* th = get_sb_vm_thread();
     struct extra_thread_data *extra_data = thread_extra_data(th);
@@ -509,7 +511,6 @@ static int valid_arena_obj_ptr_p(lispobj ptr)
 static void __attribute__((unused))
 scan_thread_control_stack(lispobj* start, lispobj* end, lispobj lispthread)
 {
-    gc_assert(arena_chain);
     lispobj* where = start;
     for ( ; where < end ; ++where) {
         lispobj word = *where;
@@ -532,12 +533,17 @@ static void scan_thread_words(lispobj* start, lispobj* end)
 
 int find_dynspace_to_arena_ptrs(lispobj arena, lispobj result_buffer)
 {
+    gc_stop_the_world();
+    if (!arena_chain) {
+        fprintf(stderr, "No arenas to examine\n");
+        gc_start_the_world();
+        return 0;
+    }
     target_arena = arena;
     // check for suspcious pointers to arena from thread roots
     searchresult.v = VECTOR(result_buffer);
     stray_pointer_detector_fn = record_if_points_to_arena_interior;
 
-    gc_stop_the_world();
     prepare_for_full_mark_phase();
     fprintf(stderr, "Checking threads...\n");
     struct thread* th;
@@ -556,8 +562,8 @@ int find_dynspace_to_arena_ptrs(lispobj arena, lispobj result_buffer)
             lispobj *sp = os_get_csp(th);
 #else
             int ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX, th));
-            if (ici != 1) lose("can't find interrupt context");
-            lispobj sp = *os_context_register_addr(nth_interrupt_context(0, th), reg_SP);
+            if (ici == 0) lose("can't find interrupt context");
+            lispobj sp = *os_context_register_addr(nth_interrupt_context(ici-1, th), reg_SP);
 #endif
             scan_thread_control_stack((lispobj*)sp, th->control_stack_end, th->lisp_thread);
         }

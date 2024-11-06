@@ -131,14 +131,15 @@
     (inst or t1 t1 t2)
     (storew t1 x 0 other-pointer-lowtag)))
 
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
+(define-vop (%closure-fun)
   (:policy :fast-safe)
-  (:generator 1
-    (inst clrrdi res ptr n-fixnum-tag-bits)))
-
+  (:translate %closure-fun)
+  (:args (function :scs (descriptor-reg)))
+  (:results (result :scs (descriptor-reg)))
+  (:generator 3
+    ;; Compute tagged pointer to simple-fun underlying this closure
+    (loadw result function closure-fun-slot fun-pointer-lowtag)
+    (inst subi result result (- (* simple-fun-insts-offset n-word-bytes) fun-pointer-lowtag))))
 
 ;;;; Allocation
 

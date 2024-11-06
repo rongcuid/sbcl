@@ -214,11 +214,8 @@ static lispobj* valid_ambiguous_pointer_p(lispobj ptr, int registerp)
     // exact pointer is always a winner
     if (compute_lispobj(start) == ptr) return start;
     unsigned char widetag = widetag_of(start);
-    // allow untagged and/or interior pointer to code, fdefn, funcallable-instance
-    // FIXME: could add a few more rejection filters
-    //        such as untagged ptr to 2nd word of fdefn
+    // allow untagged and/or interior pointer to code, funcallable-instance
     if (widetag == CODE_HEADER_WIDETAG ||
-        widetag == FDEFN_WIDETAG ||
         widetag == FUNCALLABLE_INSTANCE_WIDETAG)
         return start;
     // allow in-register untagged pointer to lockfree list node
@@ -295,18 +292,13 @@ deduce_thread(uword_t pointer, char** pc)
 }
 #endif
 
-static int non_nil_symbolp(lispobj x) {
-    return lowtag_of(x) == OTHER_POINTER_LOWTAG
-      && widetag_of((lispobj*)(x-OTHER_POINTER_LOWTAG)) == SYMBOL_WIDETAG;
-}
-
 static __attribute__((unused)) int tls_index_ok(lispobj tlsindex, struct vector* ignored_objects)
 {
     if (ignored_objects) {
         int i;
         for (i = vector_len(ignored_objects)-1; i >= 0; --i) {
             lispobj x = ignored_objects->data[i];
-            if (non_nil_symbolp(x) && tls_index_of(SYMBOL(x)) == tlsindex) return 0;
+            if (non_nil_symbol_p(x) && tls_index_of(SYMBOL(x)) == tlsindex) return 0;
         }
     }
     return 1; // is OK
@@ -673,13 +665,6 @@ static lispobj trace1(lispobj object,
         if (next.wordindex == 0 && (instancep(ptr) || functionp(ptr))) {
             target = instance_layout(native_pointer(ptr));
         }
-#ifdef LISP_FEATURE_COMPACT_SYMBOL
-        else if (next.wordindex == slot_index_of(symbol,name) &&
-                 lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
-                 widetag_of(&SYMBOL(ptr)->header) == SYMBOL_WIDETAG) {
-            target = decode_symbol_name(target);
-        }
-#endif
 #if FUN_SELF_FIXNUM_TAGGED
         else if (next.wordindex == 1 && functionp(ptr)
                  && widetag_of(native_pointer(ptr)) == CLOSURE_WIDETAG) {

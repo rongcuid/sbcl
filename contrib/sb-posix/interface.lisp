@@ -356,9 +356,7 @@
 
   ;; FIXME this is a lie, of course this can fail, but there's no
   ;; error handling here yet!
-  #+darwin
-  (define-call "darwin_reinit" void never-fails)
-  (define-call ("posix_fork" :c-name "fork") pid-t minusp)
+  (define-call-internally posix-fork "fork" pid-t minusp)
   (defun fork ()
     "Forks the current process, returning 0 in the new process and the PID of
 the child process in the parent. Forking while multiple threads are running is
@@ -391,8 +389,7 @@ not supported."
       (error "Cannot fork with multiple threads running."))
     (let ((pid (posix-fork)))
       (when (= pid 0) ; child
-        #+darwin (darwin-reinit)
-        #+mark-region-gc (alien-funcall (extern-alien "thread_pool_init" (function void))))
+        (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
       #+sb-thread (sb-impl::finalizer-thread-start)
       pid))
   (export 'fork :sb-posix)
@@ -919,10 +916,9 @@ not supported."
           result)))
   (export 'utime :sb-posix)
   (defun utime (filename &optional access-time modification-time)
-    (let ((fun (extern-alien #-netbsd "utime" #+netbsd "_utime"
-                             (function int (c-string :not-null t)
-                                       (* alien-utimbuf))))
-          (name (filename filename)))
+  (with-alien ((fun (function int (c-string :not-null t) (* alien-utimbuf))
+                    :extern #-netbsd "utime" #+netbsd "_utime"))
+    (let ((name (filename filename)))
       (if (not (and access-time modification-time))
           (alien-funcall fun name nil)
           (with-alien ((utimbuf (struct alien-utimbuf)))
@@ -931,7 +927,7 @@ not supported."
             (let ((result (alien-funcall fun name (alien-sap utimbuf))))
               (if (minusp result)
                   (syscall-error 'utime)
-                  result))))))
+                  result)))))))
   (export 'utimes :sb-posix)
   (defun utimes (filename &optional access-time modification-time)
     (flet ((seconds-and-useconds (time)
@@ -942,10 +938,9 @@ not supported."
              (if (minusp value)
                  (syscall-error 'utimes)
                  value)))
-      (let ((fun (extern-alien #-netbsd "utimes" #+netbsd "sb_utimes"
-                               (function int (c-string :not-null t)
-                                                  (* (array alien-timeval 2)))))
-            (name (filename filename)))
+   (with-alien ((fun (function int (c-string :not-null t) (* (array alien-timeval 2)))
+                     :extern #-netbsd "utimes" #+netbsd "sb_utimes"))
+     (let ((name (filename filename)))
         (if (not (and access-time modification-time))
             (maybe-syscall-error (alien-funcall fun name nil))
             (with-alien ((buf (array alien-timeval 2)))
@@ -958,7 +953,7 @@ not supported."
                               (slot modtime 'usec))
                       (seconds-and-useconds (or modification-time 0)))
                 (maybe-syscall-error (alien-funcall fun name
-                                                    (alien-sap buf))))))))))
+                                                    (alien-sap buf)))))))))))
 
 
 ;;; environment

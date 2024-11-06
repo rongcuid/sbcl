@@ -104,7 +104,7 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
         output.size = buf_size;
 
         unsigned char * written, * end;
-        long total_written = 0;
+        size_t total_written = 0;
         ZSTD_CStream *stream = ZSTD_createCStream();
         if (stream == NULL)
             lose("failed to create zstd compression context");
@@ -134,7 +134,7 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
                 }
             }
         } while (ret != 0);
-        printf("compressed %lu bytes into %lu at level %i\n",
+        printf("compressed %zu bytes into %zu at level %i\n",
                bytes, total_written, compression);
 
         ZSTD_freeCStream(stream);
@@ -285,16 +285,52 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     int string_words = ALIGN_UP(stringlen, sizeof (core_entry_elt_t))
         / sizeof (core_entry_elt_t);
     int pad = string_words * sizeof (core_entry_elt_t) - stringlen;
-    /* Write 3 word entry header: a word for entry-type-code, a word for
-     * the total length in words, and a word for the string length */
+    /* Write 5 word entry header: a word for entry-type-code, the length in words,
+     * the GC enum, the address of NIL, and the string length */
     write_lispobj(BUILD_ID_CORE_ENTRY_TYPE_CODE, file);
-    write_lispobj(3 + string_words, file);
+    write_lispobj(5 + string_words, file);
+#ifdef LISP_FEATURE_GENCGC
+    write_lispobj(1, file);
+#endif
+#ifdef LISP_FEATURE_MARK_REGION_GC
+    write_lispobj(2, file);
+#endif
+#ifdef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
+    write_lispobj(0, file);
+#else
+    write_lispobj(NIL, file);
+#endif
     write_lispobj(stringlen, file);
     int nwrote = fwrite(build_id, 1, stringlen, file);
     /* Write padding bytes to align to core_entry_elt_t */
     while (pad--) nwrote += (fputc(0xff, file) != EOF);
     if (nwrote != (int)(sizeof (core_entry_elt_t) * string_words))
         perror(GENERAL_WRITE_FAILURE_MSG);
+
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    // Lisp linkage space precedes the general space directory
+    int i;
+    extern void illegal_linkage_space_call();
+    /* The C runtime is theoretically position-independent so don't write out the address
+     * of the unused entry sentinel. The affected elements needn't be restored on restart.
+     * (Maybe add a renumbering pass in Lisp to ensure the table is 100% dense) */
+    for (i=0; i<linkage_table_count; ++i)
+        if (linkage_space[i] == (uword_t)illegal_linkage_space_call)
+            linkage_space[i] = 0;
+    int nbytes = ALIGN_UP(linkage_table_count<<WORD_SHIFT, BACKEND_PAGE_BYTES);
+    if (!lisp_startup_options.noinform)
+        printf("writing %lu bytes from the %s space at %p\n",
+               (long unsigned)nbytes, "linkage", linkage_space);
+
+    write_lispobj(LISP_LINKAGE_SPACE_CORE_ENTRY_TYPE_CODE, file);
+    write_lispobj(5, file); // number of words in this core header entry
+    write_lispobj(linkage_table_count, file);
+    sword_t data_page =
+        write_bytes(file, (char*)linkage_space,
+                    nbytes, core_start_pos, COMPRESSION_LEVEL_NONE);
+    write_lispobj(data_page, file);
+    write_lispobj(0, file); // address of ELF-based linkage entries
+#endif
 
     write_lispobj(DIRECTORY_CORE_ENTRY_TYPE_CODE, file);
     ftell_type spacecount_pos = FTELL(file);
@@ -308,6 +344,13 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  core_start_pos,
                  core_compression_level), ++count;
 #ifdef LISP_FEATURE_PERMGEN
+    {
+#define REMEMBERED_BIT (uword_t)0x80000000
+        lispobj* where = (void*)PERMGEN_SPACE_START;
+        // clear every object's bit
+        for ( ; where < permgen_space_free_pointer ; where += object_size(where) )
+            *where &= ~REMEMBERED_BIT;
+    }
     output_space(file,
                  PERMGEN_CORE_SPACE_ID,
                  (lispobj *)PERMGEN_SPACE_START,
@@ -604,6 +647,10 @@ static void prepare_dynamic_space_for_final_gc(struct thread* thread)
 #endif
         }
     }
+#ifdef LISP_FEATURE_PERMGEN
+    extern void remember_all_permgen();
+    remember_all_permgen();
+#endif
 #ifdef LISP_FEATURE_MARK_REGION_GC
     for (generation_index_t g = 1; g <= PSEUDO_STATIC_GENERATION; g++) {
       generations[0].bytes_allocated += generations[g].bytes_allocated;

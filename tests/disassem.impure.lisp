@@ -44,7 +44,9 @@
 (with-test (:name :disassemble-method
             :skipped-on :interpreter)
   (with-output-to-string (s)
-    (sb-c:dis (defmethod hello ((self cons)) "here i am") s)))
+    (sb-c:dis (defmethod hello ((self cons)) "here i am") s)
+    (disassemble (sb-mop:method-function (car (sb-mop:generic-function-methods #'documentation)))
+                 :stream s)))
 
 (with-test (:name :lp-bug-1861418)
   (disassemble '(lambda ()
@@ -100,12 +102,12 @@
 (defun install-counting-wrapper (discount)
   (declare (ignorable discount))
   #+x86-64
-  (sb-int:encapsulate
-   'sb-x86-64-asm::print-mem-ref 'test
-   (lambda (realfun &rest args)
-     ;; Each mem ref disassembled is one cons cell
-     (incf (car discount) (* sb-vm:cons-size sb-vm:n-word-bytes))
-     (apply realfun args))))
+  (flet ((wrap (realfun &rest args)
+           ;; Each mem ref disassembled to a model costs one cons cell
+           (incf (car discount) (* sb-vm:cons-size sb-vm:n-word-bytes))
+           (apply realfun args)))
+    (sb-int:encapsulate 'sb-x86-64-asm::print-mem-ref 'test #'wrap)
+    (sb-int:encapsulate 'sb-x86-64-asm::lea-print-ea 'test #'wrap)))
 (compile 'install-counting-wrapper)
 
 ;;; Disassembling everything takes around .8 seconds and conses ~14MB for me.

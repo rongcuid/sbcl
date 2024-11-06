@@ -8,7 +8,7 @@
 
 ;; sb-xref-for-internals is actively harmful to tree-shaking.
 ;; Remove some symbols to make the hide-packages test pass.
-#+sb-xref-for-internals
+#+(and sb-xref-for-internals (not sb-devel))
 (progn
   (fmakunbound 'sb-kernel::type-class-fun-slot)
   (fmakunbound 'sb-kernel::new-ctype))
@@ -191,23 +191,26 @@
                 ;; with non-cold-init lambdas. Though the cold-init function is
                 ;; never called post-build, it is not discarded. Also, I suspect
                 ;; that the following loop should print nothing, but it does:
-#|
-                (sb-vm:map-allocated-objects
-                  (lambda (obj type size)
-                    (declare (ignore size))
-                    (when (= type sb-vm:code-header-widetag)
-                      (let ((name (sb-c::debug-info-name
-                                   (sb-kernel:%code-debug-info obj))))
-                        (when (and (stringp name) (search "COLD-INIT-FORMS" name))
-                          (print obj)))))
-                  :dynamic)
-|#
+                #|
+                (sb-vm:map-allocated-objects ;
+                (lambda (obj type size) ;
+                (declare (ignore size)) ;
+                (when (= type sb-vm:code-header-widetag) ;
+                (let ((name (sb-c::debug-info-name ;
+                (sb-kernel:%code-debug-info obj)))) ;
+                (when (and (stringp name) (search "COLD-INIT-FORMS" name)) ;
+                (print obj)))))         ;
+                :dynamic)               ;
+                |#
                 (fmakunbound symbol)
                 (unintern symbol package))))))
   (sb-int:dohash ((k v) sb-c::*backend-parsed-vops*)
     (declare (ignore k))
     (setf (sb-c::vop-parse-body v) nil))
+  ;; Used for inheriting from other VOPs, not needed in the target.
+  (setf sb-c::*backend-parsed-vops* (make-hash-table))
   result)
+
 
 ;;; Check for potentially bad format-control strings
 (defun scan-format-control-strings ()
@@ -293,10 +296,10 @@ Please check that all strings which were not recognizable to the compiler
     (when (typep info 'sb-c::compiled-debug-info)
       (let ((map (sb-c::compiled-debug-info-fun-map info)))
         (when (typep map '(simple-array (unsigned-byte 8) (*)))
-          (sb-alien:with-alien ((compress-vector (function int (* char) size-t) :extern "compress_vector"))
+          (sb-alien:with-alien ((compress-vector (function int unsigned size-t) :extern))
             (sb-sys:with-pinned-objects (map)
               (sb-alien:alien-funcall compress-vector
-                                      (sb-sys:int-sap (sb-kernel:get-lisp-obj-address map))
+                                      (sb-kernel:get-lisp-obj-address map)
                                       (length map)))))))))
 (progn
   ;; Remove source forms of compiled-to-memory lambda expressions.
@@ -449,13 +452,16 @@ Please check that all strings which were not recognizable to the compiler
       (#.(find-package "SB-VM")
        (or (eq accessibility :external)
            ;; overapproximate what we need for contribs and tests
-           (member symbol '(sb-vm::map-referencing-objects
+           (member symbol `(sb-vm::map-referencing-objects
                             sb-vm::map-stack-references
                             sb-vm::reconstitute-object
                             sb-vm::points-to-arena
                             ;; need this for defining a vop which
                             ;; tests the x86-64 allocation profiler
                             sb-vm::pseudo-atomic
+                            ,@(or #+(or x86 x86-64) '(sb-vm::%vector-cas-pair
+                                                      sb-vm::%instance-cas-pair
+                                                      sb-vm::%cons-cas-pair))
                             ;; Naughty outside-world code uses these.
                             #+x86-64 sb-vm::reg-in-size))
            (let ((s (string symbol))) (and (search "THREAD-" s) (search "-SLOT" s)))
@@ -493,9 +499,12 @@ Please check that all strings which were not recognizable to the compiler
        (and (eq accessibility :external)
             (constantp symbol)))
       (#.(find-package "SB-BIGNUM")
-       ;; There are 2 important external symbols for sb-gmp.
+       ;; There are 2 important external symbols for sb-gmp, and 2
+       ;; important external symbols for sb-rotate-byte.
        ;; Other externals can disappear.
        (member symbol '(sb-bignum:%allocate-bignum
+                        sb-bignum:maximum-bignum-length
+                        sb-bignum:bit-index
                         sb-bignum:make-small-bignum)))
       (t
        (if (eq (symbol-package symbol)
@@ -527,6 +536,23 @@ Please check that all strings which were not recognizable to the compiler
             (+ sum-delta-ext sum-delta-int))))
 
 (scan-format-control-strings)
+
+(macrolet ((def-backward-compatible-sb-c-specials (pairs) ; for UIOP + ASDF
+             `(progn
+                ,@(mapcar (lambda (pair)
+                            `(define-symbol-macro ,(car pair)
+                                 (,(sb-int:package-symbolicate "SB-C" "CU-" (cdr pair) "-COUNT")
+                                   sb-c::*compilation-unit*)))
+                          pairs))))
+  ;; coece to a strict boolean
+  (define-symbol-macro sb-c::*in-compilation-unit* (not (null sb-c::*compilation-unit*)))
+  ;; the "specials" are all SETFable when and only when *IN-COMPILATION-UNIT* is T
+  (def-backward-compatible-sb-c-specials
+      sb-c::((*aborted-compilation-unit-count* . "ABORTED")
+             (*compiler-error-count* . "ERROR")
+             (*compiler-warning-count*  . "WARNING")
+             (*compiler-style-warning-count* . "STYLE-WARNING")
+             (*compiler-note-count* . "NOTE"))))
 
 #+sb-devel
 (rename-package "COMMON-LISP" "COMMON-LISP" '("SB-XC" "CL"))

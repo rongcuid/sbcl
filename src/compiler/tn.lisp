@@ -253,13 +253,12 @@
               ;; because liveness depends on pointer tracing without looking at code-fixups.
               (when (and sc
                          (or (not immed)
-                             #+permgen (typep (constant-value constant) 'layout)
-                             #+immobile-space
+                             #+(or immobile-space permgen)
                              (let ((val (constant-value constant)))
                                (or (and (symbolp val) (not (sb-vm:static-symbol-p val)))
                                    (typep val 'layout))))
                          #+(or arm64 x86-64)
-                         (not (eql (constant-value constant) $0f0)))
+                         (not (eql (constant-value constant) 0f0)))
                 (let ((constants (ir2-component-constants component)))
                   (setf (tn-offset res)
                         (vector-push-extend constant constants))))

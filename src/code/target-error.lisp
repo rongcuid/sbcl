@@ -831,6 +831,8 @@ with that condition (or with no condition) will be returned."
        (struct-context
         (format nil "when setting slot ~s of structure ~s"
                 (cddr context) (cadr context)))
+       (sb-pcl::slot
+        (format nil "when setting slot ~s" (cadr context)))
        (t context)))
     ((eql sb-c::aref-context)
      (let (*print-circle*)
@@ -853,23 +855,30 @@ with that condition (or with no condition) will be returned."
   (:report report-general-type-error))
 (defun report-general-type-error (condition stream)
   (let ((type (type-error-expected-type condition))
-        (context (type-error-context condition)))
-    (if (eq context :multiple-values)
-        (format stream  "~@<The values ~
+        (context (type-error-context condition))
+        (datum (type-error-datum condition)))
+    (case context
+      (:multiple-values
+       (format stream  "~@<The values ~
                          ~@:_~2@T~S ~
                          ~@:_are not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~:@>"
-                   (type-error-datum condition)
-                   type)
-        (format stream  "~@<The value ~
+               datum
+               type))
+      (sb-c::coerce-context
+       (format stream "~S can't be converted to type ~
+                       ~/sb-impl:print-type-specifier/."
+               datum type))
+      (t
+       (format stream  "~@<The value ~
                          ~@:_~2@T~S ~
                          ~@:_is not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~@[ ~
                          ~@:_~a~]~:@>"
-                (type-error-datum condition)
-                type
-                (decode-type-error-context (type-error-context condition)
-                                           type)))))
+               datum
+               type
+               (decode-type-error-context (type-error-context condition)
+                                          type))))))
 
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
@@ -1764,7 +1773,7 @@ handled by any other handler, it will be muffled.")
          (debug-source (when debug-info
                          (sb-c::debug-info-source debug-info)))
          (namestring (when debug-source
-                       (debug-source-namestring debug-source))))
+                       (sb-c::debug-source-namestring debug-source))))
     namestring))
 
 (defun interesting-function-redefinition-warning-p (warning old)
@@ -2434,7 +2443,7 @@ you did not expect to see this message, please report it."
      (print-unreadable-object (object stream :type t :identity t)))))
 
 
-(defun assert-error (assertion &rest rest)
+(define-error-wrapper assert-error (assertion &rest rest)
   (let* ((rest rest)
          (n-args-and-values (if (fixnump (car rest))
                                 (* (pop rest) 2)
@@ -2492,7 +2501,7 @@ you did not expect to see this message, please report it."
   (finish-output *query-io*)
   (multiple-value-list (eval (read *query-io*))))
 
-(defun check-type-error (place place-value type &optional type-string)
+(define-error-wrapper check-type-error (place place-value type &optional type-string)
   (let ((condition
          (make-condition
           'simple-type-error
@@ -2507,6 +2516,30 @@ you did not expect to see this message, please report it."
                   (format stream "Supply a new value for ~S." place))
         :interactive read-evaluated-form
         value))))
+
+(define-error-wrapper check-type-error-trap (place value type)
+  (multiple-value-bind (place type type-string)
+      (if (stringp type)
+          (values (car place) (cdr place) type)
+          (values place type))
+    (loop
+     (let ((condition
+             (make-condition
+              'simple-type-error
+              :datum value
+              :expected-type type
+              :format-control
+              "The value of ~S is ~S, which is not ~:[of type ~S~;~:*~A~]."
+              :format-arguments (list place value type-string type))))
+       (restart-case (error condition)
+         (store-value (new-value)
+           :report (lambda (stream)
+                     (format stream "Supply a new value for ~S." place))
+           :interactive read-evaluated-form
+           (setf value new-value)
+           (when (typep new-value type)
+             (return))))))
+    value))
 
 (define-error-wrapper etypecase-failure (value keys)
   (error 'case-failure

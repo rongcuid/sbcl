@@ -129,6 +129,10 @@ struct sigaction old_ll_sigactions[NSIG];
 #endif
 lispobj lisp_sig_handlers[NSIG];
 
+#ifndef LISP_FEATURE_SPARC
+# define arch_os_get_context(c) *c
+#endif
+
 /* Under Linux on some architectures, we appear to have to restore the
  * FPU control word from the context, as after the signal is delivered
  * we appear to have a null FPU control word. */
@@ -1473,8 +1477,8 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
 
     int my_state = thread_wait_until_not(STATE_STOPPED, thread);
 #ifdef MEASURE_STOP_THE_WORLD_PAUSE
-    extern void thread_accrue_stw_time(struct thread*,struct timespec*);
-    thread_accrue_stw_time(thread, &t_beginpause);
+    extern void thread_accrue_stw_time(struct thread*,struct timespec*,struct timespec*);
+    thread_accrue_stw_time(thread, &t_beginpause, 0);
 #endif
 
     event0("resumed");
@@ -1516,7 +1520,7 @@ interrupt_handle_now_handler(int signal, siginfo_t *info, void *void_context)
  */
 
 #if (defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
-extern int *os_context_flags_addr(os_context_t *context);
+extern os_context_register_t *os_context_flags_addr(os_context_t *context);
 #endif
 
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs);
@@ -2071,17 +2075,7 @@ interrupt_init(void)
 #endif
 }
 
-#ifndef LISP_FEATURE_WIN32
-int
-siginfo_code(siginfo_t *info)
-{
-    return info->si_code;
-}
-
-void
-lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
-{
-
+void lisp_memory_fault_warning(os_context_t *context, os_vm_address_t addr) {
     /* If it's a store to read-only space, it's not "corruption", so don't say that.
      * Lisp will change its wording of the memory-fault-error string */
 
@@ -2112,6 +2106,20 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
     } else {
         fake_foreign_function_call(context);
     }
+}
+
+
+#ifndef LISP_FEATURE_WIN32
+int
+siginfo_code(siginfo_t *info)
+{
+    return info->si_code;
+}
+
+void
+lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
+{
+    lisp_memory_fault_warning(context, addr);
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 #  if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))

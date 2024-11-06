@@ -122,7 +122,7 @@
   ;; Packed integer with 4 subfields.
   ;; FIXNUM is ok for the host - it's guaranteed to be at least 16 signed bits
   ;; and we don't have structures whose slot indices run into the thousands.
-  (bits 0 :type fixnum :read-only t)
+  (bits 0 :type fixnum)
   (default nil :read-only t))                    ; default value expression
 (declaim (freeze-type defstruct-slot-description))
 
@@ -130,10 +130,13 @@
   ;; Ensure that rsd-index is representable in 3 bits. (Can easily be changed)
   (assert (<= (1+ (length *raw-slot-data*)) 8)))
 
-(defconstant sb-vm:dsd-index-shift   7)
+(defconstant sb-vm:dsd-index-shift   8)
 (defconstant sb-vm:dsd-raw-type-mask #b111)
+(defconstant dsd-default-error (ash 1 7))
+
 (defun pack-dsd-bits (index read-only safe-p always-boundp gc-ignorable rsd-index)
   (logior (ash index sb-vm:dsd-index-shift)
+          ;; (ash 1 7) meaning DEFAULT doesn't match TYPE is set during compilation of the constructor.
           (if read-only (ash 1 6) 0)
           (if safe-p (ash 1 5) 0)
           (if always-boundp (ash 1 4) 0)
@@ -354,7 +357,8 @@
                   ;; Rather than hit MAKE-DEFSTRUCT-DESCRIPTION's type-check
                   ;; on the NAME slot, we can be a little more clear.
                   (error "DEFSTRUCT: ~S is not a symbol." name)))
-         (flagbits (logior #+sb-xc-host (if (eq name 'layout) +dd-varylen+ 0)
+         (flagbits (logior #+sb-xc-host
+                           (if (member name '(sb-c::compiled-debug-info layout)) +dd-varylen+ 0)
                            (if null-env-p +dd-nullenv+ 0)))
          (dd (make-defstruct-description name flagbits))
          (*dsd-source-form* nil)
@@ -1057,8 +1061,12 @@ unless :NAMED is also specified.")))
 
     (let* ((gc-ignorable
             (csubtypep ctype
-                       (specifier-type '(or fixnum boolean character
-                                            #+64-bit single-float))))
+                       ;; GC can only ignore booleans if their values
+                       ;; never change, even between images, so only
+                       ;; when static space is not relocatable.
+                       (specifier-type '(or fixnum character
+                                         #+64-bit single-float
+                                         #-relocatable-static-space boolean))))
            (dsd (make-dsd name type accessor-name
                           (pack-dsd-bits index read-only safe-p
                                          always-boundp gc-ignorable
@@ -1477,7 +1485,8 @@ unless :NAMED is also specified.")))
                            accessor-name
                            (dsd-name dsd))))))))
 
-    (awhen (remove-if-not #'sb-c::emitted-full-call-count fnames)
+    (awhen (and sb-c::*compilation-unit*
+                (remove-if-not #'sb-c::emitted-full-call-count fnames))
       (sb-c:compiler-style-warn
        'sb-c:inlining-dependency-failure
        ;; This message omits the http://en.wikipedia.org/wiki/Serial_comma
@@ -1654,9 +1663,18 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;     read-only space. For others it is a fixnum.
 ;;;     In either case the GC need not observe the value.
 (defconstant funinstance-layout-bitmap
-  #-executable-funinstances                                     -6
-  #+(and executable-funinstances (not compact-instance-header)) -24
-  #+(and executable-funinstances compact-instance-header)       -8)
+  (macrolet ((untagged-slot-mask ()
+               (let ((objdef (find 'funcallable-instance sb-vm::*primitive-objects*
+                                   :key 'sb-vm::primitive-object-name))
+                     (mask 0))
+                 (dovector (slot (sb-vm::primitive-object-slots objdef) mask)
+                   (destructuring-bind (index name . rest) slot
+                     (declare (ignore rest))
+                     (when (or (string= name "TRAMPOLINE")
+                               (eql (string/= name "INSTWORD") 8)
+                               (string= name "LAYOUT"))
+                       (setf mask (logior mask (ash 1 (1- index))))))))))
+    (lognot (untagged-slot-mask))))
 
 ;;;
 ;;; Ordinary instance with only tagged slots:
@@ -2041,10 +2059,9 @@ or they must be declared locally notinline at each call site.~@:>"
                    (source-form (and (boundp '*dsd-source-form*)
                                      (cdr (assq dsd *dsd-source-form*)))))
                (cond ((and default
-                           (neq type t)
                            (not pretty))
                       `(the* (,type :source-form ,source-form
-                                    :context :initform
+                                    :context ,dsd
                                     :use-annotations t)
                              ,default))
                      ((and default source-form
@@ -2318,22 +2335,6 @@ or they must be declared locally notinline at each call site.~@:>"
     (when (typep ctor '(cons t (eql :default)))
       (car ctor))))
 
-#+sb-xc-host
-(defun %instance-ref (instance index)
-  (let* ((layout (%instance-layout instance))
-         (map (layout-index->accessor-map layout)))
-    (when (zerop (length map)) ; construct it on demand
-      (let ((slots (dd-slots (layout-%info layout))))
-        (setf map (make-array (1+ (reduce #'max slots :key #'dsd-index))
-                              :initial-element nil)
-              (layout-index->accessor-map layout) map)
-        (dolist (dsd slots)
-          (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
-    (funcall (aref map index) instance)))
-
-#+sb-xc-host
-(defun %raw-instance-ref/word (instance index) (%instance-ref instance index))
-
 ;;; It is possible to produce instances of structure-object which violate
 ;;; the assumption throughout the compiler that slot readers are safe
 ;;; unless dictated otherwise by the SAFE-P flag in the DSD.
@@ -2382,6 +2383,7 @@ or they must be declared locally notinline at each call site.~@:>"
             sb-vm:instance-pointer-lowtag)))
 
 #+sb-xc-host
+(progn
 (defun write-structure-definitions-as-text (pathname)
   (with-open-file (output pathname :direction :output :if-exists :supersede)
     (dolist (root '(structure-object function))
@@ -2420,5 +2422,33 @@ or they must be declared locally notinline at each call site.~@:>"
             (t
              (error "Missing DD for ~S" pair))))))
     (format output ";; EOF~%")))
+
+(locally
+(declare (notinline sb-c::compiled-debug-info-p sb-c::compiled-debug-info-rest))
+;; Emulate variable-length structures for COMPILED-DEBUG-INFO.
+(defun %instance-length (instance)
+  (declare (notinline layout-length))
+  (let ((basic (layout-length (%instance-layout instance))))
+    (if (sb-c::compiled-debug-info-p instance)
+        (+ (1- basic)
+           (length (the simple-vector (sb-c::compiled-debug-info-rest instance))))
+        basic)))
+(defun %instance-ref (instance index)
+  (let* ((layout (%instance-layout instance))
+         (map (layout-index->accessor-map layout)))
+    (when (zerop (length map)) ; construct it on demand
+      (let ((slots (dd-slots (layout-%info layout))))
+        (setf map (make-array (1+ (reduce #'max slots :key #'dsd-index))
+                              :initial-element nil)
+              (layout-index->accessor-map layout) map)
+        (dolist (dsd slots)
+          (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
+    (if (and (sb-c::compiled-debug-info-p instance)
+             (>= index (1- (length map))))
+        (aref (sb-c::compiled-debug-info-rest instance) (- index (1- (length map))))
+        (funcall (aref map index) instance)))))
+
+(defun %raw-instance-ref/word (instance index) (%instance-ref instance index))
+) ; end PROGN
 
 (/show0 "code/defstruct.lisp end of file")

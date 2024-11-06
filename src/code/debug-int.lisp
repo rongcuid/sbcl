@@ -1007,12 +1007,26 @@
     (sb-alien:sap-alien (sb-vm::current-thread-offset-sap (+ tls-words n))
                         (* os-context-t))))
 
+;;; The special var and descriptor-sap costs a few more instructions, which isn't a big deal
+;;; because nothing that uses these is performance-critical. However, x86-64 wants these
+;;; pointers accessed via the thread structure for +/- sb-thread to simplify the vops.
+#+(or x86-64 (and (or riscv arm64) sb-thread))
+(progn
+  (defmacro current-uwp-block-sap ()
+    '(sb-vm::current-thread-offset-sap sb-vm::thread-current-unwind-protect-block-slot))
+  (defmacro current-catch-block-sap ()
+    '(sb-vm::current-thread-offset-sap sb-vm::thread-current-catch-block-slot)))
+#-(or x86-64 (and (or riscv arm64) sb-thread))
+(progn
+  (defmacro current-uwp-block-sap () '(descriptor-sap sb-vm::*current-unwind-protect-block*))
+  (defmacro current-catch-block-sap () '(descriptor-sap *current-catch-block*)))
+
 (defun catch-runaway-unwind (block)
   (declare (ignorable block))
   #-(and win32 x86) ;; uses SEH
   (let ((target (sap-ref-sap (descriptor-sap block)
                              (* unwind-block-uwp-slot n-word-bytes))))
-    (loop for uwp = (descriptor-sap sb-vm::*current-unwind-protect-block*)
+    (loop for uwp = (current-uwp-block-sap)
           then (sap-ref-sap uwp (* unwind-block-uwp-slot n-word-bytes))
           until (zerop (sap-int uwp))
           thereis (sap= target uwp)
@@ -1156,12 +1170,12 @@ register."
 ;;; Find the code object corresponding to the object represented by
 ;;; bits and return it. We assume bogus functions correspond to the
 ;;; undefined-function.
-#+(or x86 x86-64 arm64)
+#+(or arm64 ppc64 x86 x86-64)
 (defun code-object-from-context (context)
   (declare (type (sb-alien:alien (* os-context-t)) context))
   (code-header-from-pc (context-pc context)))
 
-#-(or x86 x86-64 arm64)
+#-(or arm64 ppc64 x86 x86-64)
 (defun code-object-from-context (context)
   (declare (type (sb-alien:alien (* os-context-t)) context))
   ;; The GC constraint on the program counter on precisely-scavenged
@@ -1279,6 +1293,7 @@ register."
                                                       sb-vm::undefined-alien-tramp))
                                       "undefined function")
                                      (routine)))))
+      #+ppc64 (function (make-bogus-debug-fun "trampoline"))
       ((eql :bpt-lra)
        (make-bogus-debug-fun "function end breakpoint")))))
 
@@ -1304,7 +1319,7 @@ register."
 ;;; CODE-LOCATIONs at which execution would continue with frame as the
 ;;; top frame if someone threw to the corresponding tag.
 (defun frame-catches (frame)
-  (let ((catch (descriptor-sap *current-catch-block*))
+  (let ((catch (current-catch-block-sap))
         (reversed-result nil)
         (fp (frame-pointer frame)))
     (labels ((catch-ref (slot)
@@ -1350,7 +1365,7 @@ register."
 
 ;;; Modify the value of the OLD-TAG catches in FRAME to NEW-TAG
 (defun replace-frame-catch-tag (frame old-tag new-tag)
-  (let ((catch (descriptor-sap *current-catch-block*))
+  (let ((catch (current-catch-block-sap))
         (fp (frame-pointer frame)))
     (labels ((catch-ref (slot)
                (sap-ref-lispobj catch (* slot n-word-bytes)))
@@ -1692,7 +1707,7 @@ register."
         (result '()))
     (flet ((push-var (tag-and-info &optional var-count)
              (push (if var-count
-                       (sb-impl::sys-tlab-append tag-and-info
+                       (sys-tlab-append tag-and-info
                                (loop :repeat var-count :collect
                                      (compiled-debug-fun-lambda-list-var
                                       args (incf i) vars)))
@@ -3964,20 +3979,10 @@ register."
   ;; Fetch the function / fdefn we're about to call from the
   ;; appropriate register.
   (let* ((callee
-           ;; FIXME: this could handle static calls, but needs some
-           ;; help from the backends
-          (make-lisp-obj
-           (cond #+(and immobile-space x86-64)
-                 ((eql (sap-ref-8 (context-pc context) 0) #xB8) ; MOV EAX,imm
-                  ;; Construct a properly tagged FDEFN given the value
-                  ;; that machine code references it by for purposes
-                  ;; of the ensuing CALL instruction.
-                  ;; FIXME: this ought to go in {target}-vm.lisp as
-                  ;; something like GET-FDEFN-FOR-SINGLE-STEP
-                  (+ (sap-ref-32 (context-pc context) 1) -2 other-pointer-lowtag))
-                 (t
-                  (logior (context-register context callee-register-offset)
-                          #+untagged-fdefns other-pointer-lowtag)))))
+          #+linkage-space
+          (sb-vm::linkage-addr->name (context-register context callee-register-offset) :abs)
+          #-linkage-space
+          (make-lisp-obj (context-register context callee-register-offset)))
          (step-info (single-step-info-from-context context)))
     ;; If there was not enough debug information available, there's no
     ;; sense in signaling the condition.
@@ -3987,7 +3992,7 @@ register."
                   (flet ((call ()
                            (apply (typecase callee
                                     (fdefn (fdefn-fun callee))
-                                    (function callee))
+                                    ((or function #+linkage-space symbol) callee))
                                   args)))
                     ;; Signal a step condition
                     (let* ((step-in
@@ -4017,6 +4022,8 @@ register."
                           (sb-impl::with-stepping-disabled
                             (call)))))))
            (new-callee (etypecase callee
+                         #+linkage-space ((or list symbol) (sb-vm::stepper-fun fun))
+                         #-linkage-space
                          (fdefn
                           (let ((fdefn (make-fdefn '(#:dummy))))
                             (setf (fdefn-fun fdefn) fun)
@@ -4029,20 +4036,15 @@ register."
         ;; won't keep NEW-CALLEE pinned down. Once it's inside
         ;; CONTEXT, which is registered in thread->interrupt_contexts,
         ;; it will properly point to NEW-CALLEE.
-        (cond
-         #+(and immobile-code x86-64)
-         ((fdefn-p callee) ; as above, should be in {target}-vm.lisp
-          ;; Store into RAX the necessary value for issuing a CALL to the JMP
-          ;; opcode in the FDEFN header.
+        (typecase callee
+         #+linkage-space ((or list symbol)
+          ;; the new callee is a funcallable instance that jumps to FUN.
+          ;; Point the callee register to the address of the FIN's trampoline word
           (setf (context-register context callee-register-offset)
-                (sb-vm::fdefn-entry-address new-callee))
-          ;; And skip over the MOV EAX, imm instruction.
-          (sb-vm::incf-context-pc context 5))
+                (+ (get-lisp-obj-address new-callee)
+                   (- sb-vm:n-word-bytes sb-vm:fun-pointer-lowtag))))
          (t
           (setf (context-register context callee-register-offset)
-                #+untagged-fdefns
-                (logandc2 (get-lisp-obj-address new-callee) lowtag-mask)
-                #-untagged-fdefns
                 (get-lisp-obj-address new-callee))))))))
 
 ;;; Given a signal context, fetch the step-info that's been stored in

@@ -117,15 +117,15 @@
       (truly-the
        (values t &optional)
        (catch 'up-and-out
-         (let* ((string (etypecase string-or-fun
+         (let* ((string (typecase string-or-fun
                           (simple-string
                            string-or-fun)
                           (string
                            (coerce string-or-fun 'simple-string))
-                          ;; Not just more compact than testing for fmt-control
-                          ;; but also produces a better error message.
                           (function
-                           (fmt-control-string string-or-fun))))
+                           (fmt-control-string string-or-fun))
+                          (t
+                           #.(sb-c::internal-type-error-call 'string-or-fun '(or string function)))))
                 (*default-format-error-control-string* string)
                 (*logical-block-popper* nil)
                 (tokens
@@ -687,7 +687,7 @@
           (float-nan-p number))
       (prin1 number stream)
       (multiple-value-bind (num expt) (sb-impl::scale-exponent (abs number))
-        (let* ((k (if (= num $1.0) (1- k) k))
+        (let* ((k (if (= num 1.0) (1- k) k))
                (expt (- expt k))
                (estr (decimal-string (abs expt)))
                (elen (if e (max (length estr) e) (length estr)))

@@ -156,6 +156,9 @@
           (tv-sec (signed 32))
           (tv-nsec (signed 32))))
 
+(defconstant sizeof-timespec 8) ; #x8
+(defconstant sizeof-timeval 8) ; #x8
+
 (in-package "SB-KERNEL")
 
 ;;; GENCGC related

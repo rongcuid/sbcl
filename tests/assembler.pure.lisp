@@ -250,26 +250,6 @@
     (assert (search "LOCK OR FS:[#x20100400], R8B"
                     (get-output-stream-string s)))))
 
-;;; This seems to be testing that we can find fdefns in static space
-;;; which I guess was broken.  immobile-code has no fdefns in static space.
-(test-util:with-test (:name :disassemble-static-fdefn
-            :skipped-on (or (not :x86-64) :immobile-code))
-  (assert (< (get-lisp-obj-address (sb-int:find-fdefn 'sb-impl::sub-gc))
-             sb-vm:static-space-end))
-  ;; Cause SUB-GC to become un-statically-linked
-  (progn (trace sb-impl::sub-gc) (untrace))
-  (let ((lines
-         (test-util:split-string (with-output-to-string (s)
-                         (disassemble 'sb-impl::gc :stream s))
-                       #\Newline))
-        (found))
-    ;; Check that find-called-object looked in static space for FDEFNs
-    (dolist (line lines)
-      (when (and (search "CALL" line)
-                 (search " SUB-GC" line))
-        (setq found t)))
-    (assert found)))
-
 (test-util:with-test (:name :cast-reg-to-size :skipped-on (not :x86-64))
   (test-assemble `(mov :byte ,rsi-tn ,rdi-tn)
                  "408AF7           MOV SIL, DIL")
@@ -315,7 +295,7 @@
                                   (subseq string (1+ (position #\newline string))
                                           (1- (length string)))))) ; chop final newline
       (declare (ignorable line))
-      (print line)
+      ;;(print line)
       )))
 
 #+x86-64
@@ -352,3 +332,8 @@
     ;; 3-operand form with 32-bit signed imm
     (try `(imul :dword ,rbx-tn ,(ea rdx-tn) #xbaba))
     (try `(imul :qword ,rbx-tn ,(ea rdx-tn) #xbaba))))
+
+(test-util:with-test (:name :mxcsr-loadstore :skipped-on (not :x86-64))
+  ;; This just assserts that we can assemble
+  (try `(ldmxcsr ,(ea rax-tn)))
+  (try `(stmxcsr ,(ea rax-tn))))

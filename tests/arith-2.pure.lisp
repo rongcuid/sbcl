@@ -202,10 +202,10 @@
            (let ((res (sb-bignum:%allocate-bignum 2)))
              (setf (sb-bignum:%bignum-ref res 1) 529
                    (sb-bignum:%bignum-ref res 0) 9223372036854775807)
-             (sb-bignum:%bignum-set-length res 1)
+             (sb-kernel:set-header-data res 1)
              (unwind-protect
                   (< res d)
-               (sb-bignum:%bignum-set-length res 2)))))
+               (sb-kernel:set-header-data res 2)))))
     ((-9.223372036854776d18) nil)
     ((9.223372036854776d18) t)))
 
@@ -415,7 +415,9 @@
      (typep (- d) '(integer -47727025476642942 -2593702250735)))
    null))
 
-(with-test (:name :signed-byte-8-p-unsigned)
+(with-test (:name :signed-byte-8-p-unsigned
+                  ;; these lack the necessary RANGE<= vop
+                  :fails-on (:or :mips :ppc :ppc64 :sparc :riscv))
   (checked-compile
    `(lambda (a)
       (declare (type (simple-array sb-vm:word (*)) a)
@@ -533,7 +535,14 @@
       (declare ((unsigned-byte 8) a))
       (dpb a (byte 63 8)
            81))
-   ((90) 23121)))
+   ((90) 23121))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((unsigned-byte 8) a))
+      (dpb a (byte 32 32)
+           1))
+   ((1) 4294967297)))
 
 (with-test (:name :mask-field-size-overflow)
   (checked-compile-and-assert
@@ -567,3 +576,50 @@
      (declare (integer x))
      (log x))
    (or (complex single-float) (single-float 0.0))))
+
+(with-test (:name :floor-derive-type)
+  (assert-type
+   (lambda (a b)
+     (declare ((integer -10 0) b)
+              ((unsigned-byte 8) a))
+     (floor a b))
+   (values (integer -255 0) (integer -9 0) &optional)))
+
+(with-test (:name :logbitp-on-integers)
+  (assert (not (ctu:ir1-named-calls `(lambda (x)
+                                       (logbitp 20 x))))))
+(with-test (:name :bt-negative-bit)
+  (checked-compile-and-assert
+   ()
+   `(lambda (c)
+     (declare ((signed-byte 64) c))
+     (logtest c -2199023255553))
+   ((-2049990302793354782) t)
+   ((0) nil)
+   (((ash 1 41)) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (b)
+      (declare (fixnum b))
+      (logior b -4611686018427387905))
+   ((-6) -1)))
+
+(with-test (:name :float-cmp)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare ((unsigned-byte 20) a)
+                  (float b))
+         (< a b))
+    ((6 4.0) nil)
+    ((1 1.1) t)))
+
+(with-test (:name :complex+non-complex-type)
+  (assert-type
+   (lambda (a)
+     (+ a #c(1.0 3.0)))
+   (or (complex single-float) (complex double-float)))
+  (assert-type
+   (lambda (a)
+     (* a #c(1d0 0d0)))
+    (complex double-float)))

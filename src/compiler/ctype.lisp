@@ -185,9 +185,7 @@
                         (cond ((fun-type-keyp type)
                                (loop with keywords = (fun-type-keywords type)
                                      for (key value) on args by #'cddr
-                                     for info = (find (lvar-value key)
-                                                      (fun-type-keywords type)
-                                                      :key #'key-info-name)
+                                     for info = (find (lvar-value key) keywords :key #'key-info-name)
                                      always (and info
                                                  (check value
                                                         (key-info-type info)))))
@@ -241,24 +239,29 @@
               (let ((initform (if (typep lambda-list-element '(cons t cons))
                                   (second lambda-list-element)
                                   (dsd-default slot))))
-                ;; Return T if value-form definitely does not satisfy
-                ;; the type-check for DSD. Return NIL if we can't decide.
-                (when (if (constantp initform)
-                          (not (sb-xc:typep (constant-form-value initform)
-                                            (dsd-type slot)))
-                          ;; Find uses of nil-returning functions as defaults,
-                          ;; like ERROR and MISSING-ARG.
-                          (and (sb-kernel::dd-null-lexenv-p dd)
-                               (listp initform)
-                               (let ((f (car initform)))
-                                 ;; Don't examine :function :type of macros!
-                                 (and (eq (info :function :kind f) :function)
-                                      (let ((info (info :function :type f)))
-                                        (and (fun-type-p info)
-                                             (type= (fun-type-returns info)
-                                                    *empty-type*)))))))
-                  (note-lossage "The slot ~S does not have a suitable default, ~
-and no value was provided for it." name))))))))))
+                (if (logtest sb-kernel::dsd-default-error (sb-kernel::dsd-bits slot))
+                    (note-lossage "The slot ~S default form ~s doesn't match :type ~s"
+                                  name
+                                  (dsd-default slot)
+                                  (dsd-type slot))
+                    ;; Return T if value-form definitely does not satisfy
+                    ;; the type-check for DSD. Return NIL if we can't decide.
+                    (when (if (constantp initform)
+                              (not (sb-xc:typep (constant-form-value initform)
+                                                (dsd-type slot)))
+                              ;; Find uses of nil-returning functions as defaults,
+                              ;; like ERROR and MISSING-ARG.
+                              (and (sb-kernel::dd-null-lexenv-p dd)
+                                   (listp initform)
+                                   (let ((f (car initform)))
+                                     ;; Don't examine :function :type of macros!
+                                     (and (eq (info :function :kind f) :function)
+                                          (let ((info (info :function :type f)))
+                                            (and (fun-type-p info)
+                                                 (type= (fun-type-returns info)
+                                                        *empty-type*)))))))
+                      (note-lossage "The slot ~S does not have a suitable default, ~
+and no value was provided for it." name)))))))))))
 
 ;;; Check that the derived type of the LVAR is compatible with TYPE. N
 ;;; is the arg number, for error message purposes. We return true if
@@ -1112,7 +1115,7 @@ and no value was provided for it." name))))))))))
                unportable because THROW and CATCH use EQ comparison)~@:>"
              (rest sources) (first sources) (lvar-type tag)))))))
 
-(defun %compile-time-type-error (values atype dtype detail code-context cast-context)
+(define-error-wrapper %compile-time-type-error (values atype dtype detail code-context cast-context)
   (declare (ignore dtype))
   (cond ((eq cast-context 'ftype-context)
          (error 'simple-type-error

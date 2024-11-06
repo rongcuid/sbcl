@@ -121,7 +121,6 @@ GNAME(funcall1_switching_stack):
  * anyway */
 
 	.align	align_16byte,0x90
-	.cfi_startproc
 GNAME(call_into_lisp_first_time_):
 GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	push	%rbp		# Save old frame pointer.
@@ -157,8 +156,6 @@ Lstack:
 	push	%r15
 	mov	%rax,%r15
 #endif
-	.cfi_def_cfa rbp, 16
-	.cfi_offset  rbp, -16
 	/* FIXME x86 saves FPU state here */
 	push	%rbx  	# these regs are callee-saved according to C
 	push	%r12	# so must be preserved and restored when
@@ -195,15 +192,6 @@ Lzero:
 	push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
-#ifndef LISP_FEATURE_DARWIN
-        # This call frame info is valid but it makes macOS print a warning
-        # that I'm tired of seeing. I can't even remember why this helps.
-	# Inform unwinder that the new frame has not been entered yet.
-	# The CFA is what it was (old RBP+16) before the preceding mov.
-	# This sequence encodes DW_CFA_def_cfa_expression
-	# DW_OP_breg6 (rbp): 0 / DW_OP_deref / DW_OP_lit16 / DW_OP_plus
-	.cfi_escape 0x0f, 5, 0x76, 0, 6, 0x40, 0x22
-#endif
 Lcall:
 	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
 	call	*CLOSURE_FUN_OFFSET(%rax)
@@ -232,7 +220,6 @@ LsingleValue:
 	leave
 #endif
 	ret
-	.cfi_endproc
 	SIZE(GNAME(call_into_lisp_))
 
 	.text
@@ -257,6 +244,8 @@ GNAME(funcall_alien_callback):
 	push	%r15    #
 #ifdef LISP_FEATURE_SB_THREAD
         mov     %rcx, THREAD_BASE_REG
+#else
+        LOAD_PIC_VAR(all_threads, THREAD_BASE_REG)
 #endif
         mov     $(3 << N_FIXNUM_TAG_BITS),%rcx
 
@@ -264,16 +253,9 @@ GNAME(funcall_alien_callback):
         push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
         mov	%rsp,%rbp
-#ifdef LISP_FEATURE_IMMOBILE_CODE
-#include "genesis/vector.h"
-        // An extra instruction is needed to load the fdefn.
-        mov	(STATIC_FDEFNS+VECTOR_DATA_OFFSET+8*ENTER_ALIEN_CALLBACK_fdefn),%rax
-        mov	FDEFN_FUN_OFFSET(%rax),%rax
-#else
-        mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
-#endif
 	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
-	call	*CLOSURE_FUN_OFFSET(%rax)
+	LOAD_PIC_VAR(linkage_space, %rax)
+	call	*(8*ENTER_ALIEN_CALLBACK_fname_index)(%rax)
 
 /* Restore C regs */
 	pop	%r15

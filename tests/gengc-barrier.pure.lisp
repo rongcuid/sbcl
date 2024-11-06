@@ -24,3 +24,40 @@
                    `(lambda (x y)
                       (when (typep y '(or fixnum null))
                         (rplaca x y)))))
+
+(with-test (:name :rplaca-union-types)
+  (assert-barriers 1 0
+                   `(lambda (a b)
+                      (declare (fixnum a))
+                      (setf (car b) (1+ a))))
+  (assert-barriers 1 0
+                   `(lambda (a b)
+                      (declare (fixnum a))
+                      (setf (car b) (- a)))))
+
+(with-test (:name :consequent)
+  (assert-barriers 2 2
+                   `(lambda (x m j)
+                      (setf (car x) m)
+                      (print x)
+                      (setf (cdr x) j)))
+  (assert-barriers 2 2
+                   `(lambda (x m j)
+                      (setf (car x) m)
+                      (setf x *)
+                      (setf (cdr x) j)))
+  #+(or arm64 x86-64)
+  (progn
+    (assert-barriers 1 1
+                     `(lambda (x m j)
+                        (setf (car x) m)
+                        (setf (cdr x) j)))
+    (assert-barriers 2 1
+                     `(lambda (x m j)
+                        (declare (fixnum m))
+                        (setf (car x) m)
+                        (setf (cdr x) j)))
+    (assert-barriers 1 1
+                     `(lambda (x m j)
+                        (setf (car x) m)
+                        (setf (cdr x) (list j))))))

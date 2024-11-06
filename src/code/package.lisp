@@ -37,13 +37,6 @@
 ;;;       so that the hash is a pure function of the name's characters.
 
 (defconstant package-id-bits 16)
-;; Give 48 bits to SYMBOL-NAME, which spans 256 TiB of memory.
-;; Omitting the lowtag bits could span up to 4 PiB because we could left-shift
-;; and re-tag to read the name.  That seems excessive though. Another viable
-;; technique would be to store a heap-base-relative pointer, which might be
-;; needed if dynamic-space is small but at a very high address.
-;; For now, it seems fine to treat the low 48 bits as a tagged pointer.
-(defconstant symbol-name-bits (- sb-vm:n-word-bits package-id-bits))
 (defconstant +package-id-overflow+ (1- (ash 1 package-id-bits)))
 (defconstant +package-id-none+     0)
 (defconstant +package-id-lisp+     1)
@@ -61,6 +54,10 @@
   ;; because the secondary hash is not computed by taking a remainder. It's just a mask.
   (hash2-mask 0 :type (unsigned-byte 32))
   ;(hash2-c    0 :type (unsigned-byte 32))
+  ;; Every extant package iterator (in any thread) can vote to make a table immutable.
+  ;; This affects ADD-SYMBOL but not NUKE-SYMBOL, the latter being informed by
+  ;; *CLEAR-RESIZED-SYMBOL-TABLES* as to zero-filling or not.
+  (immutable 0 :type sb-vm:word) ; copy-on-write if immutable > 0
   )
 
 (sb-xc:defstruct (symbol-table
@@ -85,6 +82,18 @@
   (free (missing-arg) :type index)
   ;; The number of deleted entries.
   (deleted 0 :type index))
+
+(sb-xc:defstruct (pkg-iter (:constructor pkg-iter (pkglist enable)))
+  (symbols #() :type simple-vector)
+  (cur-index 0 :type index)
+  (snapshot nil :type list) ; immutable view of internals
+  (exclude nil :type list) ; shadowing symbols, when and only when in state 2
+  ;; The BITS slot is composed of 2 packed fields:
+  ;;  [0:1] = state {-1=initial,0=externals,1=internals,2=inherited}
+  ;;  [2:]  = index into 'package-tables'
+  (bits -1 :type fixnum)
+  (enable 0 :type (unsigned-byte 3) :read-only t) ; 1 bit per {external,internal,inherited}
+  (pkglist nil :type list))
 
 ;;;; the PACKAGE structure
 

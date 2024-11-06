@@ -317,8 +317,7 @@
     (assert (= (length (remove-duplicates pvals)) 1))
     (assert (> (first pvals) 0))))
 
-(with-test (:name (:log :same-base-different-precision)
-                  :fails-on :sbcl)
+(with-test (:name (:log :same-base-different-precision))
   (let ((twos (list 2 2.0f0 2.0d0 #c(2.0f0 0.0f0) #c(2.0d0 0.0d0))))
     (let ((result (loop for number in twos
                         append (loop for base in twos
@@ -680,7 +679,9 @@
         ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
          :test #'car-type-equal))
       (checked-compile-and-assert () '(lambda (x y) (ctu:compiler-derived-type (atan x y)))
-        ((1 2) (values `(or ,long single-float (complex ,long) (complex single-float)) t) :test #'car-type-equal)))))
+        ((1 2) (values `(float ,(- pi) ,pi)
+                       t)
+         :test #'car-type-equal)))))
 
 (with-test (:name :comparison-transform-overflow)
   (checked-compile-and-assert
@@ -856,3 +857,10 @@
                         (= x 1d0))
                      nil))
              0)))
+
+(with-test (:name :tan-single-float-type-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (tan (the (single-float -1.5707964 1.5707964) x)))
+    ((1.5707964) -2.2877332e7)))

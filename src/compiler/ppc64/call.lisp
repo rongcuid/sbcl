@@ -576,12 +576,8 @@ default-value-8
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
-      ,@(case named
-          ((nil)
+      ,@(unless named
            '((arg-fun :target lexenv)))
-          (:direct)
-          (t
-           '((name :target name-pass))))
 
       ,@(when (eq return :tail)
           '((old-fp :target old-fp-pass)
@@ -600,7 +596,7 @@ default-value-8
     (:vop-var vop)
     (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
            ,@(unless variable '(nargs))
-           ,@(when (eq named :direct) '(fun))
+           ,@(when named '(fun))
            ,@(when (eq return :fixed) '(nvals))
            step-instrumenting)
 
@@ -621,19 +617,13 @@ default-value-8
                   :to (:result 0))
                  return-pc-pass)
 
-     ,@(case named
-         ((t)
-          `((:temporary (:sc descriptor-reg :offset fdefn-offset
-                         :from (:argument ,(if (eq return :tail) 0 1))
-                         :to :eval)
-                        name-pass)))
-         ((nil)
+     ,@(unless named
           `((:temporary (:sc descriptor-reg :offset lexenv-offset
                          :from (:argument ,(if (eq return :tail) 0 1))
                          :to :eval)
-                        lexenv))))
+                        lexenv)))
 
-     ,@(unless (eq named :direct)
+     ,@(unless named
          '((:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
             function)))
      (:temporary (:sc any-reg :offset nargs-offset :to :eval)
@@ -662,12 +652,6 @@ default-value-8
                      (if (eq return :tail) 0 10)
                      15
                      (if (eq return :unknown) 25 0))
-
-       ,@(when (eq named t)
-           '((aver (sc-is name constant))
-             ;; It has to be an fdefinition constant, not a normal IR1 constant.
-             ;; This is the best we can assert without peeking into IR2-COMPONENT-CONSTANTS.
-             (aver (not (sb-c::tn-leaf name)))))
 
        (let* ((cur-nfp (current-nfp-tn vop))
               ,@(unless (eq return :tail)
@@ -756,32 +740,16 @@ default-value-8
                                              8)))
                     (emit-label step-done-label))))
            (declare (ignorable #'insert-step-instrumenting))
-           ,@(case named
-               ((t)
-                `((sc-case name
-                    (descriptor-reg (move name-pass name))
-                    (control-stack
-                     (loadw name-pass cfp-tn (tn-offset name))
-                     (do-next-filler))
-                    (constant
-                     (loadw name-pass code-tn (tn-offset name) code-tn-lowtag)
-                     (do-next-filler)))
-                  ;; The step instrumenting must be done after
-                  ;; FUNCTION is loaded, but before ENTRY-POINT is
-                  ;; calculated.
-                  (insert-step-instrumenting name-pass)
-                  ;; The raw-addr (ENTRY-POINT) will be one of:
-                  ;; closure-tramp, undefined-tramp, or somewhere
-                  ;; within a simple-fun object.  If the latter, then
-                  ;; it is essential (due to it being an interior
-                  ;; pointer) that the function itself be in a
-                  ;; register before the raw-addr is loaded.
-                  (sb-assem:without-scheduling ()
-                    (let ((tag (+ #-untagged-fdefns other-pointer-lowtag)))
-                      (loadw function name-pass fdefn-fun-slot tag)
-                      (loadw entry-point name-pass fdefn-raw-addr-slot tag)))
-                  (do-next-filler)))
-               ((nil)
+           ,@(if named
+                `((inst addis entry-point card-table-base-tn 0)
+                  (cond (step-instrumenting
+                         (inst addi entry-point entry-point (make-fixup fun :linkage-cell))
+                         (do-next-filler) ; cargo-cultism for the win
+                         (insert-step-instrumenting entry-point)
+                         (inst ld entry-point entry-point 0))
+                        (t
+                         (inst ld entry-point entry-point (make-fixup fun :linkage-cell))
+                         (do-next-filler)))) ; more cargo-cultism
                 `((sc-case arg-fun
                     (descriptor-reg (move lexenv arg-fun))
                     (control-stack
@@ -790,22 +758,13 @@ default-value-8
                     (constant
                      (loadw lexenv code-tn (tn-offset arg-fun) code-tn-lowtag)
                      (do-next-filler)))
-                  (loadw function lexenv closure-fun-slot
-                      fun-pointer-lowtag)
+                  (loadw function lexenv closure-fun-slot fun-pointer-lowtag)
                   (do-next-filler)
                   ;; The step instrumenting must be done before
                   ;; after FUNCTION is loaded, but before ENTRY-POINT
                   ;; is calculated.
                   (insert-step-instrumenting function)
-                  (inst addi entry-point function
-                        (- (ash simple-fun-insts-offset word-shift)
-                           fun-pointer-lowtag))))
-               (:direct
-                ;; Load fdefn-raw-address using NIL as the base pointer.
-                ;; This has the usual problem that the displacement in
-                ;; the DS instruction form isn't a multiple of 4.
-                `((inst li temp-reg-tn (static-fun-offset fun))
-                  (inst ldx entry-point null-tn temp-reg-tn))))
+                  (inst addi entry-point function 0)))
            (loop
              (if filler
                  (do-next-filler)
@@ -836,13 +795,10 @@ default-value-8
 
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
-(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
-(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
-(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)

@@ -10,10 +10,18 @@
 ;;; half as many buckets as it would ordinarily get after enlarging.
 (sb-int:encapsulate 'sb-impl::recompute-ht-vector-sizes 'collision-inducement
  (compile nil
-          '(lambda (fn tbl old-size)
-             (multiple-value-bind (new-size new-n-buckets) (funcall fn tbl old-size)
-               (values new-size (ash new-n-buckets
-                                     (if (eq tbl *table-under-test*) -1 0)))))))
+          '(lambda (fn tbl)
+             (multiple-value-bind (new-size new-n-buckets) (funcall fn tbl)
+               (values new-size
+                       (ash new-n-buckets
+                            (if (and (eq tbl *table-under-test*)
+                                     ;; Not for flat tables though
+                                     ;; because they use the number of
+                                     ;; buckets as their size. See
+                                     ;; SB-IMPL::GROW-HASH-TABLE.
+                                     (not (sb-impl::flat-hash-table-p tbl)))
+                                -1
+                                0)))))))
 
 ;;; Keep moving everything that can move during each GC
 #+generational (setf (generation-number-of-gcs-before-promotion 0) 1000000)
@@ -24,7 +32,7 @@
   (setf *errors* e)
   (format t "~&oops: ~A in ~S~%" e *current-thread*)
   (sb-debug:print-backtrace)
-  (catch 'done))
+  (throw 'done nil))
 
 (with-test (:name (hash-table :unsynchronized)
                   ;; FIXME: This test occasionally eats out craploads
@@ -147,7 +155,8 @@
                       (let* ((i (random 100))
                              (x (gethash (aref keys i) table)))
                         (atomic-incf (aref actions n))
-                        (when (zerop (random 100 random-state))
+                        (when (and (zerop (random 100 random-state))
+                                   (not (sb-impl::flat-hash-table-p table)))
                           (let* ((kvv (sb-impl::hash-table-pairs table))
                                  (epoch (svref kvv 1)))
                             ;; Randomly force a rehash (as if by GC) so that we get "invalid" rehashes,
@@ -222,3 +231,30 @@
           (unwind-protect (sleep 2.5)
             (mapc #'terminate-thread threads))
           (assert (not *errors*)))))))
+
+;;; Stress GROW-HASH-TABLE's optimization wherein no rehashing may be
+;;; done if the index vector is not growing.
+(with-test (:name (hash-table :not-growing-index-vector :parallel-gc)
+            :broken-on :win32)
+  (let ((*errors* nil))
+    (let ((threads
+            (list (make-kill-thread
+                   (lambda ()
+                     (handler-bind ((serious-condition 'oops))
+                       (loop (let ((h (make-hash-table))
+                                   (l (loop for i below (random 200)
+                                            collect (make-teststruct i))))
+                               (loop for x in l do (setf (gethash x h) x))
+                               (loop for x in l
+                                     do (assert (eq (gethash x h) x)))))))
+                   :name "worker")
+                  (make-kill-thread
+                   (lambda ()
+                     (handler-bind ((serious-condition 'oops))
+                       (loop
+                         (sb-ext:gc :full t)
+                         (sleep (random *sleep-delay-max*)))))
+                   :name "collector"))))
+      (unwind-protect (sleep 2.5)
+        (mapc #'terminate-thread threads))
+      (assert (not *errors*)))))

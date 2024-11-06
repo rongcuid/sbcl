@@ -873,11 +873,16 @@
 
 (defun add-types-for-fixed-args (fun vars)
   (let ((fun-info (info :function :info fun)))
-    (when (and fun-info
-               (ir1-attributep (fun-info-attributes fun-info) fixed-args))
-      (loop for type in (fun-type-required (info :function :type fun))
+    (when (or (and fun-info
+                   (ir1-attributep (fun-info-attributes fun-info) fixed-args))
+              (typep fun '(cons (eql sb-impl::specialized-xep))))
+      (loop for type in (fun-type-required (if (typep fun '(cons (eql sb-impl::specialized-xep)))
+                                               (specifier-type `(function ,@(cddr fun)))
+                                               (info :function :type fun)))
             for var in vars
-            do (setf (lambda-var-type var) type))))
+            for intersection = (type-intersection type (lambda-var-type var))
+            unless (eq intersection *empty-type*)
+            do (setf (lambda-var-type var) intersection))))
   vars)
 
 ;;; Convert a LAMBDA form into a LAMBDA leaf or an OPTIONAL-DISPATCH leaf.
@@ -1412,7 +1417,7 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
 ;;; * a possibly empty list of dynamic extent arguments.
 ;;; The inline lambda will be NIL for a structure accessor, predicate, or copier
 ;;; since those can always be reconstructed from a defstruct description.
-(defun %compiler-defun (name compile-toplevel inline-lambda extra-info)
+(defun %compiler-defun (name compile-toplevel inline-lambda extra-info &optional specialized-xep)
   (cond (compile-toplevel
          (let ((defined-fun nil))
            (with-single-package-locked-error
@@ -1420,17 +1425,24 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
              (setf defined-fun (get-defined-fun name)))
            (when (boundp '*lexenv*)
              (aver (producing-fasl-file))
-             (if (member name (fun-names-in-this-file *compilation*) :test #'equal)
-                 (warn 'duplicate-definition :name name)
-                 (push name (fun-names-in-this-file *compilation*))))
+             (let ((names (fun-names-in-this-file *compilation*)))
+               (if (hashset-find names name)
+                   (warn 'duplicate-definition :name name)
+                   (hashset-insert names name))))
            ;; I don't know why this is guarded by (WHEN compile-toplevel),
            ;; because regular old %DEFUN is going to call this anyway.
            (%set-inline-expansion name defined-fun inline-lambda extra-info)))
         ((boundp 'sb-fasl::*current-fasl-group*)
-         (if (member name (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*) :test #'equal)
-             (warn 'duplicate-definition :name name)
-             (push name (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*)))))
+         (let ((names (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*)))
+           (if (hashset-find names name)
+               (warn 'duplicate-definition :name name)
+               (hashset-insert names name)))))
 
   (become-defined-fun-name name)
+  (when specialized-xep
+    (setf (info :function :specialized-xep name) specialized-xep)
+    (let ((xep-name (list* 'sb-impl::specialized-xep name specialized-xep)))
+      (setf (info :function :type xep-name) (specifier-type `(function ,@specialized-xep))
+            (info :function :where-from xep-name) :declared)))
 
   (values))

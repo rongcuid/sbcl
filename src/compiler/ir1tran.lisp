@@ -169,7 +169,7 @@
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
            (boundp '*compilation*)
-           (member name (fun-names-in-this-file *compilation*) :test #'equal))
+           (hashset-find (fun-names-in-this-file *compilation*) name))
       :defined-here
       where))
 
@@ -212,6 +212,10 @@
                                          name)))
                            (system-package-p (symbol-package name))))))
           (setf where :declared-verify))
+        (when (typep name
+                     '(cons (eql sb-impl::specialized-xep)))
+          (setf ftype (specifier-type `(function ,@(cddr name)))
+                where :declared))
         (make-global-var
          :kind :global-function
          :%source-name name
@@ -878,6 +882,49 @@
                           (find-free-fun fun "shouldn't happen! (no-cmacro)")
                           form))))
 
+;;; This may produce false matches when there are multiple copies and
+;;; they are reordered, duplicated or omitted. Still better than
+;;; nothing.
+(defun recover-source-paths (original-form expanded)
+  (when (policy *lexenv* (> debug 1))
+    (let ((equal-table (make-hash-table :test #'equal))
+          some)
+      (let ((seen (alloc-xset)))
+        (labels ((rec (form)
+                   (when (and (consp form)
+                              (not (xset-member-p form seen)))
+                     (let ((path (gethash form *source-paths*)))
+                       (push path (gethash form equal-table))
+                       (when path
+                         (setf some t)))
+                     (loop while (and (consp form)
+                                      (not (xset-member-p form seen)))
+                           do
+                           (add-to-xset form seen)
+                           (rec (pop form))))))
+          (rec original-form)))
+      (when some
+        (let ((seen (alloc-xset)))
+          (labels ((rec (form)
+                     (unless (xset-member-p form seen)
+                       (let ((original (gethash form equal-table)))
+                         (when original
+                           (let ((location
+                                   (if (cdr original)
+                                       (prog1 (car (last original))
+                                         (setf (gethash form equal-table)
+                                               (nbutlast original)))
+                                       (car original))))
+                             (when (and location
+                                        (not (gethash form *source-paths*)))
+                               (setf (gethash form *source-paths*) location))))
+                         (loop while (and (consp form)
+                                          (not (xset-member-p form seen)))
+                               do
+                               (add-to-xset form seen)
+                               (rec (pop form)))))))
+            (rec expanded)))))))
+
 ;;; Expand FORM using the macro whose MACRO-FUNCTION is FUN, trapping
 ;;; errors which occur during the macroexpansion.
 (defun careful-expand-macro (fun form &optional cmacro)
@@ -909,7 +956,10 @@
                          (t
                           (compiler-error "~@<~A~@:_ ~A~:>"
                                           (wherestring) c))))))
-      (funcall (valid-macroexpand-hook) fun form *lexenv*))))
+      (let ((result (funcall (valid-macroexpand-hook) fun form *lexenv*)))
+        #-sb-xc-host
+        (recover-source-paths form result)
+        result))))
 
 ;;;; conversion utilities
 
@@ -1612,8 +1662,8 @@ possible.")
        (current-defmethod
         (destructuring-bind (name qualifiers specializers lambda-list)
             (cdr spec)
-          (let* ((gfs (or *methods-in-compilation-unit*
-                          (setf *methods-in-compilation-unit*
+          (let* ((gfs (or (cu-methods *compilation-unit*)
+                          (setf (cu-methods *compilation-unit*)
                                 (make-hash-table :test #'equal))))
                  (methods (or (gethash name gfs)
                               (setf (gethash name gfs)

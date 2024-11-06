@@ -161,10 +161,7 @@
   (:translate make-fdefn)
   (:generator 37
     (with-fixed-allocation (result pa-flag temp fdefn-widetag fdefn-size)
-      (inst addi temp null-tn (make-fixup 'undefined-tramp :assembly-routine))
-      (storew name result fdefn-name-slot other-pointer-lowtag)
-      (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
-      (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
+      (storew name result fdefn-name-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
@@ -188,7 +185,8 @@
                           :temp-tn temp :flag-tn pa-flag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag))))
         (storew temp result 0 fun-pointer-lowtag)
-        (storew function result closure-fun-slot fun-pointer-lowtag)))))
+        (inst addi temp function (- 16 fun-pointer-lowtag)) ; untag
+        (storew temp result closure-fun-slot fun-pointer-lowtag)))))
 
 ;;; The compiler likes to be able to directly make value cells.
 ;;;

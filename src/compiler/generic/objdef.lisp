@@ -205,19 +205,18 @@ during backtrace.
   ;; The corresponding SETF function is defined using code-header-set
   ;; on the slot index.
   (fixups :type t :ref-known (flushable) :ref-trans %code-fixups)
-  ;; This slot usually holds an instance of SB-C::COMPILED-DEBUG-FUN
-  ;; but the debugger can replace it with a cons of that and something else.
-  ;; It could also be the symbol :BPT-LRA, or, as a special case
-  ;; for the assembler code component, a cons holding a hash-table.
-  ;; (the cons points from read-only to static space, but the hash-table
-  ;; wants to be in dynamic space)
-  ;; The corresponding SETF function is defined using code-header-set
-  ;; on the slot index; and there's a special variant if #+darwin-jit.
+  ;; This can be either a DEBUG-INFO object, the symbol :BPT-LRA, or,
+  ;; as a special case for the assembler code component, a cons
+  ;; holding a hash-table. (the cons points from read-only to static
+  ;; space, but the hash-table wants to be in dynamic space) The
+  ;; corresponding SETF function is defined using code-header-set on
+  ;; the slot index; and there's a special variant if #+darwin-jit.
   (debug-info :type t
               :ref-known (flushable)
               :ref-trans %code-debug-info)
   (constants :rest-p t))
 
+#-linkage-space
 (define-primitive-object (fdefn :type fdefn
                                 :lowtag other-pointer-lowtag
                                 :widetag fdefn-widetag)
@@ -229,20 +228,15 @@ during backtrace.
   ;;   they store a descriptorized (fun-pointer lowtag)
   ;;   pointer to the closure tramp
   ;; - all others store a native pointer to the function entry address
-  ;;   or closure tramp. x86-64 with immobile-code constrains this
-  ;;   to holding the address of a SIMPLE-FUN or an object that
-  ;;   has the simple-fun call convention- either a generic-function with
-  ;;   a self-contained trampoline, or closure or funcallable-instance
-  ;;   wrapped in a simplifying trampoline.
+  ;;   or closure tramp.
   (raw-addr :c-type "char *"))
-
-;;; Reader for FDEFN-RAW-ADDR. The usual IR2 converter would return
-;;; descriptor-reg and so its result would need shifting by n-fixnum-tag-bits.
-#-sb-xc-host
-(defun fdefn-raw-addr (fdefn)
-  (with-pinned-objects (fdefn)
-    (sap-ref-word (int-sap (get-lisp-obj-address fdefn))
-                  (- (ash fdefn-raw-addr-slot word-shift) other-pointer-lowtag))))
+#+linkage-space
+(define-primitive-object (fdefn :type fdefn
+                                :lowtag other-pointer-lowtag
+                                :widetag fdefn-widetag)
+  (name :ref-trans fdefn-name)
+  (unused)
+  (fun :type (or function null)))
 
 ;;; a simple function (as opposed to hairier things like closures
 ;;; which are also subtypes of Common Lisp's FUNCTION type)
@@ -281,8 +275,8 @@ during backtrace.
                                   ;; closures which requires that the length be
                                   ;; a compile-time constant.
                                   :alloc-trans %alloc-closure)
-  (fun :init :arg :ref-trans #+(or x86 x86-64 arm64) %closure-callee
-                             #-(or x86 x86-64 arm64) %closure-fun)
+  (fun :init :arg :ref-trans #+(or arm64 ppc64 x86 x86-64) %closure-callee
+                             #-(or arm64 ppc64 x86 x86-64) %closure-fun)
   (info :rest-p t))
 
 (define-primitive-object (funcallable-instance
@@ -391,16 +385,13 @@ during backtrace.
   (value :init :unbound
          :set-trans %set-symbol-global-value
          :set-known ())
-
-  ;; This slot holds an FDEFN. It's almost unnecessary to have FDEFNs at all
-  ;; for symbols. If we ensured that any function bound to a symbol had a
-  ;; call convention rendering it callable in the manner of a SIMPLE-FUN,
-  ;; then we would only need to store that function's raw entry address here,
-  ;; thereby removing the FDEFN for any global symbol. Any closure assigned
-  ;; to a symbol would need a tiny trampoline, which is already the case
-  ;; for #+immobile-code.
-  (fdefn :ref-trans %symbol-fdefn :ref-known ()
-         :cas-trans cas-symbol-fdefn)
+  ;; Symbols either store an fdefn or a function. The better way is a function.
+  ;; This slot *MUST* coincide with the FDEFN-FUN slot. (This is AVERed)
+  ;; The slot name is "FDEFN" even it holds a function. This makes some C code
+  ;; (notably trace-object.inc and traceroot) unchanged for +/- linkage-space.
+  #+linkage-space (fdefn)
+  #-linkage-space (fdefn :ref-trans %symbol-fdefn :ref-known ()
+                         :cas-trans cas-symbol-fdefn)
   ;; The private accessor for INFO reads the slot verbatim.
   ;; In contrast, the SYMBOL-INFO function always returns a PACKED-INFO
   ;; instance (see info-vector.lisp) or NIL. The slot itself may hold a cons
@@ -414,7 +405,7 @@ during backtrace.
         :cas-trans sb-impl::cas-symbol-%info
         :type (or instance list)
         :init :null)
-  (name :init :arg))
+  (name :ref-trans symbol-name :init :arg))
 
 ;;; 64-bit relocatable-static is a little like 64-bit, a little like 32-bit.
 ;;; Refer to comments above for details on each slot.
@@ -427,7 +418,7 @@ during backtrace.
         :type (or instance list)
         :init :null)
   (hash :set-trans %set-symbol-hash)
-  (name :init :arg))
+  (name :ref-trans symbol-name :init :arg))
 
 #-64-bit
 (define-primitive-object (symbol . #.*symbol-primobj-defn-properties*)
@@ -442,8 +433,7 @@ during backtrace.
         :init :null)
   (name :init :arg :ref-trans symbol-name)
   ;; The remaining slots can be ignored by GC
-  #+salted-symbol-hash (hash)
-  #-salted-symbol-hash (hash :set-trans %set-symbol-hash :ref-trans symbol-hash)
+  (hash)
   (package-id :type index ; actually 16 bits. (Could go in the header)
               :ref-trans symbol-package-id
               :set-trans sb-impl::set-symbol-package-id :set-known ())
@@ -509,6 +499,7 @@ during backtrace.
 (defconstant-eqx +thread-header-slot-names+
     `#(#+x86-64
        ,@'(t-nil-constants
+           linkage-table
            alien-linkage-table-base
            msan-xor-constant
            ;; The following slot's existence must NOT be conditional on #+msan
@@ -565,13 +556,14 @@ during backtrace.
   (binding-stack-pointer :c-type "lispobj *" :pointer t
                          :special *binding-stack-pointer*)
   ;; next two not used in C, but this wires the TLS offsets to small values
-  #+(and (or riscv x86-64 arm64) sb-thread)
+  #+(or x86-64 (and (or riscv arm64) sb-thread))
   (current-catch-block :special *current-catch-block*)
-  #+(and (or riscv x86-64 arm64) sb-thread)
+  #+(or x86-64 (and (or riscv arm64) sb-thread))
   (current-unwind-protect-block :special *current-unwind-protect-block*)
-  #+(or sb-thread sparc ppc)
-  (pseudo-atomic-bits #+(or x86 x86-64) :special #+(or x86 x86-64) *pseudo-atomic-bits*
-                      :c-type "pa_bits_t")
+  ;; BUG: fundamentally a pseudo-atomic code sequence does not use these bits
+  ;; with #+sb-safepoint so why does this slot need to be defined at all in that case?
+  #+(or sb-thread sparc ppc x86-64)
+  (pseudo-atomic-bits :c-type "pa_bits_t")
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   ;; Deterministic consing profile recording area.
@@ -638,7 +630,7 @@ during backtrace.
   ;; Same as above for the location of the current control stack
   ;; pointer.  This is also used on threaded x86oids to allow LDB to
   ;; print an approximation of the CSP as needed.
-  #+sb-thread
+  #+(or sb-thread x86-64)
   (control-stack-pointer :c-type "lispobj *")
   (card-table)
 
@@ -647,6 +639,7 @@ during backtrace.
   (symbol-tlab :c-type "struct alloc_region" :length 3)
   (sys-mixed-tlab :c-type "struct alloc_region" :length 3)
   (sys-cons-tlab :c-type "struct alloc_region" :length 3)
+  (remset)
   ;; allocation instrumenting
   (tot-bytes-alloc-boxed)
   (tot-bytes-alloc-unboxed)

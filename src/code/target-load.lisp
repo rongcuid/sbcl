@@ -43,6 +43,16 @@
 ;;; something not EQ to anything we might legitimately READ
 (define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
 
+(macrolet ((make-file-stream-source-info (s)
+             `(sb-c::make-source-info
+               :file-info (sb-c::make-file-info
+                           :%truename :defer
+                           ;; This T-L-P has been around since at least 2011.
+                           ;; It's unclear why an LPN isn't good enough.
+                           :pathname (translate-logical-pathname ,s)
+                           :external-format (stream-external-format ,s)
+                           :write-date (file-write-date ,s)))))
+
 ;;; Load a text stream.  (Note that load-as-fasl is in another file.)
 ;; We'd like, when entering the debugger as a result of an EVAL error,
 ;; that the condition be annotated with the stream position.
@@ -91,7 +101,7 @@
          (locally (declare (optimize (sb-c::type-check 0)))
            (setf sb-c::*current-path* (make-unbound-marker)))
          (if pathname
-             (let* ((info (sb-c::make-file-stream-source-info stream))
+             (let* ((info (make-file-stream-source-info stream))
                     (sb-c::*source-info* info))
                (locally (declare (optimize (sb-c::type-check 0)))
                  (setf sb-c::*current-path* (make-unbound-marker)))
@@ -111,6 +121,7 @@
                      do (sb-c::with-source-paths
                           (eval-form form nil)))))))))
   t)
+) ; end MACROLET
 
 ;;;; LOAD itself
 
@@ -322,32 +333,29 @@
 ;; expicitly ask us to load a file with a made-up name (e.g., the
 ;; defaulted filename might exceed filename length limits).
 (defun probe-load-defaults (pathname)
-  (destructuring-bind (defaulted-source-pathname
-                       defaulted-source-truename
-                       defaulted-fasl-pathname
-                       defaulted-fasl-truename)
-      (loop for type in (list *load-source-default-type*
-                              *fasl-file-type*)
-            as probe-pathname = (make-pathname :type type
-                                               :defaults pathname)
-            collect probe-pathname
-            collect (handler-case (probe-file probe-pathname)
-                      (file-error () nil)))
-    (cond ((and defaulted-fasl-truename
-                defaulted-source-truename
-                (> (file-write-date defaulted-source-truename)
-                   (file-write-date defaulted-fasl-truename)))
+  (multiple-value-bind (source-existsp defaulted-source-pathname
+                        fasl-existsp defaulted-fasl-pathname)
+      (flet ((probe (type &aux (candidate (make-pathname :type type
+                                                         :defaults pathname)))
+               (values (sb-impl::query-file-system candidate :existence nil)
+                       candidate)))
+        (multiple-value-call #'values
+          (probe *load-source-default-type*) (probe *fasl-file-type*)))
+    (cond ((and fasl-existsp
+                source-existsp
+                (> (file-write-date defaulted-source-pathname)
+                   (file-write-date defaulted-fasl-pathname)))
            (restart-case
                (error "The object file ~A is~@
                        older than the presumed source:~%  ~A."
-                      defaulted-fasl-truename
-                      defaulted-source-truename)
+                      defaulted-fasl-pathname
+                      defaulted-source-pathname)
              (source () :report "load source file"
                      defaulted-source-pathname)
              (object () :report "load object file"
                      defaulted-fasl-pathname)))
-          (defaulted-fasl-truename defaulted-fasl-pathname)
-          (defaulted-source-truename defaulted-source-pathname))))
+          (fasl-existsp defaulted-fasl-pathname)
+          (source-existsp defaulted-source-pathname))))
 
 ;;;; linkage fixups
 

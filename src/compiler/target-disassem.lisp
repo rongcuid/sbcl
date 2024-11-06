@@ -1316,6 +1316,12 @@
 
 (macrolet ((with-print-restrictions (&rest body)
              `(let ((*print-pretty* t)
+                    ;; Truncating end-of-line notes is not very informative, certainly
+                    ;; now that so many FDEFNs have compound names like
+                    ;;  #<SB-KERNEL:FDEFN (SB-IMPL::SPECIALIZED-XEP
+                    ;;                     F ..))
+                    ;; hence the extremely generous overriding value for right-margin.
+                    (*print-right-margin* 200)
                     (*print-lines* 2)
                     (*print-length* 4)
                     (*print-level* 4))
@@ -1463,9 +1469,9 @@
 
 (defstruct (source-form-cache (:conc-name sfcache-)
                               (:copier nil))
-  (debug-source nil :type (or null debug-source))
+  (debug-source nil :type (or null sb-di:debug-source))
   (toplevel-form-index -1 :type fixnum)
-  (last-location-retrieved nil :type (or null code-location))
+  (last-location-retrieved nil :type (or null sb-di:code-location))
   (last-form-retrieved -1 :type fixnum))
 
 ;;; Return a memory segment located at the system-area-pointer returned by
@@ -1495,7 +1501,7 @@
   (declare (type (function () system-area-pointer) sap-maker)
            (type disassem-length length)
            (type (or null address) virtual-location)
-           (type (or null debug-fun) debug-fun)
+           (type (or null sb-di:debug-fun) debug-fun)
            (type (or null source-form-cache) source-form-cache))
   (let ((segment
          (%make-segment
@@ -1554,23 +1560,23 @@
 
 (defun get-different-source-form (loc context &optional cache)
   (if (and cache
-           (eq (code-location-debug-source loc)
+           (eq (sb-di:code-location-debug-source loc)
                (sfcache-debug-source cache))
-           (eq (code-location-toplevel-form-offset loc)
+           (eq (sb-di:code-location-toplevel-form-offset loc)
                (sfcache-toplevel-form-index cache))
-           (or (eql (code-location-form-number loc)
+           (or (eql (sb-di:code-location-form-number loc)
                     (sfcache-last-form-retrieved cache))
                (awhen (sfcache-last-location-retrieved cache)
-                 (code-location= loc it))))
+                 (sb-di:code-location= loc it))))
       (values nil nil)
       (let ((form (sb-debug::code-location-source-form loc context nil)))
         (when cache
           (setf (sfcache-debug-source cache)
-                (code-location-debug-source loc))
+                (sb-di:code-location-debug-source loc))
           (setf (sfcache-toplevel-form-index cache)
-                (code-location-toplevel-form-offset loc))
+                (sb-di:code-location-toplevel-form-offset loc))
           (setf (sfcache-last-form-retrieved cache)
-                (code-location-form-number loc))
+                (sb-di:code-location-form-number loc))
           (setf (sfcache-last-location-retrieved cache) loc))
         (values form t))))
 
@@ -1647,7 +1653,7 @@
 ;;; Return a STORAGE-INFO struction describing the object-to-source
 ;;; variable mappings from DEBUG-FUN.
 (defun storage-info-for-debug-fun (debug-fun)
-  (declare (type debug-fun debug-fun))
+  (declare (type sb-di:debug-fun debug-fun))
   (let ((sc-vec sb-c:*backend-sc-numbers*)
         (groups nil)
         (debug-vars (sb-di::debug-fun-debug-vars debug-fun)))
@@ -1697,10 +1703,10 @@
 
 (defun source-available-p (debug-fun)
   (handler-case
-      (do-debug-fun-blocks (block debug-fun)
+      (sb-di:do-debug-fun-blocks (block debug-fun)
         (declare (ignore block))
         (return t))
-    (no-debug-blocks () nil)))
+    (sb-di:no-debug-blocks () nil)))
 
 (defun print-block-boundary (stream dstate)
   (let ((os (dstate-output-state dstate)))
@@ -1715,7 +1721,7 @@
 ;;; structure, in which case it is used to cache forms from files.
 (defun add-source-tracking-hooks (segment debug-fun &optional sfcache)
   (declare (type segment segment)
-           (type (or null debug-fun) debug-fun)
+           (type (or null sb-di:debug-fun) debug-fun)
            (type (or null source-form-cache) sfcache))
   (let ((last-block-pc -1))
     (flet ((add-hook (pc fun &optional before-address)
@@ -1725,9 +1731,9 @@
                     :before-address before-address)
                    (seg-hooks segment))))
       (handler-case
-          (do-debug-fun-blocks (block debug-fun)
+          (sb-di:do-debug-fun-blocks (block debug-fun)
             (let ((first-location-in-block-p t))
-              (do-debug-block-locations (loc block)
+              (sb-di:do-debug-block-locations (loc block)
                 (let ((pc (sb-di::compiled-code-location-pc loc)))
 
                   ;; Put blank lines in at block boundaries
@@ -1742,7 +1748,7 @@
 
                   ;; Print out corresponding source; this information is not
                   ;; all that accurate, but it's better than nothing
-                  (unless (zerop (code-location-form-number loc))
+                  (unless (zerop (sb-di:code-location-form-number loc))
                     (multiple-value-bind (form new)
                         (get-different-source-form loc 0 sfcache)
                       (when new
@@ -1755,7 +1761,7 @@
                                 (unless at-block-begin
                                   (terpri stream))
                                 (format stream ";;; [~W] "
-                                        (code-location-form-number
+                                        (sb-di:code-location-form-number
                                          loc))
                                 (prin1-short form stream)
                                 (terpri stream)
@@ -1779,7 +1785,7 @@
                                          live-set)))
                              dstate))))
                   ))))
-        (no-debug-blocks () nil)))))
+        (sb-di:no-debug-blocks () nil)))))
 
 ;;; Disabled because it produces poor annotations, especially around
 ;;; macros.
@@ -1839,10 +1845,15 @@
                         (when first-block-seen-p
                           (return)))
                        ((eq kind nil)
-                        (when nil-block-seen-p
-                          (return))
-                        (when first-block-seen-p
-                          (setf nil-block-seen-p t))))
+                        (let ((name (sb-c::compiled-debug-fun-name fmap-entry)))
+                          (cond ((and (typep name '(cons (eql sb-impl::specialized-xep)))
+                                      (eq (%fun-name function)
+                                          (second name)))
+                                 (setf first-block-seen-p t))
+                                (nil-block-seen-p
+                                 (return))
+                                (first-block-seen-p
+                                 (setf nil-block-seen-p t))))))
                  (setf last-debug-fun
                        (sb-di::make-compiled-debug-fun fmap-entry code)))))))
         (let ((max-offset (%code-text-size code)))
@@ -1977,18 +1988,19 @@
           (last (car (last segments))))
       (flet ((print-segment-name (segment)
                (let* ((debug-fun (seg-debug-fun segment))
-                      (name (and debug-fun (debug-fun-name debug-fun))))
+                      (name (and debug-fun (sb-di:debug-fun-name debug-fun))))
                  (when name
-                   (format stream " ~Vt ; " *disassem-note-column*)
-                   (case (sb-c::compiled-debug-fun-kind
-                          (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
-                     (:external
-                      (format stream "(XEP ~s)" name))
-                     (:optional
-                      (format stream "(&OPTIONAL ~s)" name))
-                     (:more
-                      (format stream "(&MORE ~s)" name))
-                     (t (prin1 name stream)))))))
+                   (format stream " ~Vt " *disassem-note-column*)
+                   (pprint-logical-block (stream nil :per-line-prefix "; ")
+                     (case (sb-c::compiled-debug-fun-kind
+                            (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                       (:external
+                        (format stream "(XEP ~s)" name))
+                       (:optional
+                        (format stream "(&OPTIONAL ~s)" name))
+                       (:more
+                        (format stream "(&MORE ~s)" name))
+                       (t (prin1 name stream))))))))
         ;; One origin per segment is printed. As with the per-line display,
         ;; the segment is thought of as immovable for rendering of addresses,
         ;; though in fact the disassembler transiently allows movement.
@@ -2040,7 +2052,7 @@
          (list it)))
       (sb-pcl::%method-function
        ;; user's code is in the fast-function
-       (cons fun (recurse (sb-pcl::%method-function-fast-function fun))))
+       (recurse (sb-pcl::%method-function-fast-function fun)))
       (funcallable-instance
        (list (%funcallable-instance-fun fun)))
       (function
@@ -2227,14 +2239,10 @@
       (let ((code sb-fasl:*assembler-routines*))
         (invert (sb-fasl::%asm-routine-table code)
                 (lambda (x) (sap-int (sap+ (code-instructions code) (car x)))))))
+    #-linkage-space
     (dovector (name sb-vm::+all-static-fdefns+)
-      ;; ENTER-ALIEN-CALLBACK is not fboundp until src/code/alien-callback
-      ;; is compiled, so don't fail in function-raw-address.
-      (when (fboundp name)
-        (let ((address
-                #+(and x86-64 immobile-code) (sb-vm::function-raw-address name :rel32)
-                #-(and x86-64 immobile-code) (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
-          (setf (gethash address addr->name) name))))
+      (let ((address (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
+        (setf (gethash address addr->name) name)))
     ;; Not really a routine, but it uses the similar logic for annotations
     #+(and sb-safepoint (not x86-64))
     (setf (gethash (- sb-vm:static-space-start sb-vm:gc-safepoint-trap-offset) addr->name)
@@ -2513,7 +2521,7 @@
          (find-valid-storage-location offset sc-name dstate)))
     (when storage-location
       (note (lambda (stream)
-              (princ (debug-var-symbol
+              (princ (sb-di:debug-var-symbol
                       (aref (storage-info-debug-vars
                              (seg-storage-info (dstate-segment dstate)))
                             storage-location))
@@ -2537,7 +2545,7 @@
       (note (lambda (stream)
               (format stream "~A = ~S"
                       assoc-with
-                      (debug-var-symbol
+                      (sb-di:debug-var-symbol
                        (aref (dstate-debug-vars dstate)
                              storage-location))))
             dstate)

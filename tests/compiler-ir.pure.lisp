@@ -343,6 +343,11 @@
                      (ir-calls
                       `(lambda (x)
                          (aref x 0)))
+                     :key (lambda (x) (combination-fun-source-name x nil)))))
+  (assert (not (find 'sb-c::%type-check-error/c
+                     (ir-calls
+                      `(lambda (x)
+                         (char x 0)))
                      :key (lambda (x) (combination-fun-source-name x nil))))))
 
 (with-test (:name :call-full-like-p-constants)
@@ -445,3 +450,28 @@
                          (declare (special s))
                          (pop s))))
       1)))
+
+(with-test (:name :overflow+make-array)
+  (assert
+   (= (count 'sb-vm::overflow+t
+             (ir2-vops '(lambda (y)
+                         (make-array (1+ y)))))
+      1)))
+
+(with-test (:name :other-pointer-p)
+  (assert (not (find 'sb-c::%type-check-error/c
+                     (ir-calls
+                      `(lambda (x)
+                         (when (and (stringp (truly-the (or simple-string (member #\a)) x))
+                                    (zerop (length x)))
+                           x)))
+                     :key (lambda (x) (combination-fun-source-name x nil))))))
+
+(with-test (:name :external-type-checks-across-functions)
+  (assert (not (find 'sb-c::%type-check-error/c
+                     (ir-calls
+                      `(lambda (a b)
+                         (declare (number a b)
+                                  (optimize speed))
+                         (+ a b)))
+                     :key (lambda (x) (combination-fun-source-name x nil))))))

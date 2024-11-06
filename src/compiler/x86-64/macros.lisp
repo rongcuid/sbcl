@@ -122,28 +122,11 @@
       (let (#+gs-seg (thread-tn nil))
         (ea thread-segment-reg (ash slot-index word-shift) thread-tn))))
 
-#+sb-thread
-(progn
-  ;; Return an EA for the TLS of SYMBOL, or die.
-  (defun symbol-known-tls-cell (symbol)
-    (let ((index (info :variable :wired-tls symbol)))
-      (aver (integerp index))
-      (thread-tls-ea index)))
+(defmacro load-tl-symbol-value (reg symbol)
+  `(inst mov ,reg (thread-slot-ea ,(symbol-thread-slot symbol))))
 
-  ;; LOAD/STORE-TL-SYMBOL-VALUE macros are ad-hoc (ugly) emulations
-  ;; of (INFO :VARIABLE :WIRED-TLS) = :ALWAYS-THREAD-LOCAL
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(inst mov ,reg (symbol-known-tls-cell ',symbol)))
-
-  (defmacro store-tl-symbol-value (reg symbol)
-    `(inst mov (symbol-known-tls-cell ',symbol) ,reg)))
-
-#-sb-thread
-(progn
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(inst mov ,reg (static-symbol-value-ea ',symbol)))
-  (defmacro store-tl-symbol-value (reg symbol)
-    `(inst mov (static-symbol-value-ea ',symbol) ,reg)))
+(defmacro store-tl-symbol-value (reg symbol)
+  `(inst mov (thread-slot-ea ,(symbol-thread-slot symbol)) ,reg))
 
 (defmacro load-binding-stack-pointer (reg)
   `(load-tl-symbol-value ,reg *binding-stack-pointer*))
@@ -205,10 +188,8 @@
   (inst test :byte rax-tn (ea -8 gc-card-table-reg-tn)))
 
 (macrolet ((pa-bits-ea ()
-             #+sb-thread `(thread-slot-ea
-                           thread-pseudo-atomic-bits-slot
-                           #+gs-seg ,@(if thread (list thread)))
-             #-sb-thread `(static-symbol-value-ea '*pseudo-atomic-bits*))
+             `(thread-slot-ea thread-pseudo-atomic-bits-slot
+                              #+gs-seg ,@(if thread (list thread))))
            (nonzero-bits ()
              ;; reg-mem move is allegedly faster than imm-mem according to
              ;; someone at some point. Whether that's true or not, it is what it is.
@@ -292,10 +273,10 @@
            ,@(ecase name
                (%compare-and-swap-svref
                 ;; store barrier needs the EA of the affected element
-                '((emit-gengc-barrier object ea rax (vop-nth-arg 3 vop) new-value)))
+                '((emit-gengc-barrier object ea rax (vop-nth-arg 3 vop))))
                (%instance-cas
                 ;; store barrier affects only the object's base address
-                '((emit-gengc-barrier object nil rax (vop-nth-arg 3 vop) new-value)))
+                '((emit-gengc-barrier object nil rax (vop-nth-arg 3 vop))))
                ((%raw-instance-cas/word %raw-instance-cas/signed-word)))
            (move-immediate rax (encode-value-if-immediate old-value ,(and (memq 'any-reg scs) t)))
            (inst cmpxchg :lock ea new-value)
@@ -430,10 +411,20 @@
                                               (and (integerp value)
                                                    (plausible-signed-imm32-operand-p (,(if tagged 'fixnumize 'progn) value)))))))))
        (:arg-types ,type tagged-num ,el-type)
+       (:arg-refs obj-ref ind-ref val-ref)
        (:vop-var vop)
        ,@(and barrier
-              `((:temporary (:sc unsigned-reg) val-temp)))
+              `((:gc-barrier 0 2)
+                (:info barrier)
+                (:temporary (:sc unsigned-reg) val-temp)))
        (:generator 4
+         #+permgen
+         ,@(when (string= name 'instance-index-set)
+             `((when (and (eq (tn-ref-type obj-ref) (specifier-type 'layout))
+                          ;; since ANY-REG is non-pointer, OBJECT doesn't need remembering
+                          (not (sc-is value any-reg)))
+                 (inst push object)
+                 (invoke-asm-routine 'call 'gc-remember-layout vop))))
          ,@(when (eq translate 'sb-bignum:%bignum-set)
              '((bignum-index-check object index 0 vop)))
          (let ((ea (if (sc-is index immediate)
@@ -442,14 +433,10 @@
                        (ea (- (* ,offset n-word-bytes) ,lowtag)
                            object index (index-scale n-word-bytes index)))))
            ,@(if barrier
-                 `((emit-gengc-barrier object nil val-temp (vop-nth-arg 2 vop) value)
+                 `((when barrier
+                     (emit-gengc-barrier object nil val-temp t))
                    (emit-store ea value val-temp))
                  `((inst mov :qword ea (encode-value-if-immediate value ,tagged)))))))))
-
-(defmacro pc-size (vop)
-  `(if (sb-c::code-immobile-p ,vop)
-       :dword
-       :qword))
 
 ;;; This is not "very" arch-specific apart from use of the EA macro
 (defmacro mutex-slot (base-reg slot-name)

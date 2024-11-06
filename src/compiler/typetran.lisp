@@ -67,14 +67,17 @@
         (abort-ir1-transform)
         expansion)))
 
-(progn
-  (defun type-other-pointer-p (type)
-    (csubtypep type (specifier-type '(not #1=(or fixnum #+64-bit single-float
-                                                 list function instance character
-                                                 extended-sequence)))))
+(sb-xc:deftype other-pointer ()
+  '(or array
+    (and number (not (or fixnum #+64-bit single-float)))
+    fdefn (and symbol (not null))
+    weak-pointer system-area-pointer code-component))
 
-  (defun type-not-other-pointer-p (type)
-    (csubtypep type (specifier-type '#1#))))
+(defun type-other-pointer-p (type)
+  (csubtypep type (specifier-type 'other-pointer)))
+
+(defun type-not-other-pointer-p (type)
+  (csubtypep type (specifier-type '(not other-pointer))))
 
 ;;; If the lvar OBJECT definitely is or isn't of the specified
 ;;; type, then return T or NIL as appropriate. Otherwise quietly
@@ -118,6 +121,21 @@
                  ;; If it's a lisp-rep-type, the CTYPE should be one already.
                  (aver (not (compute-lisp-rep-type alien-type)))
                  `(sb-alien::alien-value-typep object ',alien-type)))
+              ((and (neq current-predicate 'arrayp)
+                    (csubtypep intersect (specifier-type 'array))
+                    (not (types-equal-or-intersect (type-difference otype type)
+                                                   (specifier-type 'array))))
+               `(arrayp object))
+              ((and (neq current-predicate 'simple-array-p)
+                    (neq current-predicate 'arrayp)
+                    (csubtypep intersect (specifier-type 'simple-array))
+                    (not (types-equal-or-intersect (type-difference otype type)
+                                                   (specifier-type 'simple-array))))
+               `(simple-array-p object))
+              ((and (eq current-predicate 'vectorp)
+                    (vop-existsp :translate %array-rank=)
+                    (and (csubtypep otype (specifier-type 'array))))
+               `(%array-rank= object 1))
               ;; (typep (the (or list fixnum) x) 'integer) =>
               ;; (typep x 'fixnum)
               ((let ((new-predicate
@@ -146,6 +164,8 @@
                             (not (and (eq current-predicate 'functionp)
                                       (eq new-predicate 'compiled-function-p)))
                             (not (eq current-predicate 'characterp))
+                            (not (eq current-predicate 'arrayp))
+                            (not (eq current-predicate 'simple-array-p))
                             (not (and (eq current-predicate 'non-null-symbol-p)
                                       (eq new-predicate 'keywordp)))
                             (not (eq new-predicate #+64-bit 'signed-byte-64-p
@@ -183,9 +203,12 @@
                              (cond ((and (type-not-other-pointer-p diff)
                                          (type-other-pointer-p type))
                                     `(%other-pointer-p object))
-                                   ((and (type-other-pointer-p type)
+                                   ((and (type-other-pointer-p diff)
                                          (type-not-other-pointer-p type))
-                                    `(not (%other-pointer-p object)))))))))
+                                    `(not (%other-pointer-p object)))
+                                   ((and (csubtypep diff (specifier-type 'instance))
+                                         (not (types-equal-or-intersect type (specifier-type 'instance))))
+                                    `(not (%instancep object)))))))))
               (t
                (give-up-ir1-transform)))))))
 
@@ -396,6 +419,13 @@
              ((type= type (specifier-type '(or word sb-vm:signed-word)))
               `(or (typep ,object 'sb-vm:signed-word)
                    (typep ,object 'word)))
+             ((and (vop-existsp :translate unsigned-byte-x-p)
+                   (eql (numeric-type-class type) 'integer)
+                   (eql low 0)
+                   (integerp high)
+                   (= (logcount (1+ high)) 1)
+                   (zerop (rem (integer-length high) sb-vm:n-word-bits)))
+              `(unsigned-byte-x-p ,object ,(integer-length high)))
              (t
               `(and (typep ,object ',base)
                     ,(transform-numeric-bound-test object type base)))))
@@ -424,20 +454,6 @@
            ;; as soon as any unknown is present.
            `(classoid-cell-typep ,(find-classoid-cell spec :create t) ,object))
           ((unknown-type-p type)
-           #+(and sb-xc-host (not sb-devel))
-           (warn "can't open-code test of unknown type ~S"
-                 (type-specifier type))
-           ;; This is not a policy-based decision to notify here,
-           ;; because it is _ALWAYS_ questionable style imho to refer to unknown types.
-           ;; Unfortunately, people love to suppress COMPILER-NOTE because SBCL produces
-           ;; far too many of those for low-level things like untagged-SAP-to-tagged-SAP.
-           ;; So we could opt to STYLE-WARN, which is, in this case, perhaps more severe
-           ;; than we'd like?
-           ;; I guess we're just going to have to say that if you've muffled too may
-           ;; kinds of NOTEs, that's on you.
-           #-sb-xc-host (compiler-notify 'unknown-typep-note
-                                         :format-control "can't open-code test of unknown type ~S"
-                                         :format-arguments (list (type-specifier type)))
            `(let ((object ,object)
                   (cache (load-time-value (cons #'sb-kernel::cached-typep ',spec)
                                           t)))
@@ -567,7 +583,39 @@
              `((typep ,object '(or ,@(mapcar #'type-specifier other))))))))))
 
 (defun source-transform-union-numeric-typep (object types)
-  (cond ((not (every #'numeric-type-p types))
+  (cond ((and (= (length types) 2)
+              ;; Transform (or (double-float * (0d0)) (eql -0d0))
+              (destructuring-bind (a b) types
+                (multiple-value-bind (member numeric) (cond ((member-type-p a)
+                                                             (values a b))
+                                                            ((member-type-p b)
+                                                             (values b a)))
+                  (let ((double))
+                    (and (numeric-type-p numeric)
+                         (= (member-type-size member) 1)
+                         (or (setf double (sb-kernel::member-type-member-p -0d0 member))
+                             (sb-kernel::member-type-member-p -0f0 member))
+                         (let ((low (numeric-type-low numeric))
+                               (high (numeric-type-high numeric))
+                               (type (if double
+                                         'double-float
+                                         'single-float)))
+                           (when (and (eq (numeric-type-class numeric) 'float)
+                                      (eq (numeric-type-complexp numeric) :real)
+                                      (equal high (if double
+                                                      '(0d0)
+                                                      '(0f0))))
+                             `(and ,(if double
+                                        `(double-float-p ,object)
+                                        `(single-float-p ,object))
+                                   ,(if low
+                                        `(and (float-sign-bit-set-p (truly-the ,type ,object))
+                                              (,@(if (consp low)
+                                                     `(< ,(car low))
+                                                     `(<= ,low))
+                                               (truly-the ,type ,object)))
+                                        `(float-sign-bit-set-p (truly-the ,type ,object))))))))))))
+        ((not (every #'numeric-type-p types))
          nil)
         ((and (= (length types) 2)
               ;; (and subtype-of-integer (not (eql x)))
@@ -650,9 +698,48 @@
                        '(or ,@(mapcar #'type-specifier
                                (remove type-cons
                                 (remove type-symbol types)))))))
+          ;; Check for NULL before consp, then consp can be reduced to listp.
+          ((and mtype
+                (memq nil members)
+                (find-if #'cons-type-p types))
+           `(or (null ,object)
+                (typep ,object
+                       '(or ,@(mapcar #'type-specifier
+                               (remove mtype types))
+                         (member ,@(remove nil members))))))
           ((group-vector-type-length-tests object types))
           ((group-vector-length-type-tests object types))
           ((source-transform-union-numeric-typep object types))
+          ;; Check for CONSP/SINGLE/DOUBLE-FLOAT-P once.
+          ((let* (single-floats
+                  double-floats
+                  conses)
+             (loop for type in types
+                   do
+                   (cond
+                     ((numeric-type-p type)
+                      (cond ((numtype-aspects-eq type (specifier-type 'double-float))
+                             (push type double-floats))
+                            ((numtype-aspects-eq type (specifier-type 'single-float))
+                             (push type single-floats))))
+                     ((cons-type-p type)
+                      (push type conses))))
+             (when (or (cdr single-floats)
+                       (cdr double-floats)
+                       (cdr conses))
+               (flet ((check (sub-types test)
+                        (when (cdr sub-types)
+                          `((and (,test ,object)
+                                 (or
+                                  ,@(loop for type in sub-types
+                                          do (setf types (remove type types :test #'eq :count 1))
+                                          collect `(typep ,object ',(type-specifier type)))))))))
+                 `(or
+                   ,@(check single-floats 'single-float-p)
+                   ,@(check double-floats 'double-float-p)
+                   ,@(check conses 'consp)
+                   ,@(loop for type in types
+                           collect `(typep ,object ',(type-specifier type))))))))
           (t
            (multiple-value-bind (widetags more-types)
                (sb-kernel::widetags-from-union-type types)
@@ -886,8 +973,9 @@
   (let ((eltype (array-type-specialized-element-type type)))
     (unless (or (type= eltype (array-type-specialized-element-type stype))
                 (eq eltype *wild-type*))
-      (let* ((typecode (sb-vm:saetp-typecode (find-saetp-by-ctype eltype))))
-        (cond ((and headerp (not (array-type-complexp stype)))
+      (let* ((typecode (sb-vm:saetp-typecode (find-saetp-by-ctype eltype)))
+             (complexp (array-type-complexp type)))
+        (cond ((and headerp (not complexp))
                (let ((obj `(truly-the ,(type-specifier stype) ,obj)))
                  ;; If we know OBJ is an array header, and that the array is
                  ;; simple, we also know there is exactly one indirection to
@@ -896,7 +984,7 @@
                    (eq (%other-pointer-widetag (%array-data ,obj)) ,typecode)
                    #+x86-64
                    (widetag= (%array-data ,obj) ,typecode))))
-              ((not (array-type-complexp stype))
+              ((not complexp)
                (values
                 `((and (%other-pointer-p ,obj)
                        (let ((widetag (%other-pointer-widetag ,obj)))
@@ -910,40 +998,50 @@
                  (arrayp
                   (values `((and (%other-pointer-p ,obj)
                                  (let ((data ,obj))
-                                   (loop
-                                    (let ((widetag (%other-pointer-widetag data)))
-                                      (if (eq widetag ,typecode)
-                                          (return t)
-                                          (if (or (eq widetag sb-vm:simple-array-widetag)
-                                                  (>= widetag sb-vm:complex-base-string-widetag))
-                                              (setf data (%array-data data))
-                                              (return nil))))))))
+                                   (and
+                                    ,@(when (eq complexp t)
+                                        `((/= (%other-pointer-widetag data)
+                                              ,@(unless headerp
+                                                  `(,typecode))
+                                              sb-vm:simple-array-widetag)))
+                                    (loop
+                                     (let ((widetag (%other-pointer-widetag data)))
+                                       (if (eq widetag ,typecode)
+                                           (return t)
+                                           (if (or (eq widetag sb-vm:simple-array-widetag)
+                                                   (>= widetag sb-vm:complex-base-string-widetag))
+                                               (setf data (%array-data data))
+                                               (return nil)))))))))
                           t))
                  (vectorp
                   (if length
                       (values `((and (%other-pointer-p ,obj)
                                      (let ((widetag (%other-pointer-widetag ,obj)))
-                                       (if (eq widetag ,typecode)
-                                           (= (vector-length (truly-the (simple-array * (*)) ,obj)) ,length)
-                                           (and (= widetag sb-vm:complex-vector-widetag)
-                                                (= (%array-dimension (truly-the (and (array * (*))
-                                                                                     (not simple-array)) ,obj) 0)
-                                                   ,length)
-                                                (let ((data ,obj))
-                                                  (loop
-                                                   (setf data (%array-data data))
-                                                   (let ((widetag (%other-pointer-widetag data)))
-                                                     (if (eq widetag ,typecode)
-                                                         (return t)
-                                                         (unless (or (eq widetag sb-vm:simple-array-widetag)
-                                                                     (>= widetag sb-vm:complex-vector-widetag))
-                                                           (return nil)))))))))))
+                                       (,@(if (eq complexp t)
+                                              '(progn)
+                                              `(if (eq widetag ,typecode)
+                                                   (= (vector-length (truly-the (simple-array * (*)) ,obj)) ,length)))
+                                        (and (= widetag sb-vm:complex-vector-widetag)
+                                             (= (%array-dimension (truly-the (and (array * (*))
+                                                                                  (not simple-array)) ,obj) 0)
+                                                ,length)
+                                             (let ((data ,obj))
+                                               (loop
+                                                (setf data (%array-data data))
+                                                (let ((widetag (%other-pointer-widetag data)))
+                                                  (if (eq widetag ,typecode)
+                                                      (return t)
+                                                      (unless (or (eq widetag sb-vm:simple-array-widetag)
+                                                                  (>= widetag sb-vm:complex-vector-widetag))
+                                                        (return nil)))))))))))
                               t
                               t)
                       (values `((and (%other-pointer-p ,obj)
                                      (let ((widetag (%other-pointer-widetag ,obj)))
-                                       (if (eq widetag ,typecode)
-                                           t
+                                       (,@(if (eq complexp t)
+                                              '(progn)
+                                              `(if (eq widetag ,typecode)
+                                                   t))
                                            (and (= widetag sb-vm:complex-vector-widetag)
                                                 (let ((data ,obj))
                                                   (loop
@@ -1126,11 +1224,6 @@
                 `(structure-typep object ,flag)
                 `(and (%instancep object)
                       (logtest (,get-flags (%instance-layout object)) ,flag)))))
-
-          ;; TODO: remove after April 2021 release.
-          ((eq name 'sb-kernel::random-class)
-           (style-warn "~S should not appear in a TYPEP test" name)
-           nil)
 
           ;; Next easiest: Sealed and no subtypes. Typically for DEFSTRUCT only.
           ;; Even if you don't seal a DEFCLASS, we're allowed to assume that things
@@ -1629,6 +1722,12 @@
            ;; that can undo that and see that it's really (IDENTITY X).
            (progn (delay-ir1-transform node :constraint)
                   `(coerce-to-fun x))))
+      ((multiple-value-bind (p really)
+           (csubtypep tspec
+                      (specifier-type '(or sequence character complex float function)))
+         (and really
+              (not p)))
+       `(the* (,tspec :context coerce-context) x))
       (t
        (give-up-ir1-transform
         "~@<open coding coercion to ~S not implemented.~:@>"
@@ -1638,17 +1737,24 @@
   ((value) (sb-vm:signed-word) * :important nil)
   `(>= value 0))
 
+(when-vop-existsp (:translate unsigned-byte-x-p)
+  (deftransform unsigned-byte-x-p
+      ((value x) (t t) * :important nil :node node)
+    (ir1-transform-type-predicate value (specifier-type `(unsigned-byte ,(lvar-value x))) node))
+
+  (deftransform unsigned-byte-x-p
+      ((value x) ((integer * #.most-positive-word) t) * :important nil)
+    `(#+64-bit unsigned-byte-64-p #-64-bit unsigned-byte-32-p x)))
+
 (deftransform %other-pointer-p ((object))
-  (let ((this-type
-          (specifier-type '(or fixnum
-                            #+64-bit single-float
-                            function
-                            list
-                            instance
-                            character))))
-    (cond ((not (types-equal-or-intersect this-type (lvar-type object))))
-          ((csubtypep (lvar-type object) this-type)
+  (let ((type (lvar-type object)))
+    (cond ((not (types-equal-or-intersect type (specifier-type 'other-pointer)))
            nil)
+          ((or (csubtypep type (specifier-type 'other-pointer))
+               ;; It doesn't negate to this type, so check both
+               (csubtypep type (specifier-type '(not (or fixnum #+64-bit single-float
+                                                                list function instance character)))))
+           t)
           ((give-up-ir1-transform)))))
 
 ;;; BIGNUMP is simpler than INTEGERP, so if we can rule out FIXNUM then ...
@@ -1695,3 +1801,18 @@
     (def 16)
     #+64-bit
     (def 32)))
+
+;;; source-transform-union-typep would generate the same thing but
+;;; it's too complicated to be optimized later, hence the delay.
+(deftransform string-designator-p ((x) * * :node node)
+  (delay-ir1-transform node :constraint)
+  `(or (%other-pointer-subtype-p x '(,sb-vm:symbol-widetag ,@sb-vm::+string-widetags+))
+       (null (truly-the (not (or (and symbol (not null)) string)) x))
+       (characterp (truly-the (not (or symbol string)) x))))
+
+(defoptimizer (check-type-error-trap derive-type) ((place place-value type/string))
+  (when (constant-lvar-p type/string)
+    (let ((type (lvar-value type/string)))
+      (if (stringp type)
+          (careful-specifier-type (cdr (lvar-value place)))
+          (careful-specifier-type type)))))

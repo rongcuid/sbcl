@@ -217,12 +217,11 @@
 (declaim (inline address-based-counter-val quasi-random-address-based-hash))
 (defun address-based-counter-val ()
   (let ((word
-         ;; threads imply gencgc. use the per-thread alloc region pointer
-         #+sb-thread
+         ;; Use the per-thread alloc region pointer when possible
+         #+(or x86-64 sb-thread)
          (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-mixed-tlab-slot))
-         ;; dynamic-space-free-pointer increments only when a page is full.
-         ;; Using mixed_region directly is finer-grained.
-         #+(and (not sb-thread) gencgc)
+         ;; Otherwise mixed_region in static space
+         #-(or x86-64 sb-thread)
          (sb-sys:sap-ref-word (sb-sys:int-sap (+ sb-vm::static-space-start
                                                  sb-vm::mixed-region-offset))
                               0)))
@@ -781,10 +780,6 @@
 (define-load-time-global *eql-type-cache* ; like EQL-SPECIALIZER-TABLE in PCL
     (sb-impl::make-system-hash-table :test 'eql :weakness :value :synchronized nil))
 
-(defmacro safe-member-type-elt-p (obj)
-  `(or (not (sb-vm:is-lisp-pointer (get-lisp-obj-address ,obj)))
-       (heap-allocated-p ,obj)))
-
 #-sb-xc-host
 (defun ctype-hashset-insert-if-absent (hashset key function)
   (or (hashset-find hashset key)
@@ -1157,7 +1152,7 @@
     ;; Don't need the answer to be positive for key-info-set-hashset,
     ;; but do need it to be positive when hashing ARGS-TYPE which uses MIX.
     (dolist (elt set (logand h sb-xc:most-positive-fixnum))
-      (setf h (plus-mod-fixnum (truly-the fixnum (key-info-hash elt)) h)))))
+      (setf h (plus-mod-fixnum (truly-the sb-xc:fixnum (key-info-hash elt)) h)))))
 
 (defun key-info-list-flags (list)
   (let ((bits 0))

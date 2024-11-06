@@ -132,6 +132,11 @@
                (unless (fgen-system old)
                  (setf (fgen-system old) system)))
               (t
+               (unless (eql (sb-vm:thread-current-arena) 0)
+                 (setq gensyms (ensure-heap-list gensyms))
+                 (sb-vm:without-arena
+                     (setq test (copy-tree test)
+                           generator-lambda  (copy-tree generator-lambda))))
                (setf (gethash test table)
                      (make-fgen gensyms generator generator-lambda system))))))))
 
@@ -148,7 +153,8 @@
 (defun get-new-fun-generator (lambda test code-converter)
   (multiple-value-bind (code gensyms) (compute-code lambda code-converter)
     (let ((generator-lambda `(lambda ,gensyms
-                               (declare (optimize (sb-c:store-source-form 0)))
+                               (declare (optimize (sb-c:store-source-form 0)
+                                                  (sb-c::store-xref-data 0)))
                                (function ,code))))
       (let ((generator (pcl-compile generator-lambda :safe)))
         (ensure-fgen test gensyms generator generator-lambda nil)
@@ -182,8 +188,8 @@
             gensyms)))
 
 (defun compute-constants (lambda constant-converter)
-  (let ((*walk-form-expand-macros-p* t) ; doesn't matter here.
-        collect)
+  (let ((*walk-form-expand-macros-p* t)) ; doesn't matter here.
+   (collect ((res))
     (walk-form lambda
                nil
                (lambda (f c e)
@@ -192,11 +198,9 @@
                      f
                      (let ((consts (funcall constant-converter f)))
                        (if consts
-                           (progn
-                             (setq collect (append collect consts))
-                             (values f t))
+                           (dolist (x consts (values f t)) (res x))
                            f)))))
-    collect))
+    (res))))
 
 (defmacro precompile-function-generators (&optional system)
   (let (collect)

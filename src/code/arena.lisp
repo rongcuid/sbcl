@@ -13,7 +13,6 @@
           switch-to-arena
           rewind-arena
           unuse-arena
-          thread-current-arena
           in-same-arena
           dump-arena-objects
           arena-contents
@@ -84,13 +83,21 @@ one or more times, not to exceed MAX-EXTENSIONS times"
                            (alien-funcall (extern-alien "sbcl_new_arena" (function unsigned unsigned))
                                           size)))))
     (%set-instance-layout arena layout)
-    (setf (arena-size-limit (truly-the arena arena))
-          (+ size (the fixnum (* max-extensions growth-amount)))
-          (arena-growth-amount arena) growth-amount
-          (arena-index arena) index
-          (arena-hidden arena) nil
-          (arena-token arena) 1
-          (arena-userdata arena) nil)
+    ;; Arena growth amount < 8MiB is failure-prone. The reason has to do with the test
+    ;; for whether an allocation is "oversized" - see the logic in claim_subrange where it checks
+    ;; "nbytes > (sword_t)(a->uw_growth_amount >> 9)" and the logic for adding a default
+    ;; amount of slack to any claim at "long total_request = nbytes + 8192".
+    ;; If the amount to grow by is too small, then a single cons cell plus the default slack
+    ;; can exceed the threshold for being oversized. But if a cons cell goes in a standalone
+    ;; (oversized) block, scavenging goes haywire, and I don't really want to change how it works.
+    (let ((growth-amount (max growth-amount (* 8 1024 1024))))
+      (setf (arena-size-limit (truly-the arena arena))
+            (+ size (the fixnum (* max-extensions growth-amount)))
+            (arena-growth-amount arena) growth-amount
+            (arena-index arena) index
+            (arena-hidden arena) nil
+            (arena-token arena) 1
+            (arena-userdata arena) nil))
     arena))
 
 ;;; Destroy memory associated with ARENA, unlinking it from the global chain.
@@ -183,6 +190,11 @@ one or more times, not to exceed MAX-EXTENSIONS times"
   ;; Inform GC as of now not to look in the arena
   (setf (arena-hidden arena) t)
   (arena-mprotect arena t))
+;; FIXME: for the pattern "unhide / rewind / with-arena" to be safe, there has to be
+;; another state introduced which is "hidden + ignored-during-GC".  This is needed
+;; in case an auto-triggered collection skipped over the arena. Then there is race
+;; with the next auto-triggered GC in between unhide + rewind, beacause any pointers
+;; in the un-hidden arena may point to garbage.
 (defun unhide-arena (arena)
   (aver (arena-hidden arena))
   (arena-mprotect arena nil)

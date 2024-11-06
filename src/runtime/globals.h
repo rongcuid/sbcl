@@ -31,7 +31,7 @@ extern struct lisp_startup_options lisp_startup_options;
 extern int pre_verify_gen_0; // set and read from Lisp tests
 extern int gencgc_verbose;
 
-extern sword_t next_free_page;
+extern int next_free_page;
 #define dynamic_space_highwatermark() (next_free_page*GENCGC_PAGE_BYTES+DYNAMIC_SPACE_START)
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -61,7 +61,7 @@ extern uword_t DYNAMIC_0_SPACE_START, DYNAMIC_1_SPACE_START;
 #else
 extern uword_t DYNAMIC_SPACE_START;
 #endif
-extern uword_t FIXEDOBJ_SPACE_START, TEXT_SPACE_START, PERMGEN_SPACE_START;
+extern uword_t FIXEDOBJ_SPACE_START, TEXT_SPACE_START;
 extern unsigned int text_space_size;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 extern uword_t immobile_space_lower_bound, immobile_space_max_offset;
@@ -92,6 +92,9 @@ extern lispobj *current_binding_stack_pointer;
 extern lispobj *read_only_space_free_pointer;
 extern lispobj *static_space_free_pointer;
 extern lispobj *permgen_space_free_pointer;
+extern uword_t permgen_bounds[2];
+#define PERMGEN_SPACE_START permgen_bounds[0]
+#define CORE_PERMGEN_END permgen_bounds[1]
 
 static inline bool readonly_space_p(lispobj ptr) {
     return ptr >= READ_ONLY_SPACE_START && (lispobj*)ptr < read_only_space_free_pointer;
@@ -107,8 +110,10 @@ extern lispobj *static_code_space_free_pointer;
 extern lispobj *text_space_highwatermark;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 extern lispobj *fixedobj_free_pointer;
-extern lispobj ALIEN_LINKAGE_TABLE_SPACE_START;
+extern lispobj ALIEN_LINKAGE_SPACE_START;
 #endif
+extern lispobj *linkage_space, *elf_linkage_space;
+extern int linkage_table_count, elf_linkage_table_count;
 extern os_vm_address_t anon_dynamic_space_start;
 extern lispobj* tlsf_mem_start; // meaningful only if immobile space
 
