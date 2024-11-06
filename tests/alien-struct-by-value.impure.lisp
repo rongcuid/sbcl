@@ -11,8 +11,25 @@
 ;;;; This software is in the public domain and is provided with
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
-(in-package :cl-user)
+
+;(in-package :cl-user)
 ;;;; Bug 313202: C struct pass/return by value
+;;; Compile and load shared library
+
+(defvar *soname*)
+#+win32
+(with-scratch-file (dll "dll")
+  (sb-ext:run-program "gcc" `("-shared" "-o" ,dll "alien-struct-by-value.c")
+                      :search t)
+  (load-shared-object dll))
+#-win32
+(progn
+  (unless (probe-file "alien-struct-by-value.so")
+    (sb-ext:run-program "/bin/sh" '("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
+                                    "-o" "alien-struct-by-value.so"
+                                    "alien-struct-by-value.c")))
+  (setq *soname* (truename "alien-struct-by-value.so"))
+  (load-shared-object *soname*))
 (defconstant +magic-number+ 42)
 ;;; Compile and load shared library
 (unless (probe-file "alien-struct-by-value.so")
@@ -198,5 +215,6 @@
     (assert (= 55 (slot m 'm12))) (assert (= 56 (slot m 'm13)))
     (assert (= 57 (slot m 'm14))) (assert (= 58 (slot m 'm15)))))
 
+
 ;;; Clean up
-(delete-file "alien-struct-by-value.so")
+#-win32 (ignore-errors (delete-file *soname*))
