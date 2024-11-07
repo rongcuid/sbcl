@@ -1252,6 +1252,13 @@
              (when (and (constant-fold-call-p node)
                         (constant-fold-call node))
                (return-from ir1-optimize-combination))
+             ;; Don't transform locally flushable functions,
+             ;; their transforms won't know that they are flushable.
+             (when (and (not (node-tail-p node))
+                        (not (node-lvar node))
+                        (let ((name (lvar-fun-name (combination-fun node) t)))
+                          (memq name (lexenv-flushable (node-lexenv node)))))
+               (return-from ir1-optimize-combination))
              (when (fold-call-derived-to-constant node)
                (return-from ir1-optimize-combination))
              (when (and (ir1-attributep attr commutative)
@@ -1850,7 +1857,16 @@
   (let* ((info (basic-combination-fun-info combination))
          (attr (fun-info-attributes info))
          (args (basic-combination-args combination)))
-    (cond ((not (ir1-attributep attr foldable))
+    (cond ((not (or (ir1-attributep attr foldable)
+                    (and (ir1-attributep attr foldable-read-only)
+                         (let ((dest (node-dest combination)))
+                           (and (combination-p dest)
+                                (eq (combination-kind dest) :known)
+                                (let* ((info (combination-fun-info dest))
+                                       (read-only (fun-info-read-only-args info)))
+                                  (when read-only
+                                    (logbitp (position (node-lvar combination) (combination-args dest))
+                                             read-only))))))))
            nil)
           ((ir1-attributep attr call)
            (map-combination-args-and-types
@@ -2831,7 +2847,7 @@
 
                ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
                (change-ref-leaf (lvar-uses (combination-fun node))
-                                (find-free-fun 'values "values-list optimizer"))
+                                (find-free-fun 'values "VALUES-LIST"))
                (setf (combination-kind node) :full)
                (dolist (arg args)
                  (setf (lvar-dest arg) node))
@@ -2861,7 +2877,7 @@
                            (replace-node use `(values ,@(constant-value (ref-leaf use)))))
                           (t
                            (change-ref-leaf (lvar-uses (combination-fun use))
-                                            (find-free-fun 'values "values-list optimizer"))
+                                            (find-free-fun 'values "VALUES-LIST"))
                            (setf (combination-kind use) :full)
                            (setf (node-derived-type use) *wild-type*)))))
              (mapc #'transform use)

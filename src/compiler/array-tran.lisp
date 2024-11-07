@@ -585,8 +585,12 @@
 ;;;; constructors
 
 ;;; Convert VECTOR into a MAKE-ARRAY.
-(define-source-transform vector (&rest elements)
-  `(make-array ,(length elements) :initial-contents (list ,@elements)))
+(deftransform vector ((&rest elements) * * :node node)
+  ;; Some transforms recognize VECTOR as an argument
+  (delay-ir1-transform node :constraint)
+  (let ((vars (make-gensym-list (length elements))))
+    `(lambda ,vars
+       (make-array ,(length elements) :initial-contents (list ,@vars)))))
 
 ;;; Convert it into a MAKE-ARRAY if the element-type is known at compile-time.
 ;;; Otherwise, don't. This prevents allocating memory for a million element
@@ -683,7 +687,8 @@
      (if (constantp initial-contents env)
          (map 'vector (lambda (x) (constant-form-value x env)) output)
          (let ((f (if (singleton-p output) 'list 'vector)))
-           `(locally (declare (notinline ,f))
+           `(locally (declare (notinline ,f)
+                              (flushable ,f))
              (,f ,@(mapcar (lambda (x)
                              (cond ((and (symbolp x)
                                          (not (nth-value
@@ -1003,7 +1008,7 @@
     (flet ((wrap (underlying)
              `(let* ((%length ,(or c-length '(the index dims)))
                      (nwords ,n-words-form))
-                (declare (flushable sb-vm::splat))
+                (declare (flushable sb-vm::splat quickfill))
                 ,(if (not array-header-p)
                      underlying     ; was already cast using TRULY-THE
                      (let* ((constant-fill-pointer-p (and fill-pointer
