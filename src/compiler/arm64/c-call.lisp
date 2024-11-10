@@ -219,32 +219,34 @@
 - Number of registers if to be put in registers
 - Stack slot size (padded) if to be put on stack
 - Additional stack space consumed if copying required
+- Natural alignment
 
 Note: with Darwin, arguments can take less than one word on stack."
   (let* ((raw-size (truncate (alien-type-bits type) n-byte-bits))
          (slot-size #+darwin raw-size #-darwin n-word-bytes)
-         (nregs (ceiling slot-size n-word-bytes)))
+         (nregs (ceiling slot-size n-word-bytes))
+         (natural-alignment (truncate (alien-type-alignment type) n-byte-bits)))
     (cond
       ;; Ints, floats, and pointers
       ((alien-integer-type-p type)
        (assert (<= size 8) (size)
                "SBCL BUG: Integer argument of size ~A > 8 bytes is not supported." size)
-       (values :int nregs slot-size 0))
+       (values :int nregs slot-size 0 natural-alignment))
       ((alien-float-type-p type)
        (assert (<= size 8) (size)
                "SBCL BUG: Float argument of size ~A > 8 bytes is not supported." size)
-       (values :float nregs slot-size 0))
+       (values :float nregs slot-size 0 natural-alignment))
       ((alien-pointer-type-p type)
-       (values :ptr nregs slot-size 0))
+       (values :ptr nregs slot-size 0 natural-alignment))
       ((alien-type-= #.(parse-alien-type 'system-area-pointer nil) type)
-       (values :sap nregs slot-size 0))
+       (values :sap nregs slot-size 0 natural-alignment))
       ;; Structs
       ((alien-record-type-p type)
        (if (> size 16)
            ;; Large struct is copied to stack and replaced by pointer
-           (values :record-large 1 n-word-bytes raw-size)
+           (values :record-large 1 n-word-bytes raw-size natural-alignment)
            ;; Small struct is used like non-composite values
-           (values :record-small nregs slot-size 0)))
+           (values :record-small nregs slot-size 0 natural-alignment)))
       (t (bug "Unsupported alien type: ~S" type)))))
 
 ;;;; VOPs used for argument parsing
@@ -980,6 +982,107 @@ NOTE:
         `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
 
 #-sb-xc-host
+(defun allocate-arguments (arg-types)
+  "Computes argument allocation.
+
+Returns a list of assignment, where each element corresponds to one argument.
+Each element can be one of the following alloc-forms:
+- (:GPR GPRN+) for passing an integer or pointer by general purpose register
+- (:GPRS GRRN+) for passing a struct by general purpose register
+    - This distinguish is required because a record on SBCL side is a SAP
+- (:FPR PRECISION FPRN) for passing by floating point register
+    - Precision is 1 if single, 2 if double
+- (:STACK NSP-OFFSET NSP-SIZE) for passing by stack
+- (:COPY COPY-OFFSET COPY-SIZE gpr-or-stack-form) for copying then pass by pointer
+
+NOTE: unfortunately this can only be used in the callback assembler wrapper.
+Ideally it should also be used in the C calling part."
+  (let ((ngrn 0)
+        (nsrn 0)
+        (nsp-off 0)
+        (copy-off 0))
+    (dolist (type arg-types)
+      (multiple-value-bind (kind nregs size extra align) (alien-type-slot-info type)
+        (ecase kind
+          ;; C.1-8 except for SIMD and vector types
+          (:float
+           (let ((precision (if (alien-single-float-type-p type) 1 2)))
+             (cond ((< nsrn 8)
+                  (prog1 (list :fpr precision nsrn) (incf nsrn)))
+                 (t
+                  (prog1 (list :stack nsp-off size) (incf nsp-off size))))))
+          ;; C.9+
+          ((:int :ptr :sap)
+           (cond
+             ;; C.9
+             ((and (<= size 8) (< ngrn 8))
+              (prog1 (list :gpr ngrn) (incf ngrn)))
+             ;; C.10, C.11
+             ((and (= size 16) (< ngrn 7))
+              ;; C.10
+              #-darwin
+              (setf ngrn (align-up ngrn 2))
+              (prog1 (list :gpr ngrn (1+ ngrn)) (incf ngrn 2)))
+             ;; C.14 (implicit from size), C.16 (implicit), C.17
+             (t
+              (prog1 (list :stack nsp-off size) (incf nsp-off size)))))
+          (:record-small
+           #-darwin
+           (when (= align 16) (align-up ngrn 2))
+           (cond
+             ;; C.12
+             ((< nregs (- 8 ngrn))
+              (prog1 `(:gprs ,@(loop for i below nregs collect (+ ngrn i)))
+                (incf ngrn nregs)))
+             ;; C.14, C.16, C.17
+             (t
+              (prog1 `(:stack ,nsp-offset ,size) (incf nsp-offset size)))))
+          (:record-large
+           #-darwin
+           (when (= align 16) (align-up ngrn 2))
+           (cond
+             ((< ngrn 8)
+              (prog1 `(:copy ,copy-off ,size (:gpr ,ngrn))
+                (incf copy-off size)
+                (incf ngrn)))
+             (t
+              (prog1 `(:copy ,copy-off ,size (:stack ,nsp-off ,n-word-bytes))
+                (incf copy-off size)
+                (incf nsp-off n-word-bytes))))))))))
+
+#-sb-xc-host
+(defun callback-frame-info (arg-allocs)
+  "Computes the callback frame info from argument allocations.
+Returning:
+- Frame size
+- Total aligned argument size (i.e. beginning of extra segment)
+
+Frame is organized as following, where extras hold copies of arguments as needed:
+
+|Arguments |Extras"
+  (let ((frame-size 0)
+        (args-size 0)
+        (extra-size 0))
+    (dolist (alloc arg-allocs)
+      (ecase (car alloc)
+        ;; GPR args are copied as is
+        (:gpr (loop for r in (cdr alloc) do (incf args-size n-word-bytes)))
+        ;; FPR args are copied as is
+        (:fpr (incf args-size n-word-bytes))
+        ;; Stack args may need to be zero/sign extended when copied
+        (:stack (incf args-size (align-up (nth 2 alloc) n-word-bytes)))
+        ;; A struct passed by GPR requires an additional copy AND a SAP to the copy
+        (:gprs
+         (incf args-size n-word-bytes)
+         (incf extra-size (* n-word-bytes (length (cdr alloc)))))
+        ;; A copied argument requires passing only the SAP
+        (:copy (incf args-size n-word-bytes))))
+    (setf frame-size (+ arg-size extra-size))
+    (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
+                                 +number-stack-alignment-mask+))
+    (values frame-size args-size)))
+
+#-sb-xc-host
 (defun copy-int-arg-to-stack (type size target-tn nsp-save-tn arg-offset temp-tn)
   (let ((addr (@ nsp-save-tn arg-offset)))
     (cond #+darwin
@@ -1016,8 +1119,25 @@ NOTE:
      (inst str temp-tn target-tn))))
 
 #-sb-xc-host
-(defun callback-frame-size (argument-types)
-  (loop for type in argument-types))
+(defun alien-callback-copy-arguments (arg-allocs from-nsp-tn to-nsp-tn extra-offset temp-tn)
+  "Given argument allocations, copy arguments to callback frame."
+  (let ((next-nsp-off 0)
+        (next-extra-off extra-offset))
+    (dolist (alloc arg-allocs)
+      (ecase (car alloc)
+        ;; GPR-allocated args are simply copied
+        (:gpr
+         (dolist (gpr (cdr alloc))
+           (inst str gpr (@ nsp-tn next-nsp-off))
+           (incf next-nsp-off n-word-bytes)))
+        ;; FPR-allocated args are copied, but we need the precision
+        (:fpr
+         (let ((src-reg (if (= 1 (nth 1 alloc)) 'single-reg 'double-reg))
+               (src-tn (make-tn (nth 2 alloc) src-reg)))
+           (inst str src-tn target-tn)))
+        (:stack)
+        (:gprs)
+        (:copy)))))
 
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
@@ -1026,10 +1146,6 @@ NOTE:
                            :sc (sc-or-lose sc-name)
                            :offset offset)))
     (let* ((segment (make-segment))
-           ;; Stack offset of the next source argument
-           (arg-offset 0)
-           ;; Extra offset of where an argument will be copied to (small structs)
-           (extra-offset 0)
            (r0-tn (make-tn 0))
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
@@ -1037,174 +1153,98 @@ NOTE:
            (r4-tn (make-tn 4))
            (temp-tn (make-tn 9))
            (nsp-save-tn (make-tn 10))
-           ;; NGRN
-           (num-registers 0)
-           ;; NSRN
-           (fp-registers 0)
-           ;; NSAA = nsp + nsp-offset
-           (nsp-offset 0)
-           (frame-size 0)
-           ;; Size of arguments copied to frame
-           (arg-size 0)
-           ;; Extra size on frame (e.g. copied values)
-           (extra-size 0))
-      ;; Preprocess arguments
-      (dolist (type argument-types)
-        (multiple-value-bind (kind nregs size extra) (alien-type-slot-info type)
-          (ecase kind
-            ;; Int, float, and pointer args are copied as is (slot only)
-            ((:int :float :ptr :sap)
-             (incf arg-size size))
-            ;; Small records may need to be copied and referenced with SAP (slot + pointer).
-            ;; NOTE: We always allocate extra space and always align up, though it might not be necessary:
-            ;; - If small struct is already passed on stack, we don't need an extra copy
-            ;; - On Mac OS, we can align to natural boundary
-            (:record-small
-             (incf arg-size n-word-bytes)
-             (incf extra-size (align-up size n-word-bytes)))
-            ;; Large records already have a copy in memory and can be referenced with SAP (pointer only)
-            (:record-large
-             (incf arg-size n-word-bytes)))))
-      ;; Align up arg-size so that extra region is always aligned
-      (setf arg-size (align-up arg-size n-word-bytes))
-      ;; Calculate frame size
-      (setf frame-size (+ arg-size extra-size))
-      ;; Align frame
-      (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
-                                 +number-stack-alignment-mask+))
-      (assemble (segment 'nil)
-        (inst mov-sp nsp-save-tn nsp-tn)
-        (inst str lr-tn (@ nsp-tn -16 :pre-index))
-        ;; Make room on the stack for arguments.
-        (when (plusp frame-size)
-          (inst sub nsp-tn nsp-tn frame-size))
-        ;; Copy arguments
-        (dolist (type argument-types)
-          (multiple-value-bind (kind nregs size extra) (alien-type-slot-info type)
-            (let ((target-tn (@ nsp-tn nsp-offset)))
-              (ecase kind
-                ((:int :ptr :sap)
-                 (cond
-                   ;; C.9 copy from registers
-                   ((< num-registers +max-register-args+)
-                    (let ((src-tn (make-tn num-registers)))
-                      (inst str src-tn target-tn)
-                      (incf num-registers)
-                      (incf nsp-offset size)))
-                   ;; C.17 copy from saved stack
-                   (t
-                    (copy-int-arg-to-stack type size target-tn nsp-save-tn arg-offset temp-tn)
-                    (incf arg-offset size)
-                    (incf nsp-offset size))))
-                (:float
-                 (cond ((< fp-registers +max-register-args+)
-                        (let ((src-tn (make-tn fp-registers
+           (arg-allocs (allocate-arguments argument-types))
+           (frame-size 0))
+      (multiple-value-bind (frame-size extra-offset) (callback-frame-info arg-allocs)
+        (assemble (segment 'nil)
+          (inst mov-sp nsp-save-tn nsp-tn)
+          (inst str lr-tn (@ nsp-tn -16 :pre-index))
+          ;; Make room on the stack for arguments.
+          (when (plusp frame-size)
+            (inst sub nsp-tn nsp-tn frame-size))
+          ;; Copy arguments
+          (alien-callback-copy-arguments arg-allocs nsp-save-tn nsp-tn extra-offset temp-tn)
+          ;; FIXME: Below is to be rewritten
+          (dolist (type argument-types)
+            (let ((target-tn (@ nsp-tn (* arg-count n-word-bytes)))
+                  (size #+darwin (truncate (alien-type-bits type) n-byte-bits)
+                        #-darwin n-word-bytes))
+              (cond ((or (alien-integer-type-p type)
+                         (alien-pointer-type-p type)
+                         (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
+                                       type))
+                     (let ((gpr (pop gprs)))
+                       (cond (gpr
+                              (inst str gpr target-tn))
+                             (t
+                              (setf stack-argument-bytes
+                                    (align-up stack-argument-bytes size))
+                              (copy-int-arg-to-stack type size target-tn nsp-save-tn stack-argument-bytes temp-tn)
+                              (incf stack-argument-bytes size))))
+                     (incf arg-count))
+                    ((alien-float-type-p type)
+                     (cond ((< fp-registers 8)
+                            (inst str (make-tn fp-registers
                                                (if (alien-single-float-type-p type)
                                                    'single-reg
-                                                   'double-reg))))
-                          (inst str src-tn target-tn)
-                          (incf fp-registers)
-                          (incf nsp-offset size)))
-                       (t
-                        (copy-float-arg-to-stack size target-tn nsp-save-tn arg-offset temp-tn)
-                        (incf arg-offset size)
-                        (incf nsp-offset size))))
-                (:record-small
-                 (cond
-                   ;; If record is passed by registers, copy it to extra space
-                   ((< (+ num-registers nregs) +max-register-args+)
-                    (sb-c::vop load-stack-ptr node block nsp-tn (+ arg-size extra-offset) target-tn)
-                    (ecase nregs
-                      (1
-                       (inst str (make-tn num-registers) target-tn)
-                       (incf num-registers))
-                      (2
-                       (inst stp (make-tn num-registers) (make-tn (1+ num-registers)) target-tn)
-                       (incf num-registers 2))))
-                   ;; If record is passed on stack, take its address without copy
-                   (t)))
-                (:record-large
-                 (bug "TODO")))))
-          ;; FIXME: Below is to be rewritten
-          (let ((target-tn (@ nsp-tn (* arg-count n-word-bytes)))
-                (size #+darwin (truncate (alien-type-bits type) n-byte-bits)
-                      #-darwin n-word-bytes))
-            (cond ((or (alien-integer-type-p type)
-                       (alien-pointer-type-p type)
-                       (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
-                                     type))
-                   (let ((gpr (pop gprs)))
-                     (cond (gpr
-                            (inst str gpr target-tn))
+                                                   'double-reg))
+                                  target-tn))
                            (t
                             (setf stack-argument-bytes
                                   (align-up stack-argument-bytes size))
-                            (copy-int-arg-to-stack type size target-tn nsp-save-tn stack-argument-bytes temp-tn)
-                            (incf stack-argument-bytes size))))
-                   (incf arg-count))
-                  ((alien-float-type-p type)
-                   (cond ((< fp-registers 8)
-                          (inst str (make-tn fp-registers
-                                             (if (alien-single-float-type-p type)
-                                                 'single-reg
-                                                 'double-reg))
-                                target-tn))
-                         (t
-                          (setf stack-argument-bytes
-                                (align-up stack-argument-bytes size))
-                          (copy-float-arg-to-stack size target-tn nsp-save-tn stack-argument-bytes temp-tn)
-                          (incf stack-argument-bytes size)))
-                   (incf fp-registers)
-                   (incf arg-count))
-                  ((and (alien-record-type-p type) (<= size 16))
-                   (bug "Callback arg unimplemented for small record: ~S" type))
-                  ((and (alien-record-type-p type) (> size 16))
-                   (bug "Callback arg unimplemented for large record: ~S" type))
-                  (t
-                   (bug "Unknown alien type: ~S" type)))))
-        ;; arg0 to FUNCALL3 (function)
-        (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
-        (loadw r0-tn r0-tn)
-        ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-        (inst mov r1-tn (fixnumize index))
-        ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-        (inst mov-sp r2-tn nsp-tn)
-        ;; add room on stack for return value
-        (inst sub nsp-tn nsp-tn (* n-word-bytes 2))
-        ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-        (inst mov-sp r3-tn nsp-tn)
+                            (copy-float-arg-to-stack size target-tn nsp-save-tn stack-argument-bytes temp-tn)
+                            (incf stack-argument-bytes size)))
+                     (incf fp-registers)
+                     (incf arg-count))
+                    ((and (alien-record-type-p type) (<= size 16))
+                     (bug "Callback arg unimplemented for small record: ~S" type))
+                    ((and (alien-record-type-p type) (> size 16))
+                     (bug "Callback arg unimplemented for large record: ~S" type))
+                    (t
+                     (bug "Unknown alien type: ~S" type)))))
+          ;; arg0 to FUNCALL3 (function)
+          (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
+          (loadw r0-tn r0-tn)
+          ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
+          (inst mov r1-tn (fixnumize index))
+          ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
+          (inst mov-sp r2-tn nsp-tn)
+          ;; add room on stack for return value
+          (inst sub nsp-tn nsp-tn (* n-word-bytes 2))
+          ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
+          (inst mov-sp r3-tn nsp-tn)
 
-        ;; Call
-        (load-immediate-word r4-tn (foreign-symbol-address
-                                    #-sb-thread "funcall3"
-                                    #+sb-thread "callback_wrapper_trampoline"))
-        (inst blr r4-tn)
+          ;; Call
+          (load-immediate-word r4-tn (foreign-symbol-address
+                                      #-sb-thread "funcall3"
+                                      #+sb-thread "callback_wrapper_trampoline"))
+          (inst blr r4-tn)
 
-        ;; Result now on top of stack, put it in the right register
-        (cond
-          ((or (alien-integer-type-p result-type)
-               (alien-pointer-type-p result-type)
-               (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
-                             result-type))
-           (loadw r0-tn nsp-tn))
-          ((alien-float-type-p result-type)
-           (loadw (make-tn fp-registers
-                              (if (alien-single-float-type-p result-type)
-                                  'single-reg
-                                  'double-reg))
-                 nsp-tn))
-          ((alien-record-type-p result-type)
-           (let ((size #+darwin (truncate (alien-type-bits result-type) n-byte-bits)
-                       #-darwin n-word-bytes))
-             (if (<= size 16)
-                 (bug "Callback result unimplemented for small record type: ~S" result-type)
-                 (bug "Callback result unimplemented for large record type: ~S" result-type))))
-          ((alien-void-type-p result-type))
-          (t
-           (error "Unrecognized alien type: ~A" result-type)))
-        (inst add nsp-tn nsp-tn (+ frame-size (* n-word-bytes 2)))
-        (inst ldr lr-tn (@ nsp-tn 16 :post-index))
-        (inst ret))
+          ;; Result now on top of stack, put it in the right register
+          (cond
+            ((or (alien-integer-type-p result-type)
+                 (alien-pointer-type-p result-type)
+                 (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
+                               result-type))
+             (loadw r0-tn nsp-tn))
+            ((alien-float-type-p result-type)
+             (loadw (make-tn fp-registers
+                             (if (alien-single-float-type-p result-type)
+                                 'single-reg
+                                 'double-reg))
+                    nsp-tn))
+            ((alien-record-type-p result-type)
+             (let ((size #+darwin (truncate (alien-type-bits result-type) n-byte-bits)
+                         #-darwin n-word-bytes))
+               (if (<= size 16)
+                   (bug "Callback result unimplemented for small record type: ~S" result-type)
+                   (bug "Callback result unimplemented for large record type: ~S" result-type))))
+            ((alien-void-type-p result-type))
+            (t
+             (error "Unrecognized alien type: ~A" result-type)))
+          (inst add nsp-tn nsp-tn (+ frame-size (* n-word-bytes 2)))
+          (inst ldr lr-tn (@ nsp-tn 16 :post-index))
+          (inst ret)))
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
