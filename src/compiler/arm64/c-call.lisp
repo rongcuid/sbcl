@@ -1043,6 +1043,10 @@ NOTE:
                           (incf stack-argument-bytes size)))
                    (incf fp-registers)
                    (incf arg-count))
+                  ((and (alien-record-type-p type) (<= size 16))
+                   (bug "Callback arg unimplemented for small record: ~S" type))
+                  ((and (alien-record-type-p type) (> size 16))
+                   (bug "Callback arg unimplemented for large record: ~S" type))
                   (t
                    (bug "Unknown alien type: ~S" type)))))
         ;; arg0 to FUNCALL3 (function)
@@ -1076,6 +1080,12 @@ NOTE:
                                   'single-reg
                                   'double-reg))
                  nsp-tn))
+          ((alien-record-type-p result-type)
+           (let ((size #+darwin (truncate (alien-type-bits result-type) n-byte-bits)
+                       #-darwin n-word-bytes))
+             (if (<= size 16)
+                 (bug "Callback result unimplemented for small record type: ~S" result-type)
+                 (bug "Callback result unimplemented for large record type: ~S" result-type))))
           ((alien-void-type-p result-type))
           (t
            (error "Unrecognized alien type: ~A" result-type)))
