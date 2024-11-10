@@ -946,6 +946,42 @@ NOTE:
         `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
 
 #-sb-xc-host
+(defun copy-int-arg-to-stack (type size target-tn nsp-save-tn stack-argument-bytes temp-tn)
+  (let ((addr (@ nsp-save-tn stack-argument-bytes)))
+    (cond #+darwin
+          ((/= size 8)
+           (let ((signed (and (alien-integer-type-p type)
+                              (alien-integer-type-signed type))))
+             (ecase size
+               (1
+                (if signed
+                    (inst ldrsb temp-tn addr)
+                    (inst ldrb temp-tn addr)))
+               (2
+                (if signed
+                    (inst ldrsh temp-tn addr)
+                    (inst ldrh temp-tn addr)))
+               (4
+                (if signed
+                    (inst ldrsw (32-bit-reg temp-tn) addr)
+                    (inst ldr (32-bit-reg temp-tn) addr))))))
+          (t
+           (inst ldr temp-tn addr)))
+    (inst str temp-tn target-tn)))
+
+#-sb-xc-host
+(defun copy-float-arg-to-stack (size target-tn nsp-save-tn stack-argument-bytes temp-tn)
+  (case size
+    #+darwin
+    (4
+     (let ((reg (32-bit-reg temp-tn)))
+       (inst ldr reg (@ nsp-save-tn stack-argument-bytes))
+       (inst str reg target-tn)))
+    (t
+     (inst ldr temp-tn (@ nsp-save-tn stack-argument-bytes))
+     (inst str temp-tn target-tn))))
+
+#-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
   (flet ((make-tn (offset &optional (sc-name 'any-reg))
            (make-random-tn :kind :normal
@@ -990,27 +1026,7 @@ NOTE:
                            (t
                             (setf stack-argument-bytes
                                   (align-up stack-argument-bytes size))
-                            (let ((addr (@ nsp-save-tn stack-argument-bytes)))
-                              (cond #+darwin
-                                    ((/= size 8)
-                                     (let ((signed (and (alien-integer-type-p type)
-                                                        (alien-integer-type-signed type))))
-                                       (ecase size
-                                         (1
-                                          (if signed
-                                              (inst ldrsb temp-tn addr)
-                                              (inst ldrb temp-tn addr)))
-                                         (2
-                                          (if signed
-                                              (inst ldrsh temp-tn addr)
-                                              (inst ldrh temp-tn addr)))
-                                         (4
-                                          (if signed
-                                              (inst ldrsw (32-bit-reg temp-tn) addr)
-                                              (inst ldr (32-bit-reg temp-tn) addr))))))
-                                    (t
-                                     (inst ldr temp-tn addr)))
-                              (inst str temp-tn target-tn))
+                            (copy-int-arg-to-stack type size target-tn nsp-save-tn stack-argument-bytes temp-tn)
                             (incf stack-argument-bytes size))))
                    (incf arg-count))
                   ((alien-float-type-p type)
@@ -1023,15 +1039,7 @@ NOTE:
                          (t
                           (setf stack-argument-bytes
                                   (align-up stack-argument-bytes size))
-                          (case size
-                            #+darwin
-                            (4
-                             (let ((reg (32-bit-reg temp-tn)))
-                              (inst ldr reg (@ nsp-save-tn stack-argument-bytes))
-                              (inst str reg target-tn)))
-                            (t
-                             (inst ldr temp-tn (@ nsp-save-tn stack-argument-bytes))
-                             (inst str temp-tn target-tn)))
+                          (copy-float-arg-to-stack size target-tn nsp-save-tn stack-argument-bytes temp-tn)
                           (incf stack-argument-bytes size)))
                    (incf fp-registers)
                    (incf arg-count))
