@@ -213,6 +213,40 @@
                       nl7-offset)
        index))
 
+(defun alien-type-slot-info (type)
+  "Returns the slot info of an alien type. Slot info are VALUES of the following (in order):
+- Kind of type, :INT, :FLOAT, :PTR, :SAP, :RECORD-SMALL, :RECORD-LARGE
+- Number of registers if to be put in registers
+- Stack slot size (padded) if to be put on stack
+- Additional stack space consumed if copying required
+
+Note: with Darwin, arguments can take less than one word on stack."
+  (let* ((raw-size (truncate (alien-type-bits type) n-byte-bits))
+         (slot-size #+darwin raw-size #-darwin n-word-bytes)
+         (nregs (ceiling slot-size n-word-bytes)))
+    (cond
+      ;; Ints, floats, and pointers
+      ((alien-integer-type-p type)
+       (assert (<= size 8) (size)
+               "SBCL BUG: Integer argument of size ~A > 8 bytes is not supported." size)
+       (values :int nregs slot-size 0))
+      ((alien-float-type-p type)
+       (assert (<= size 8) (size)
+               "SBCL BUG: Float argument of size ~A > 8 bytes is not supported." size)
+       (values :float nregs slot-size 0))
+      ((alien-pointer-type-p type)
+       (values :ptr nregs slot-size 0))
+      ((alien-type-= #.(parse-alien-type 'system-area-pointer nil) type)
+       (values :sap nregs slot-size 0))
+      ;; Structs
+      ((alien-record-type-p type)
+       (if (> size 16)
+           ;; Large struct is copied to stack and replaced by pointer
+           (values :record-large 1 n-word-bytes raw-size)
+           ;; Small struct is used like non-composite values
+           (values :record-small nregs slot-size 0)))
+      (t (bug "Unsupported alien type: ~S" type)))))
+
 ;;;; VOPs used for argument parsing
 ;;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
 ;;; Essentially performs the following C operation:
@@ -946,8 +980,8 @@ NOTE:
         `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
 
 #-sb-xc-host
-(defun copy-int-arg-to-stack (type size target-tn nsp-save-tn stack-argument-bytes temp-tn)
-  (let ((addr (@ nsp-save-tn stack-argument-bytes)))
+(defun copy-int-arg-to-stack (type size target-tn nsp-save-tn arg-offset temp-tn)
+  (let ((addr (@ nsp-save-tn arg-offset)))
     (cond #+darwin
           ((/= size 8)
            (let ((signed (and (alien-integer-type-p type)
@@ -970,16 +1004,20 @@ NOTE:
     (inst str temp-tn target-tn)))
 
 #-sb-xc-host
-(defun copy-float-arg-to-stack (size target-tn nsp-save-tn stack-argument-bytes temp-tn)
+(defun copy-float-arg-to-stack (size target-tn nsp-save-tn arg-offset temp-tn)
   (case size
     #+darwin
     (4
      (let ((reg (32-bit-reg temp-tn)))
-       (inst ldr reg (@ nsp-save-tn stack-argument-bytes))
+       (inst ldr reg (@ nsp-save-tn arg-offset))
        (inst str reg target-tn)))
     (t
-     (inst ldr temp-tn (@ nsp-save-tn stack-argument-bytes))
+     (inst ldr temp-tn (@ nsp-save-tn arg-offset))
      (inst str temp-tn target-tn))))
+
+#-sb-xc-host
+(defun callback-frame-size (argument-types)
+  (loop for type in argument-types))
 
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
@@ -988,10 +1026,10 @@ NOTE:
                            :sc (sc-or-lose sc-name)
                            :offset offset)))
     (let* ((segment (make-segment))
-           ;; How many arguments have been copied
-           (arg-count 0)
-           ;; How many arguments have been copied from the stack
-           (stack-argument-bytes 0)
+           ;; Stack offset of the next source argument
+           (arg-offset 0)
+           ;; Extra offset of where an argument will be copied to (small structs)
+           (extra-offset 0)
            (r0-tn (make-tn 0))
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
@@ -999,10 +1037,39 @@ NOTE:
            (r4-tn (make-tn 4))
            (temp-tn (make-tn 9))
            (nsp-save-tn (make-tn 10))
-           (gprs (loop for i below 8
-                       collect (make-tn i)))
+           ;; NGRN
+           (num-registers 0)
+           ;; NSRN
            (fp-registers 0)
-           (frame-size (* (length argument-types) n-word-bytes)))
+           ;; NSAA = nsp + nsp-offset
+           (nsp-offset 0)
+           (frame-size 0)
+           ;; Size of arguments copied to frame
+           (arg-size 0)
+           ;; Extra size on frame (e.g. copied values)
+           (extra-size 0))
+      ;; Preprocess arguments
+      (dolist (type argument-types)
+        (multiple-value-bind (kind nregs size extra) (alien-type-slot-info type)
+          (ecase kind
+            ;; Int, float, and pointer args are copied as is (slot only)
+            ((:int :float :ptr :sap)
+             (incf arg-size size))
+            ;; Small records may need to be copied and referenced with SAP (slot + pointer).
+            ;; NOTE: We always allocate extra space and always align up, though it might not be necessary:
+            ;; - If small struct is already passed on stack, we don't need an extra copy
+            ;; - On Mac OS, we can align to natural boundary
+            (:record-small
+             (incf arg-size n-word-bytes)
+             (incf extra-size (align-up size n-word-bytes)))
+            ;; Large records already have a copy in memory and can be referenced with SAP (pointer only)
+            (:record-large
+             (incf arg-size n-word-bytes)))))
+      ;; Align up arg-size so that extra region is always aligned
+      (setf arg-size (align-up arg-size n-word-bytes))
+      ;; Calculate frame size
+      (setf frame-size (+ arg-size extra-size))
+      ;; Align frame
       (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                  +number-stack-alignment-mask+))
       (assemble (segment 'nil)
@@ -1013,6 +1080,52 @@ NOTE:
           (inst sub nsp-tn nsp-tn frame-size))
         ;; Copy arguments
         (dolist (type argument-types)
+          (multiple-value-bind (kind nregs size extra) (alien-type-slot-info type)
+            (let ((target-tn (@ nsp-tn nsp-offset)))
+              (ecase kind
+                ((:int :ptr :sap)
+                 (cond
+                   ;; C.9 copy from registers
+                   ((< num-registers +max-register-args+)
+                    (let ((src-tn (make-tn num-registers)))
+                      (inst str src-tn target-tn)
+                      (incf num-registers)
+                      (incf nsp-offset size)))
+                   ;; C.17 copy from saved stack
+                   (t
+                    (copy-int-arg-to-stack type size target-tn nsp-save-tn arg-offset temp-tn)
+                    (incf arg-offset size)
+                    (incf nsp-offset size))))
+                (:float
+                 (cond ((< fp-registers +max-register-args+)
+                        (let ((src-tn (make-tn fp-registers
+                                               (if (alien-single-float-type-p type)
+                                                   'single-reg
+                                                   'double-reg))))
+                          (inst str src-tn target-tn)
+                          (incf fp-registers)
+                          (incf nsp-offset size)))
+                       (t
+                        (copy-float-arg-to-stack size target-tn nsp-save-tn arg-offset temp-tn)
+                        (incf arg-offset size)
+                        (incf nsp-offset size))))
+                (:record-small
+                 (cond
+                   ;; If record is passed by registers, copy it to extra space
+                   ((< (+ num-registers nregs) +max-register-args+)
+                    (sb-c::vop load-stack-ptr node block nsp-tn (+ arg-size extra-offset) target-tn)
+                    (ecase nregs
+                      (1
+                       (inst str (make-tn num-registers) target-tn)
+                       (incf num-registers))
+                      (2
+                       (inst stp (make-tn num-registers) (make-tn (1+ num-registers)) target-tn)
+                       (incf num-registers 2))))
+                   ;; If record is passed on stack, take its address without copy
+                   (t)))
+                (:record-large
+                 (bug "TODO")))))
+          ;; FIXME: Below is to be rewritten
           (let ((target-tn (@ nsp-tn (* arg-count n-word-bytes)))
                 (size #+darwin (truncate (alien-type-bits type) n-byte-bits)
                       #-darwin n-word-bytes))
@@ -1038,7 +1151,7 @@ NOTE:
                                 target-tn))
                          (t
                           (setf stack-argument-bytes
-                                  (align-up stack-argument-bytes size))
+                                (align-up stack-argument-bytes size))
                           (copy-float-arg-to-stack size target-tn nsp-save-tn stack-argument-bytes temp-tn)
                           (incf stack-argument-bytes size)))
                    (incf fp-registers)
