@@ -1199,7 +1199,7 @@ Frame is organized as following, where extras hold copies of arguments as needed
            (let ((src-off (getf alloc :nsp-offset))
                  (size (getf alloc :nsp-size)))
              (ecase (getf alloc :kind)
-               (:fpr
+               (:float
                 (copy-float-arg-to-stack
                  size (@ from-nsp-tn src-off) (@ to-nsp-tn next-arg-off) temp-tn)
                 (incf next-arg-off n-word-bytes))
