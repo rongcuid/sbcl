@@ -36,6 +36,20 @@
                    (alien-funcall *thunk*))
                  "hi")))
 
+(defun a-num (x)
+  (format t "num=~A" x))
+
+(defvar *a-num*
+  (sb-alien::alien-callback (function c-string int) #'a-num))
+
+(with-test (:name (:callback :a-num)
+            ;; The whole file is broken, report one test
+            ;; and skip the rest.
+            :broken-on :interpreter)
+  (assert (equal (with-output-to-string (*standard-output*)
+                   (alien-funcall *a-num* 42))
+                 "num=42")))
+
 ;; WITH-ALIEN is broken when interpreted, e.g.
 ;; (with-alien ((x int 10)) x), see lp#992362, lp#1731556
 (when (eq sb-ext:*evaluator-mode* :interpret)
