@@ -1036,13 +1036,15 @@ Ideally it should also be used in the C calling part."
                (cond
                  ;; C.9
                  ((and (<= size 8) (< ngrn 8))
-                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn))) (incf ngrn)))
+                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn)))
+                    (incf ngrn)))
                  ;; C.10, C.11
                  ((and (= size 16) (< ngrn 7))
                   ;; C.10
                   #-darwin
                   (setf ngrn (align-up ngrn 2))
-                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn ,(1+ ngrn)))) (incf ngrn 2)))
+                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn ,(1+ ngrn))))
+                    (incf ngrn 2)))
                  ;; C.14 (implicit from size), C.16 (implicit), C.17
                  (t
                   (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
