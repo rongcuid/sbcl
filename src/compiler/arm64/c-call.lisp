@@ -68,7 +68,7 @@
 ;;;; 12. If Composite Type and size in double words <= 8-NGRN:
 ;;;;    - Allocate to consecutive GPR starting at x[NGRN], as if loaded from dword-aligned address with LDR instructions.
 ;;;;    - Increment NGRN by registers used.
-;;;; 13. NGRA is set to 8.
+;;;; 13. NGRN is set to 8.
 ;;;; 14. NSAA is rounded up to max(8, Natural Alignment of Type).
 ;;;; 15. If Composite Type:
 ;;;;    - Allocate to memory at adjusted NSAA. Increment NSAA by size.
@@ -1170,11 +1170,17 @@ Frame is organized as following, where extras hold copies of arguments as needed
              ;; GPR-allocated records require copying to extras first, then make a pointer
              (:record
               ;; Write pointer
+              ;; FIXME
+              (format t "!!NSP[~A] := &NSP[~A] ~%" next-arg-off next-extra-off)
               (inst add temp-tn to-nsp-tn next-extra-off)
               (inst str temp-tn (@ to-nsp-tn next-arg-off))
               (incf next-arg-off n-word-bytes)
               ;; Copy to extras
               (cond ((<= 8 (getf alloc :size))
+                     ;; FIXME
+                     (format t "!!NSP[~A] := R~A:~A ~%"
+                             next-extra-off
+                              (car (getf alloc :gpr)) (getf alloc :size))
                      (inst str (make-tn (car (getf alloc :gpr))) (@ to-nsp-tn next-extra-off))
                      (incf next-extra-off n-word-bytes))
                     (t
@@ -1245,6 +1251,7 @@ Frame is organized as following, where extras hold copies of arguments as needed
                              (car (allocate-arguments (list result-type))))))
       ;; FIXME remove this debug call when done
       (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
+      (format t "!!RES-ALLOC: ~S~%" result-alloc)
       (multiple-value-bind (frame-size extra-offset) (callback-frame-info arg-allocs)
         (assemble (segment 'nil)
           (inst mov-sp nsp-save-tn nsp-tn)

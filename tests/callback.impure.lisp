@@ -120,7 +120,7 @@
 ;;; passing and returning structs
 (define-alien-type tiny-align-8 (struct tiny-align-8 (m0 (integer 64))))
 
-(define-alien-callable pass-tiny-align-8 int ((s tiny-align-8))
+(define-alien-callable pass-tiny-align-8 long ((s tiny-align-8))
     (slot s 'm0))
 
 (with-alien ((s tiny-align-8))
