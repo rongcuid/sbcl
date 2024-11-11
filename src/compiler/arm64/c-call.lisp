@@ -213,43 +213,6 @@
                       nl7-offset)
        index))
 
-#-sb-xc-host
-(defun alien-type-slot-info (type)
-  "Returns the slot info of an alien type. Slot info are VALUES of the following (in order):
-- Kind of type, :INT, :FLOAT, :PTR, :SAP, :RECORD-SMALL, :RECORD-LARGE
-- Number of registers if to be put in registers
-- Stack slot size (padded) if to be put on stack
-- Additional stack space consumed if copying required
-- Natural size
-- Natural alignment
-
-Note: with Darwin, arguments can take less than one word on stack."
-  (let* ((raw-size (truncate (alien-type-bits type) n-byte-bits))
-         (slot-size #+darwin raw-size #-darwin n-word-bytes)
-         (nregs (ceiling slot-size n-word-bytes))
-         (natural-alignment (truncate (alien-type-alignment type) n-byte-bits)))
-    (cond
-      ;; Ints, floats, and pointers
-      ((alien-integer-type-p type)
-       (assert (<= raw-size 8) (raw-size)
-               "SBCL BUG: Integer argument of size ~A > 8 bytes is not supported." raw-size)
-       (values :int nregs slot-size 0 raw-size natural-alignment))
-      ((alien-float-type-p type)
-       (assert (<= raw-size 8) (raw-size)
-               "SBCL BUG: Float argument of size ~A > 8 bytes is not supported." raw-size)
-       (values :float nregs slot-size 0 raw-size natural-alignment))
-      ((alien-pointer-type-p type)
-       (values :ptr nregs slot-size 0 raw-size natural-alignment))
-      ((alien-type-= #.(parse-alien-type 'system-area-pointer nil) type)
-       (values :sap nregs slot-size 0 raw-size natural-alignment))
-      ;; Structs
-      ((alien-record-type-p type)
-       (if (> raw-size 16)
-           ;; Large struct is copied to stack and replaced by pointer
-           (values :record-large 1 n-word-bytes raw-size raw-size natural-alignment)
-           ;; Small struct is used like non-composite values
-           (values :record-small nregs slot-size 0 raw-size natural-alignment)))
-      (t (bug "Unsupported alien type: ~S" type)))))
 
 ;;;; VOPs used for argument parsing
 ;;; Copies SIZE bytes from FROM-PTR to FP + FPOFF. Assumes that FROM-PTR is dword aligned.
@@ -982,6 +945,44 @@ NOTE:
                                           ,(+ byte-offset offset))
                                     (* ,type)))))
         `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+
+#-sb-xc-host
+(defun alien-type-slot-info (type)
+  "Returns the slot info of an alien type. Slot info are VALUES of the following (in order):
+- Kind of type, :INT, :FLOAT, :PTR, :SAP, :RECORD-SMALL, :RECORD-LARGE
+- Number of registers if to be put in registers
+- Stack slot size (padded) if to be put on stack
+- Additional stack space consumed if copying required
+- Natural size
+- Natural alignment
+
+Note: with Darwin, arguments can take less than one word on stack."
+  (let* ((raw-size (truncate (alien-type-bits type) n-byte-bits))
+         (slot-size #+darwin raw-size #-darwin n-word-bytes)
+         (nregs (ceiling slot-size n-word-bytes))
+         (natural-alignment (truncate (alien-type-alignment type) n-byte-bits)))
+    (cond
+      ;; Ints, floats, and pointers
+      ((alien-integer-type-p type)
+       (assert (<= raw-size 8) (raw-size)
+               "SBCL BUG: Integer argument of size ~A > 8 bytes is not supported." raw-size)
+       (values :int nregs slot-size 0 raw-size natural-alignment))
+      ((alien-float-type-p type)
+       (assert (<= raw-size 8) (raw-size)
+               "SBCL BUG: Float argument of size ~A > 8 bytes is not supported." raw-size)
+       (values :float nregs slot-size 0 raw-size natural-alignment))
+      ((alien-pointer-type-p type)
+       (values :ptr nregs slot-size 0 raw-size natural-alignment))
+      ((alien-type-= #.(parse-alien-type 'system-area-pointer nil) type)
+       (values :sap nregs slot-size 0 raw-size natural-alignment))
+      ;; Structs
+      ((alien-record-type-p type)
+       (if (> raw-size 16)
+           ;; Large struct is copied to stack and replaced by pointer
+           (values :record-large 1 n-word-bytes raw-size raw-size natural-alignment)
+           ;; Small struct is used like non-composite values
+           (values :record-small nregs slot-size 0 raw-size natural-alignment)))
+      (t (bug "Unsupported alien type: ~S" type)))))
 
 #-sb-xc-host
 (defun allocate-arguments (arg-types)
