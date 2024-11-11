@@ -125,6 +125,7 @@
 
 (with-alien ((s tiny-align-8))
   (setf (slot s 'm0) 42)
+  (assert (= 42 (slot s 'm0)))
   (assert (= 42 (alien-funcall (alien-callable-function 'pass-tiny-align-8) s))))
 
 ;;; redefining and invalidating alien callables

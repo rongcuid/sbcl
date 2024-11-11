@@ -1088,38 +1088,42 @@ Ideally it should also be used in the C calling part."
 (defun callback-frame-info (arg-allocs)
   "Computes the callback frame info from argument allocations.
 Returning:
-- Frame size
+- Frame size (including padding)
 - Total argument size (also the beginning offset of extra segment)
+- Extra end offset
 
 Frame is organized as following, where extras hold copies of arguments as needed:
 
-|Arguments |Extras"
+|Arguments |Extras
+
+NOTE: this is using Lisp calling convention, not AAPCS64!"
   (let ((frame-size 0)
         (args-size 0)
         (extra-size 0))
     (dolist (alloc arg-allocs)
       (ecase (getf alloc :alloc)
-        ;; GPR args are copied as is
+        ;; GPR args are copied as is, one word per register
         (:gpr
          (case (getf alloc :kind)
            ;; A struct passed by GPR requires an additional copy AND a SAP to the copy
            (:record
             (incf args-size n-word-bytes)
-            (incf extra-size (* n-word-bytes (length (cdr alloc)))))
+            (incf extra-size (* n-word-bytes (length (getf alloc :gpr)))))
            ;; Otherwise, copy GPR to stack
            (otherwise
             (loop for r in (getf alloc :gpr) do (incf args-size n-word-bytes)))))
         ;; FPR args are copied as is
         (:fpr (incf args-size n-word-bytes))
-        ;; Stack args are copied extended
+        ;; Stack args are copied and aligned
         (:stack (incf args-size (align-up (getf alloc :nsp-size) n-word-bytes)))
         ;; A copied argument requires passing only the SAP
         (:copy (incf args-size n-word-bytes))))
     ;; Calculate final frame size
+    (setf args-size (align-up args-size n-word-bytes))
     (setf frame-size (+ args-size extra-size))
     (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                +number-stack-alignment-mask+))
-    (values frame-size args-size)))
+    (values frame-size args-size (+ args-size extra-size))))
 
 #-sb-xc-host
 (defun copy-int-arg-to-stack (size signed source-tn target-tn temp-tn)
@@ -1249,10 +1253,14 @@ Frame is organized as following, where extras hold copies of arguments as needed
            (arg-allocs (allocate-arguments argument-types))
            (result-alloc (unless (alien-void-type-p result-type)
                              (car (allocate-arguments (list result-type))))))
-      ;; FIXME remove this debug call when done
-      (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
-      (format t "!!RES-ALLOC: ~S~%" result-alloc)
-      (multiple-value-bind (frame-size extra-offset) (callback-frame-info arg-allocs)
+      (multiple-value-bind (frame-size extra-offset extra-end) (callback-frame-info arg-allocs)
+        ;; FIXME remove this debug call when done
+        (format t "!!===~%")
+        (format t "!!FRAME:~A = ARGS[0..~A] + EXTRAS[~A..~A] + PADDING[~A..~A]~%"
+                frame-size extra-offset extra-offset extra-end extra-end frame-size)
+        (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
+        (format t "!!RES-ALLOC: ~S~%" result-alloc)
+        (format t "!!===~%")
         (assemble (segment 'nil)
           (inst mov-sp nsp-save-tn nsp-tn)
           (inst str lr-tn (@ nsp-tn -16 :pre-index))
