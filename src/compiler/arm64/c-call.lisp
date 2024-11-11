@@ -1231,7 +1231,9 @@ Frame is organized as following, where extras hold copies of arguments as needed
            (r4-tn (make-tn 4))
            (temp-tn (make-tn 9))
            (nsp-save-tn (make-tn 10))
-           (arg-allocs (allocate-arguments argument-types)))
+           (arg-allocs (allocate-arguments argument-types))
+           (result-alloc (unless (alien-void-type-p result-type)
+                             (car (allocate-arguments (list result-type))))))
       (multiple-value-bind (frame-size extra-offset) (callback-frame-info arg-allocs)
         (assemble (segment 'nil)
           (inst mov-sp nsp-save-tn nsp-tn)
@@ -1258,29 +1260,17 @@ Frame is organized as following, where extras hold copies of arguments as needed
                                       #-sb-thread "funcall3"
                                       #+sb-thread "callback_wrapper_trampoline"))
           (inst blr r4-tn)
-
           ;; Result now on top of stack, put it in the right register
-          (cond
-            ((or (alien-integer-type-p result-type)
-                 (alien-pointer-type-p result-type)
-                 (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
-                               result-type))
+          (ecase (getf result-alloc :kind)
+            ((:int :ptr :sap)
              (loadw r0-tn nsp-tn))
-            ((alien-float-type-p result-type)
-             (loadw (make-tn 0
-                             (if (alien-single-float-type-p result-type)
-                                 'single-reg
-                                 'double-reg))
+            (:float
+             (loadw (make-tn 0 (if (= 4 (getf result-alloc :size)) 'single-reg 'double-reg))
                     nsp-tn))
-            ((alien-record-type-p result-type)
-             (let ((size #+darwin (truncate (alien-type-bits result-type) n-byte-bits)
-                         #-darwin n-word-bytes))
-               (if (<= size 16)
-                   (bug "Callback result unimplemented for small record type: ~S" result-type)
-                   (bug "Callback result unimplemented for large record type: ~S" result-type))))
-            ((alien-void-type-p result-type))
-            (t
-             (error "Unrecognized alien type: ~A" result-type)))
+            (:record (bug "Callback result unimplemented for record type: ~S" result-type))
+            ;; Void return
+            ((nil))
+            (t (error "Unrecognized alien type: ~A" result-type)))
           (inst add nsp-tn nsp-tn (+ frame-size (* n-word-bytes 2)))
           (inst ldr lr-tn (@ nsp-tn 16 :post-index))
           (inst ret)))
