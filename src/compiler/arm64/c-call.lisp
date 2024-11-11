@@ -1193,6 +1193,8 @@ Frame is organized as following, where extras hold copies of arguments as needed
                   (src-tn (make-tn (getf alloc :fpr) src-reg-type)))
              (inst str src-tn (@ to-nsp-tn next-arg-off))
              (incf next-arg-off n-word-bytes)))
+          ;; NOTE: this is the Lisp calling convention, not AAPCS64.
+          ;; Therefore we always copy to a 8-byte slot
           (:stack
            (let ((src-off (getf alloc :nsp-offset))
                  (size (getf alloc :nsp-size)))
@@ -1200,12 +1202,12 @@ Frame is organized as following, where extras hold copies of arguments as needed
                (:fpr
                 (copy-float-arg-to-stack
                  size (@ from-nsp-tn src-off) (@ to-nsp-tn next-arg-off) temp-tn)
-                (incf next-arg-off size))
+                (incf next-arg-off n-word-bytes))
                ((:int :ptr :sap)
                 (copy-int-arg-to-stack
                  size (getf alloc :signed)
                  (@ from-nsp-tn src-off) (@ to-nsp-tn next-arg-off) temp-tn)
-                (incf next-arg-off size))
+                (incf next-arg-off n-word-bytes))
                ;; For a small record on stack, make a pointer to the source
                (:record
                 (inst add temp-tn from-nsp-tn src-off)
