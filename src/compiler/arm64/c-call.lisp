@@ -933,22 +933,11 @@ NOTE:
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type)) ; FIXME It's not actually parsed
-    ;; FIXME
-    (format t "!!TYPE=~A SAP=~A OFFSET=~A~%" parsed-type sap offset)
-    (format t "!!INT: ~A, REC: ~A~%"
-            (alien-integer-type-p parsed-type)
-            (alien-record-type-p parsed-type))
-    (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
-               (let ((byte-offset
-                      (cond ((< bits n-word-bits)
-                             (- n-word-bytes
-                                (ceiling bits n-byte-bits)))
-                            (t 0))))
-                 `(deref (sap-alien (sap+ ,sap
-                                          ,(+ byte-offset offset))
-                                    (* ,type)))))
+  "NOTE: this is the Lisp calling convention, not AAPCS64"
+  (let ((parsed-type (parse-alien-type type nil)))
+    (if (alien-record-type-p parsed-type)
+        ;; SBCL represents records as a SAP, so it's pointer to pointer
+        `(deref (sap-alien (sap+ ,sap ,offset) (* (* ,type))))
         `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
 
 #-sb-xc-host
