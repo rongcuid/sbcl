@@ -118,6 +118,18 @@
 (assert (= pi (alien-funcall (alien-callable-function 'return-double) pi)))
 
 ;;; passing and returning structs
+(define-alien-type point3 (struct point3
+                                  (x (integer 64))
+                                  (y (integer 64))
+                                  (z (integer 64))))
+(define-alien-callable point3-x (integer 64) ((p point3))
+  (slot p 'x))
+(with-alien ((p point3))
+  (setf (slot p 'x) 1)
+  (setf (slot p 'y) 2)
+  (setf (slot p 'z) 3)
+  (assert (= 1 (alien-funcall (alien-callable-function 'point3-x) p))))
+
 (define-alien-type tiny-align-8 (struct tiny-align-8 (m0 (integer 64))))
 
 (define-alien-callable pass-tiny-align-8 long ((s tiny-align-8))

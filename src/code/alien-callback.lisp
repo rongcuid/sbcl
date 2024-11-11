@@ -188,6 +188,11 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
 
 (defun alien-callback-argument-bytes (spec env)
   (let ((type (parse-alien-type spec env)))
+    ;; FIXME
+    (format t "!!SPEC=~A TYPE=~A INT-P=~A FLOAT-P=~A PTR-P=~A SAP-P=~A~%"
+            spec type
+            (alien-integer-type-p type) (alien-float-type-p type)
+            (alien-pointer-type-p type) (alien-system-area-pointer-type-p type))
     (if (or (alien-integer-type-p type)
             (alien-float-type-p type)
             (alien-pointer-type-p type)

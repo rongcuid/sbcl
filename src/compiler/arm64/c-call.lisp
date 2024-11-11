@@ -933,7 +933,12 @@ NOTE:
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type))
+  (let ((parsed-type type)) ; FIXME It's not actually parsed
+    ;; FIXME
+    (format t "!!TYPE=~A SAP=~A OFFSET=~A~%" parsed-type sap offset)
+    (format t "!!INT: ~A, REC: ~A~%"
+            (alien-integer-type-p parsed-type)
+            (alien-record-type-p parsed-type))
     (if (alien-integer-type-p parsed-type)
         (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
                (let ((byte-offset
