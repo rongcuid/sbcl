@@ -36,6 +36,8 @@
                    (alien-funcall *thunk*))
                  "hi")))
 
+;;; Simple test parameter passing
+
 (defun a-num (x)
   (format t "x=~A" x))
 
@@ -114,6 +116,16 @@
 
 (assert (= spi (alien-funcall (alien-callable-function 'return-single) spi)))
 (assert (= pi (alien-funcall (alien-callable-function 'return-double) pi)))
+
+;;; passing and returning structs
+(define-alien-type tiny-align-8 (struct tiny-align-8 (m0 (integer 64))))
+
+(define-alien-callable pass-tiny-align-8 int ((s tiny-align-8))
+    (slot s 'm0))
+
+(with-alien ((s tiny-align-8))
+  (setf (slot s 'm0) 42)
+  (assert (= 42 (alien-funcall (alien-callable-function 'pass-tiny-align-8) s))))
 
 ;;; redefining and invalidating alien callables
 

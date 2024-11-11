@@ -1057,7 +1057,7 @@ Ideally it should also be used in the C calling part."
                (cond
                  ;; C.12
                  ((< nregs (- 8 ngrn))
-                  (prog1 (append pl `(:alloc gpr :gpr ,@(loop for i below nregs
+                  (prog1 (append pl `(:alloc :gpr :gpr ,(loop for i below nregs
                                                               collect (+ ngrn i))))
                     (incf ngrn nregs)))
                  ;; C.14, C.16, C.17
