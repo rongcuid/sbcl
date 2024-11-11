@@ -1011,71 +1011,75 @@ Ideally it should also be used in the C calling part."
   (let ((ngrn 0)
         (nsrn 0)
         (nsp-off 0)
-        (copy-off 0))
+        (copy-off 0)
+        (allocs nil))
     (dolist (type arg-types)
        (multiple-value-bind (kind nregs size extra nat-size nat-align)
            (alien-type-slot-info type)
-         (let ((pl `(:size ,nat-size :align ,nat-align)))
-           (ecase kind
-             ;; C.1-8 except for SIMD and vector types
-             (:float
-              (nconc pl '(:kind :float))
-              (cond
-                ((< nsrn 8)
-                 (prog1 (append pl `(:alloc :fpr :fpr ,nsrn)) (incf nsrn)))
-                (t
-                 (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
-                   (incf nsp-off size)))))
-             ;; C.9+
-             ((:int :ptr :sap)
-              (nconc pl `(:kind ,kind
+         (push
+          (let ((pl `(:size ,nat-size :align ,nat-align)))
+            (ecase kind
+              ;; C.1-8 except for SIMD and vector types
+              (:float
+               (nconc pl '(:kind :float))
+               (cond
+                 ((< nsrn 8)
+                  (prog1 (append pl `(:alloc :fpr :fpr ,nsrn)) (incf nsrn)))
+                 (t
+                  (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
+                    (incf nsp-off size)))))
+              ;; C.9+
+              ((:int :ptr :sap)
+               (nconc pl `(:kind ,kind
                            :signed ,(and (alien-integer-type-p type)
                                          (alien-integer-type-signed type))))
-              (cond
-                ;; C.9
-                ((and (<= size 8) (< ngrn 8))
-                 (prog1 (append pl `(:alloc :gpr :gpr (,ngrn))) (incf ngrn)))
-                ;; C.10, C.11
-                ((and (= size 16) (< ngrn 7))
-                 ;; C.10
-                 #-darwin
-                 (setf ngrn (align-up ngrn 2))
-                 (prog1 (append pl `(:alloc :gpr :gpr (,ngrn ,(1+ ngrn)))) (incf ngrn 2)))
-                ;; C.14 (implicit from size), C.16 (implicit), C.17
-                (t
-                 (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
-                   (incf nsp-off size)))))
-             (:record-small
-              (nconc pl '(:kind :record))
-              #-darwin
-              (when (= align 16) (align-up ngrn 2))
-              (cond
-                ;; C.12
-                ((< nregs (- 8 ngrn))
-                 (prog1 (append pl `(:alloc gpr :gpr ,@(loop for i below nregs
-                                                             collect (+ ngrn i))))
-                   (incf ngrn nregs)))
-                ;; C.14, C.16, C.17
-                (t
-                 (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
-                   (incf nsp-off size)))))
-             (:record-large
-              (nconc pl '(:kind :record))
-              #-darwin
-              (when (= align 16) (align-up ngrn 2))
-              (cond
-                ((< ngrn 8)
-                 (prog1 (append pl `(:alloc :copy
-                                     :copy-offset ,copy-off :copy-size ,extra
-                                     :gpr (,ngrn)))
-                   (incf copy-off size)
-                   (incf ngrn)))
-                (t
-                 (prog1 (append pl `(:alloc :copy
-                                     :copy-offset ,copy-off :copy-size ,extra
-                                     :nsp-offset ,nsp-off :nsp-size ,size))
-                   (incf copy-off size)
-                   (incf nsp-off n-word-bytes)))))))))))
+               (cond
+                 ;; C.9
+                 ((and (<= size 8) (< ngrn 8))
+                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn))) (incf ngrn)))
+                 ;; C.10, C.11
+                 ((and (= size 16) (< ngrn 7))
+                  ;; C.10
+                  #-darwin
+                  (setf ngrn (align-up ngrn 2))
+                  (prog1 (append pl `(:alloc :gpr :gpr (,ngrn ,(1+ ngrn)))) (incf ngrn 2)))
+                 ;; C.14 (implicit from size), C.16 (implicit), C.17
+                 (t
+                  (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
+                    (incf nsp-off size)))))
+              (:record-small
+               (nconc pl '(:kind :record))
+               #-darwin
+               (when (= align 16) (align-up ngrn 2))
+               (cond
+                 ;; C.12
+                 ((< nregs (- 8 ngrn))
+                  (prog1 (append pl `(:alloc gpr :gpr ,@(loop for i below nregs
+                                                              collect (+ ngrn i))))
+                    (incf ngrn nregs)))
+                 ;; C.14, C.16, C.17
+                 (t
+                  (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
+                    (incf nsp-off size)))))
+              (:record-large
+               (nconc pl '(:kind :record))
+               #-darwin
+               (when (= align 16) (align-up ngrn 2))
+               (cond
+                 ((< ngrn 8)
+                  (prog1 (append pl `(:alloc :copy
+                                      :copy-offset ,copy-off :copy-size ,extra
+                                      :gpr (,ngrn)))
+                    (incf copy-off size)
+                    (incf ngrn)))
+                 (t
+                  (prog1 (append pl `(:alloc :copy
+                                      :copy-offset ,copy-off :copy-size ,extra
+                                      :nsp-offset ,nsp-off :nsp-size ,size))
+                    (incf copy-off size)
+                    (incf nsp-off n-word-bytes)))))))
+          allocs)))
+    (nreverse allocs)))
 
 #-sb-xc-host
 (defun callback-frame-info (arg-allocs)
@@ -1094,7 +1098,7 @@ Frame is organized as following, where extras hold copies of arguments as needed
       (ecase (getf alloc :alloc)
         ;; GPR args are copied as is
         (:gpr
-         (ecase (getf alloc :kind)
+         (case (getf alloc :kind)
            ;; A struct passed by GPR requires an additional copy AND a SAP to the copy
            (:record
             (incf args-size n-word-bytes)
@@ -1159,7 +1163,7 @@ Frame is organized as following, where extras hold copies of arguments as needed
       (dolist (alloc arg-allocs)
         (ecase (getf alloc :alloc)
           (:gpr
-           (ecase (getf alloc :kind)
+           (case (getf alloc :kind)
              ;; GPR-allocated records require copying to extras first, then make a pointer
              (:record
               ;; Write pointer
@@ -1178,8 +1182,8 @@ Frame is organized as following, where extras hold copies of arguments as needed
                      (incf next-extra-off (* 2 n-word-bytes)))))
              ;; GPR-allocated args are simply copied
              (otherwise
-              (dolist (gpr (cdr alloc))
-                (inst str gpr (@ to-nsp-tn next-arg-off))
+              (dolist (gpr (getf alloc :gpr))
+                (inst str (make-tn gpr) (@ to-nsp-tn next-arg-off))
                 (incf next-arg-off n-word-bytes)))))
           ;; FPR-allocated args are copied
           (:fpr
@@ -1234,6 +1238,8 @@ Frame is organized as following, where extras hold copies of arguments as needed
            (arg-allocs (allocate-arguments argument-types))
            (result-alloc (unless (alien-void-type-p result-type)
                              (car (allocate-arguments (list result-type))))))
+      ;; FIXME remove this debug call when done
+      (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
       (multiple-value-bind (frame-size extra-offset) (callback-frame-info arg-allocs)
         (assemble (segment 'nil)
           (inst mov-sp nsp-save-tn nsp-tn)

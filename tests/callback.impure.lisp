@@ -37,7 +37,7 @@
                  "hi")))
 
 (defun a-num (x)
-  (format t "num=~A" x))
+  (format t "x=~A" x))
 
 (defvar *a-num*
   (sb-alien::alien-callback (function c-string int) #'a-num))
@@ -48,7 +48,7 @@
             :broken-on :interpreter)
   (assert (equal (with-output-to-string (*standard-output*)
                    (alien-funcall *a-num* 42))
-                 "num=42")))
+                 "x=42")))
 
 ;; WITH-ALIEN is broken when interpreted, e.g.
 ;; (with-alien ((x int 10)) x), see lp#992362, lp#1731556
