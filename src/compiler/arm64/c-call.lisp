@@ -455,7 +455,7 @@ Implementation notes:
         (alignment #-darwin n-word-bytes
                    #+darwin (ceiling (alien-type-alignment type) n-byte-bits)))
     ;; FIXME: spec supports it, need to implement.
-    (assert (<= 8 alignment) (alignment)
+    (assert (<= alignment 8) (alignment)
             "SBCL BUG: Struct alignment ~A > 8 bytes is unsupported" alignment)
     (cond
       ;; C.12, if we can fit the argument in register, copy to consecutive registers
