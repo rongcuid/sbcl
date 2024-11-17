@@ -1221,7 +1221,7 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
                ;; For a small record on stack, make a pointer to the source
                (:record
                 (inst add temp-tn from-nsp-tn src-off)
-                (inst str (@ to-nsp-tn next-arg-off)))
+                (inst str temp-tn (@ to-nsp-tn next-arg-off)))
                (incf next-arg-off n-word-bytes))))
           ;; For a large record, copy the pointer
           (:copy
