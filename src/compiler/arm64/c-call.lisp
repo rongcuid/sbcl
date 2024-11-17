@@ -1176,14 +1176,17 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
               (inst str temp-tn (@ to-nsp-tn next-arg-off))
               (incf next-arg-off n-word-bytes)
               ;; Copy to extras
-              (cond ((<= 8 (getf alloc :size))
+              (cond ((<= (getf alloc :size) 8)
                      ;; FIXME
-                     (format t "!!NSP[~A] := R~A:~A ~%"
+                     (format t "!!NSP[~A] := R~A(~A) ~%"
                              next-extra-off
                               (car (getf alloc :gpr)) (getf alloc :size))
                      (inst str (make-tn (car (getf alloc :gpr))) (@ to-nsp-tn next-extra-off))
                      (incf next-extra-off n-word-bytes))
                     (t
+                     (format t "!!NSP[~A] := R~A ++ R~A ~%"
+                             next-extra-off
+                             (nth 1 (getf alloc :gpr)) (nth 0 (getf alloc :gpr)))
                      (inst stp
                            (make-tn (nth 0 (getf alloc :gpr)))
                            (make-tn (nth 1 (getf alloc :gpr)))
