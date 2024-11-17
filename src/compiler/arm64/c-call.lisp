@@ -1254,7 +1254,6 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
                 frame-size extra-offset extra-offset extra-end extra-end frame-size)
         (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
         (format t "!!RES-ALLOC: ~S~%" result-alloc)
-        (format t "!!===~%")
         (assemble (segment 'nil)
           (inst mov-sp nsp-save-tn nsp-tn)
           (inst str lr-tn (@ nsp-tn -16 :pre-index))
@@ -1295,6 +1294,8 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
           (inst ldr lr-tn (@ nsp-tn 16 :post-index))
           (inst ret)))
       (finalize-segment segment)
+      ;; FIXME
+      (format t "!!===~%")
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
       (let* ((buffer (sb-assem:segment-buffer segment))
