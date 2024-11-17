@@ -118,6 +118,36 @@
 (assert (= pi (alien-funcall (alien-callable-function 'return-double) pi)))
 
 ;;; passing and returning structs of various size and alignment
+(define-alien-type point2l (struct point2l
+                                  (x (integer 64))
+                                  (y (integer 64))))
+(define-alien-callable point2l-x (integer 64) ((p point2l))
+  (slot p 'x))
+(define-alien-callable point2l-y (integer 64) ((p point2l))
+  (slot p 'y))
+(with-test (:name (:callback :point2l)
+            :broken-on :interpreter)
+  (with-alien ((p point2l))
+    (setf (slot p 'x) 8)
+    (setf (slot p 'y) 9)
+    (assert (= 8 (alien-funcall (alien-callable-function 'point2l-x) p)))
+    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-y) p)))))
+
+(define-alien-type point2i (struct point2i
+                                  (x (integer 32))
+                                  (y (integer 32))))
+(define-alien-callable point2i-x (integer 32) ((p point2i))
+  (slot p 'x))
+(define-alien-callable point2i-y (integer 32) ((p point2i))
+  (slot p 'y))
+(with-test (:name (:callback :point2i)
+            :broken-on :interpreter)
+  (with-alien ((p point2i))
+    (setf (slot p 'x) 10)
+    (setf (slot p 'y) 11)
+    (assert (= 10 (alien-funcall (alien-callable-function 'point2i-x) p)))
+    (assert (= 11 (alien-funcall (alien-callable-function 'point2i-y) p)))))
+
 (define-alien-type point3l (struct point3l
                                   (x (integer 64))
                                   (y (integer 64))
