@@ -1042,8 +1042,9 @@ Ideally it should also be used in the C calling part."
                   (setf ngrn (align-up ngrn 2))
                   (prog1 (append pl `(:alloc :gpr :gpr (,ngrn ,(1+ ngrn))))
                     (incf ngrn 2)))
-                 ;; C.14 (implicit from size), C.16 (implicit), C.17
+                 ;; C.13, C.14 (implicit from size), C.16 (implicit), C.17
                  (t
+                  (setf ngrn 8)
                   (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
                     (incf nsp-off size)))))
               (:record-small
@@ -1056,8 +1057,9 @@ Ideally it should also be used in the C calling part."
                   (prog1 (append pl `(:alloc :gpr :gpr ,(loop for i below nregs
                                                               collect (+ ngrn i))))
                     (incf ngrn nregs)))
-                 ;; C.14, C.16, C.17
+                 ;; C.13, C.14, C.16, C.17
                  (t
+                  (setf ngrn 8)
                   (prog1 (append pl `(:alloc :stack :nsp-offset ,nsp-off :nsp-size ,size))
                     (incf nsp-off size)))))
               (:record-large

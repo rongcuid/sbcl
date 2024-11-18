@@ -483,6 +483,32 @@
                                    (p point2l))
   (declare (ignore a b c d e f))
   (slot p 'y))
+(define-alien-callable point2l-8x
+    (integer 64) ((a (integer 64)) (b (integer 64)) (c (integer 64)) (d (integer 64))
+                                   (e (integer 64)) (f (integer 64)) (g (integer 64))
+                                   (p point2l))
+  (declare (ignore a b c d e f g))
+  (slot p 'x))
+(define-alien-callable point2l-8y
+    (integer 64) ((a (integer 64)) (b (integer 64)) (c (integer 64)) (d (integer 64))
+                                   (e (integer 64)) (f (integer 64)) (g (integer 64))
+                                   (p point2l))
+  (declare (ignore a b c d e f g))
+  (slot p 'y))
+(define-alien-callable point2l-9x
+    (integer 64) ((a (integer 64)) (b (integer 64)) (c (integer 64)) (d (integer 64))
+                                   (e (integer 64)) (f (integer 64)) (g (integer 64))
+                                   (h (integer 64))
+                                   (p point2l))
+  (declare (ignore a b c d e f g h))
+  (slot p 'x))
+(define-alien-callable point2l-9y
+    (integer 64) ((a (integer 64)) (b (integer 64)) (c (integer 64)) (d (integer 64))
+                                   (e (integer 64)) (f (integer 64)) (g (integer 64))
+                                   (h (integer 64))
+                                   (p point2l))
+  (declare (ignore a b c d e f g h))
+  (slot p 'y))
 (with-test (:name (:callback :point2l)
             :broken-on :interpreter)
   (with-alien ((p point2l))
@@ -491,7 +517,11 @@
     (assert (= 8 (alien-funcall (alien-callable-function 'point2l-x) p)))
     (assert (= 9 (alien-funcall (alien-callable-function 'point2l-y) p)))
     (assert (= 8 (alien-funcall (alien-callable-function 'point2l-7x) 1 2 3 4 5 6 p)))
-    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-7y) 1 2 3 4 5 6 p)))))
+    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-7y) 1 2 3 4 5 6 p)))
+    (assert (= 8 (alien-funcall (alien-callable-function 'point2l-8x) 1 2 3 4 5 6 7 p)))
+    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-8y) 1 2 3 4 5 6 7 p)))
+    (assert (= 8 (alien-funcall (alien-callable-function 'point2l-9x) 1 2 3 4 5 6 7 8 p)))
+    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-9y) 1 2 3 4 5 6 7 8 p)))))
 
 ;; Point2 Int
 (define-alien-type point2i (struct point2i
