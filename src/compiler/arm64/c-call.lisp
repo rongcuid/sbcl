@@ -1053,7 +1053,7 @@ Ideally it should also be used in the C calling part."
                (when (= align 16) (align-up ngrn 2))
                (cond
                  ;; C.12
-                 ((< nregs (- 8 ngrn))
+                 ((<= nregs (- 8 ngrn))
                   (prog1 (append pl `(:alloc :gpr :gpr ,(loop for i below nregs
                                                               collect (+ ngrn i))))
                     (incf ngrn nregs)))
