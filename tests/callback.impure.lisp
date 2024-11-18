@@ -463,44 +463,73 @@
 
 
 ;;; passing and returning structs of various size and alignment
-(defmacro make-point-test (type fields-with-lisp-types &optional args-before args-after)
-  "Create test for point-type structs"
+(defmacro make-point-test (type fields &optional args-before args-after)
+  "Create test for point-type structs
+
+TYPE: struct type
+FIELDS: fields with lisp types and alien types
+ARGS-BEFORE: arguments before with lisp types and alien types
+ARGS-AFTER: arguments after with lisp types and alien types"
   (let*
       ((pkw (intern (symbol-name type) "KEYWORD"))
        (slot-values
-         (loop for (field type) in fields-with-lisp-types
-               collect `(,field ,(coerce (random 1000) type))))
+         (loop for (field type) in fields
+               collect (coerce (random 1000) type)))
        (slot-inits
-         (loop for (field value) in slot-values
+         (loop for (field) in fields
+               for value in slot-values
                collect `(setf (slot p ',field) ,value)))
        (before
-         (loop for type in args-before collect `(coerce (random 1000) type)))
+         (loop for (lisp-type) in args-before collect (coerce (random 1000) lisp-type)))
        (after
-         (loop for type in args-after collect `(coerce (random 1000) type)))
-       (fns
-         (loop for (field _) in fields-with-lisp-types
+         (loop for (lisp-type) in args-after collect (coerce (random 1000) lisp-type)))
+       (accessors
+         (loop for (field) in fields
                collect (intern
-                        (format nil "~A-~A" (symbol-name type) (symbol-name field)))))
+                        (format nil "*~A-~A*" (symbol-name type) (symbol-name field)))))
+       (accessor-defs
+         (loop
+           for (field lisp-type alien-type) in fields
+           for fn in accessors
+           collect
+           (let*
+               ((ret alien-type)
+                (nargs 0)
+                (before-alien
+                  (loop for (nil alien-type) in args-before
+                        do (incf nargs)
+                        collect `(,(intern (format nil "a~A" nargs)) ,alien-type)))
+                (after-alien
+                  (loop for (nil alien-type) in args-after
+                        for i upfrom 0
+                        do (incf nargs)
+                        collect `(,(intern (format nil "a~A" nargs)) ,alien-type)))
+                (args `(,@before-alien ,(list 'p type) ,@after-alien)))
+             `(define-alien-callable ,fn ,ret ,args
+                (slot p ',field)))))
        (test-body
-         (loop for (field value) in slot-values
-               for fn in fns
+         (loop for (field) in fields
+               for value in slot-values
+               for fn in accessors
                collect
                `(assert (= ,value
                            (alien-funcall
                             (alien-callable-function ',fn) ,@before p ,@after))))))
-    `(with-test (:name ,(list :callback pkw :before args-before :after args-after)
-                 :broken-on :interpreter)
-       (with-alien ((p ,type))
-         ,@slot-inits
-         ,@test-body))))
+    `(progn
+       ,@accessor-defs
+       (with-test (:name ,(list :callback pkw :before args-before :after args-after)
+                   :broken-on :interpreter)
+         (with-alien ((p ,type))
+           ,@slot-inits
+           ,@test-body)))))
 ;; Point2 Long
 (define-alien-type point2l (struct point2l
                                   (x (integer 64))
                                   (y (integer 64))))
-(define-alien-callable point2l-x (integer 64) ((p point2l))
-  (slot p 'x))
-(define-alien-callable point2l-y (integer 64) ((p point2l))
-  (slot p 'y))
+;;(define-alien-callable point2l-x (integer 64) ((p point2l))
+;;  (slot p 'x))
+;;(define-alien-callable point2l-y (integer 64) ((p point2l))
+;;  (slot p 'y))
 ;;(define-alien-callable point2l-7x
 ;;    (integer 64) ((a (integer 64)) (b (integer 64)) (c (integer 64))
 ;;                                   (d (integer 64)) (e (integer 64)) (f (integer 64))
@@ -551,16 +580,16 @@
 ;;                                   (p point2l))
 ;;  (declare (ignore a b c d e f g h))
 ;;  (slot p 'y))
-(format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer) (y integer)))))
-(make-point-test point2l ((x integer) (y integer)))
+(format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))))
+(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))
 
 (with-test (:name (:callback :point2l)
             :broken-on :interpreter)
   (with-alien ((p point2l))
     (setf (slot p 'x) 8)
     (setf (slot p 'y) 9)
-    (assert (= 8 (alien-funcall (alien-callable-function 'point2l-x) p)))
-    (assert (= 9 (alien-funcall (alien-callable-function 'point2l-y) p)))
+    ;;(assert (= 8 (alien-funcall (alien-callable-function 'point2l-x) p)))
+    ;;(assert (= 9 (alien-funcall (alien-callable-function 'point2l-y) p)))
     ;;(assert (= 8 (alien-funcall (alien-callable-function 'point2l-7x) 1 2 3 4 5 6 p)))
     ;;(assert (= 9 (alien-funcall (alien-callable-function 'point2l-7y) 1 2 3 4 5 6 p)))
     ;;(assert (= 8 (alien-funcall (alien-callable-function 'point2l-7-1-x) 1 2 3 4 5 6 p 8)))
