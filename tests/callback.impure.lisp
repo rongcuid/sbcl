@@ -467,7 +467,7 @@
   "Create test for point-type structs
 
 TYPE: struct type
-FIELDS: fields with lisp types and alien types
+FIELDS: fields with name, lisp types, and alien types
 ARGS-BEFORE: arguments before with lisp types and alien types
 ARGS-AFTER: arguments after with lisp types and alien types"
   (let*
@@ -504,8 +504,11 @@ ARGS-AFTER: arguments after with lisp types and alien types"
                         for i upfrom 0
                         do (incf nargs)
                         collect `(,(intern (format nil "a~A" nargs)) ,alien-type)))
-                (args `(,@before-alien ,(list 'p type) ,@after-alien)))
+                (args `(,@before-alien ,(list 'p type) ,@after-alien))
+                (ignore-args `(declare (ignore ,@(loop for (a) in before-alien collect a)
+                                               ,@(loop for (a) in after-alien collect a)))))
              `(define-alien-callable ,fn ,ret ,args
+                ,ignore-args
                 (slot p ',field)))))
        (test-body
          (loop for (field) in fields
@@ -582,6 +585,11 @@ ARGS-AFTER: arguments after with lisp types and alien types"
 ;;  (slot p 'y))
 (format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))))
 (make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))
+(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
+                 ((integer (integer 64))))
+(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
+                 ((integer (integer 64)))
+                 ((integer (integer 64))))
 
 (with-test (:name (:callback :point2l)
             :broken-on :interpreter)
