@@ -875,6 +875,22 @@ many elements are copied."
         vector)
       #()))
 
+(defun list-reverse-into-vector-cddr (list)
+  (declare (explicit-check))
+  (if list
+      (let* ((list-length (length (the list list)))
+             (length (ceiling list-length 2))
+             (vector (make-array length))
+             (list list))
+        (when (evenp list-length)
+          (pop list))
+        (loop for i from (1- length) downto 0
+              do
+              (setf (aref vector i) (pop list))
+              (pop list))
+        vector)
+      #()))
+
 (defun reverse-word-specialized-vector (from to end)
   (declare (vector from))
   (do ((length (length to))
@@ -1190,10 +1206,9 @@ many elements are copied."
                 (defun ,(symbolicate name "-SUBSEQ") (&rest sequences)
                   (declare (explicit-check)
                            (optimize (sb-c:insert-array-bounds-checks 0)))
-                  (let ((length* 0))
-                    (declare (index length*))
+                  (let ((length 0))
+                    (declare (index length))
                     (symbol-macrolet ((index (truly-the index index*))
-                                      (length (truly-the index length*))
                                       (start (truly-the index start*)))
                       (do-rest-arg ((arg index*) sequences)
                         (cond ((eq arg '%subseq)
@@ -1256,7 +1271,7 @@ many elements are copied."
   (let ((length 0))
     (declare (index length))
     (do-rest-arg ((seq) sequences)
-      (incf (truly-the index length) (length seq)))
+      (incf length (length seq)))
     (let* ((n-bits-shift (aref sb-vm::%%simple-array-n-bits-shifts%% (truly-the (unsigned-byte 8) widetag)))
            (result (sb-vm::allocate-vector-with-widetag
                     #+ubsan nil widetag length n-bits-shift))
@@ -1294,10 +1309,10 @@ many elements are copied."
 
 (defun %concatenate-to-vector-subseq (widetag &rest sequences)
   (declare (explicit-check))
-  (let ((length* 0))
+  (let ((length 0))
+    (declare (index length))
     (symbol-macrolet ((index (truly-the index index*))
-                      (rest-index (truly-the index rest-index*))
-                      (length (truly-the index length*)))
+                      (rest-index (truly-the index rest-index*)))
       (do-rest-arg ((arg index*) sequences)
         (cond ((eq arg '%subseq)
                (let* ((seq (fast-&rest-nth (incf index) sequences))
@@ -2707,7 +2722,7 @@ many elements are copied."
 (macrolet (;; shared logic for defining %FIND-POSITION and
            ;; %FIND-POSITION-IF in terms of various inlineable cases
            ;; of the expression defined in FROB and VECTOR*-FROB
-           (frobs (&optional bit-frob)
+           (frobs (&optional specialized)
              `(seq-dispatch-checking sequence-arg
                (frob sequence-arg from-end)
                (with-array-data ((sequence sequence-arg :offset-var offset)
@@ -2715,12 +2730,31 @@ many elements are copied."
                                  (end end)
                                  :check-fill-pointer t)
                  (typecase sequence
-                   #+sb-unicode
                    ((simple-array character (*))
-                    (vector*-frob sequence))
+                    #1=
+                    (cond ,@(when specialized
+                              #+(or arm64 x86-64) ;; invoke simd routines
+                              `(((and (eq #'identity key)
+                                      (or (eq #'eq test)
+                                          (eq #'eql test)
+                                          (and (or (eq test #'sb-c::two-arg-char=)
+                                                   (eq test #'char=))
+                                               (characterp item))
+                                          (eq #'equal test)))
+                                 (locally
+                                     (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                                   (let ((p (if from-end
+                                                (nth-value 1 (%find-position item sequence t start end #'identity #'eq))
+                                                (nth-value 1 (%find-position item sequence nil start end #'identity #'eq)))))
+                                     (if p
+                                         (values item (truly-the index (- p offset)))
+                                         (values nil nil)))))))
+                          (t
+                           (vector*-frob sequence))))
+                   #+sb-unicode
                    ((simple-array base-char (*))
-                    (vector*-frob sequence))
-                   ,@(when bit-frob
+                    #1#)
+                   ,@(when specialized
                        `((simple-bit-vector
                           (if (and (typep item 'bit)
                                    (eq #'identity key)

@@ -592,6 +592,26 @@
       (if (numberp x)
           (object-not-type-error (- x) type nil)
           (object-not-type-error x 'number nil)))))
+
+(deferr fill-pointer-error (array)
+  (declare (notinline fill-pointer-error))
+  (if (and (arrayp array)
+           (array-has-fill-pointer-p array))
+      (error (if (zerop (fill-pointer array))
+                 "There is nothing left to pop."
+                 "Unexpected FILL-POINTER error"))
+      (fill-pointer-error array)))
+
+(deferr mprint-error (x)
+  (declare (ignore x))
+  (let* ((raw-x (car *current-internal-error-args*))
+         (tn-name (sb-disassem::get-random-tn-name raw-x))
+         (context (sb-di:error-context)))
+    (multiple-value-bind (value size)
+        (sb-di::sub-access-debug-var-slot nil raw-x *current-internal-error-context* t)
+      (if size
+          (format t "~7a = ~v,'0,'|,32:x ~a~%" tn-name (* size 2) value context)
+          (format t "~7a = ~a ~a~%" tn-name value context)))))
 
 ;;;; INTERNAL-ERROR signal handler
 

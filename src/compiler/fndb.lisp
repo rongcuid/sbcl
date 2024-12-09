@@ -592,7 +592,8 @@
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t
                                           :preserve-vector-type t))
 
-(defknown list-reverse-into-vector (proper-list) simple-vector
+(defknown (list-reverse-into-vector list-reverse-into-vector-cddr)
+    (proper-list) simple-vector
   (flushable no-verify-arg-count))
 
 (defknown make-sequence (type-specifier index
@@ -656,11 +657,10 @@
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t
                                           :preserve-vector-type t))
 
-(defknown #.(loop for info across sb-vm:*specialized-array-element-type-properties*
-                  collect
-                  (intern (concatenate 'string "VECTOR-MAP-INTO/"
-                                       (string (sb-vm:saetp-primitive-type-name info)))
-                          :sb-impl))
+(defknown #.(map 'list (lambda (x)
+                         (package-symbolicate "SB-IMPL" "VECTOR-MAP-INTO/"
+                                              (sb-vm:saetp-primitive-type-name x)))
+                 sb-vm:*specialized-array-element-type-properties*)
     (simple-array index index (function ((rest-args :sequence t))
                                         (nth-arg 0 :sequence t))
                   &rest sequence)

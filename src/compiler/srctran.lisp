@@ -4798,12 +4798,19 @@
                                     'consp)
                                ,y)
                               (eq (car ,y) ',(car value))
-                              (null (cdr ,y)))))))))
+                              (null (cdr ,y))))))))
+           ;; (equal x (list y))
+           (unroll-list (lvar x y)
+             (when (splice-fun-args lvar 'list 1 nil)
+               `(and (typep ,y '(cons t null))
+                     (equal (car ,y) ,x)))))
       (cond ((same-leaf-ref-p x y) t)
             ((array-type-dimensions-mismatch x-type y-type)
              nil)
             ((unroll-constant x 'y))
             ((unroll-constant y 'x))
+            ((unroll-list x 'x 'y))
+            ((unroll-list y 'y 'x))
             (t
              (flet ((try (x-type y-type)
                       (flet ((both-csubtypep (type)
@@ -4893,12 +4900,19 @@
                              (loop with cdr = value
                                    while (consp cdr)
                                    always (symbolp (pop cdr))))
-                        `(equal x y)))))))
+                        `(equal x y))))))
+           ;; (equalp x (list y))
+           (unroll-list (lvar x y)
+             (when (splice-fun-args lvar 'list 1 nil)
+               `(and (typep ,y '(cons t null))
+                     (equalp (car ,y) ,x)))))
       (cond ((same-leaf-ref-p x y) t)
             ((array-type-dimensions-mismatch x-type y-type)
              nil)
             ((unroll-constant x 'y))
             ((unroll-constant y 'x))
+            ((unroll-list x 'x 'y))
+            ((unroll-list y 'y 'x))
             (t
              (flet ((try (x-type y-type)
                       (flet ((both-csubtypep (type)
@@ -6667,6 +6681,91 @@
 
 (deftransform princ ((object &optional stream) (string &optional t) * :important nil)
   `(write-string object stream))
+
+#-sb-xc-host ;; ansi-stream not defined
+(deftransform write-char ((object stream) (t ansi-stream) * :important nil)
+  `(progn (funcall (ansi-stream-cout stream) stream object)
+          object))
+
+#-sb-xc-host
+(deftransform write-string ((object stream &key (start 0) end)
+                            (simple-string ansi-stream &rest t) * :important nil)
+  `(progn (funcall (ansi-stream-sout stream) stream object start (or end
+                                                                     (length object)))
+          object))
+
+(deftransform read-char ((&optional stream eof-error-p eof-value recursive-p))
+  (when stream
+    (let ((uses (lvar-uses stream)))
+      (when (cast-p uses)
+        (delete-cast uses))))
+  `(block nil
+     (or (and (sb-impl::ansi-stream-p stream)
+              (let* ((buffer (sb-impl::ansi-stream-cin-buffer stream))
+                     (index (ansi-stream-in-index stream)))
+                (if buffer
+                    (when (/= index sb-impl::+ansi-stream-in-buffer-length+)
+                      (prog1
+                          (aref buffer index)
+                        (setf (ansi-stream-in-index stream) (1+ index))))
+                    (return (funcall (ansi-stream-in stream) stream ,(if eof-error-p
+                                                                         'eof-error-p
+                                                                         t) eof-value)))))
+         (locally (declare (notinline read-char))
+           (read-char ,@(loop for (lvar var) on (list stream 'stream
+                                                      eof-error-p 'eof-error-p
+                                                      eof-value 'eof-value
+                                                      recursive-p 'recursive-p)
+                              by #'cddr
+                              when lvar
+                              collect var))))))
+
+(deftransform read-byte ((stream &optional eof-error-p eof-value))
+  (when stream
+    (let ((uses (lvar-uses stream)))
+      (when (cast-p uses)
+        (delete-cast uses))))
+  `(block nil
+     (or (and (sb-impl::ansi-stream-p stream)
+              (let* ((buffer (ansi-stream-in-buffer stream))
+                     (index (ansi-stream-in-index stream)))
+                (if buffer
+                    (when (/= index sb-impl::+ansi-stream-in-buffer-length+)
+                      (prog1
+                          (aref buffer index)
+                        (setf (ansi-stream-in-index stream) (1+ index))))
+                    (return (funcall (ansi-stream-bin stream) stream ,(if eof-error-p
+                                                                          'eof-error-p
+                                                                          t) eof-value)))))
+         (locally (declare (notinline read-byte))
+           (read-byte stream
+                      ,@(loop for (lvar var) on (list eof-error-p 'eof-error-p
+                                                      eof-value 'eof-value)
+                              by #'cddr
+                              when lvar
+                              collect var))))))
+
+(deftransform peek-char ((&optional peek-type stream eof-error-p eof-value recursive-p)
+                         (null &rest t))
+  (when stream
+    (let ((uses (lvar-uses stream)))
+      (when (cast-p uses)
+        (delete-cast uses))))
+  `(or (and (sb-impl::ansi-stream-p stream)
+            (let* ((buffer (sb-impl::ansi-stream-cin-buffer stream))
+                   (index (ansi-stream-in-index stream)))
+              (when (and buffer
+                         (/= index sb-impl::+ansi-stream-in-buffer-length+))
+                (aref (truly-the vector buffer) index))))
+       (locally (declare (notinline peek-char))
+         (peek-char peek-type
+                    ,@(loop for (lvar var) on (list stream 'stream
+                                                    eof-error-p 'eof-error-p
+                                                    eof-value 'eof-value
+                                                    recursive-p 'recursive-p)
+                            by #'cddr
+                            when lvar
+                            collect var)))))
 
 #+sb-thread
 (progn
