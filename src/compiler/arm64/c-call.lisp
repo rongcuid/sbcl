@@ -1197,6 +1197,7 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
              ;; GPR-allocated args are simply copied
              (otherwise
               (dolist (gpr (getf alloc :gpr))
+                (format t "!!NSP[~A] := R~A ~%" next-arg-off gpr)
                 (inst str (make-tn gpr) (@ to-nsp-tn next-arg-off))
                 (incf next-arg-off n-word-bytes)))))
           ;; FPR-allocated args are copied

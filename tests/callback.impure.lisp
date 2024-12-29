@@ -472,9 +472,11 @@ ARGS-BEFORE: arguments before with lisp types and alien types
 ARGS-AFTER: arguments after with lisp types and alien types"
   (let*
       ((pkw (intern (symbol-name type) "KEYWORD"))
+       (init-value (random 1000))
        (slot-values
          (loop for (field type) in fields
-               collect (coerce (random 1000) type)))
+               for i from init-value
+               collect (coerce i type)))
        (slot-inits
          (loop for (field) in fields
                for value in slot-values
@@ -583,13 +585,41 @@ ARGS-AFTER: arguments after with lisp types and alien types"
 ;;                                   (p point2l))
 ;;  (declare (ignore a b c d e f g h))
 ;;  (slot p 'y))
-(format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))))
+;; (format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))))
 (make-point-test point2l ((x integer (integer 64)) (y integer (integer 64))))
 (make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
                  ((integer (integer 64))))
-(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
+(format t "~A~%" (macroexpand-1 '(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
                  ((integer (integer 64)))
-                 ((integer (integer 64))))
+                 ((integer (integer 64))))))
+(PROGN
+ (DEFINE-ALIEN-CALLABLE *POINT2L-X*
+     (INTEGER 64)
+     ((a1 (INTEGER 64)) (P POINT2L) (a2 (INTEGER 64)))
+   (DECLARE (IGNORE a1 a2))
+   (SLOT P 'X))
+ (DEFINE-ALIEN-CALLABLE *POINT2L-Y*
+     (INTEGER 64)
+     ((a1 (INTEGER 64)) (P POINT2L) (a2 (INTEGER 64)))
+   (DECLARE (IGNORE a1 a2))
+   (SLOT P 'Y))
+ (WITH-TEST (:NAME
+             (:CALLBACK :POINT2L :BEFORE ((INTEGER (INTEGER 64))) :AFTER
+              ((INTEGER (INTEGER 64))))
+             :BROKEN-ON :INTERPRETER)
+   (WITH-ALIEN ((P POINT2L))
+     (SETF (SLOT P 'X) 889)
+     (SETF (SLOT P 'Y) 890)
+     (ASSERT
+      (= 889 (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-X*) 300 P 991)))
+     (ASSERT
+      (= 890
+         (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-Y*) 300 P 991))))))
+
+
+;(make-point-test point2l ((x integer (integer 64)) (y integer (integer 64)))
+;                 ((integer (integer 64)))
+;                 ((integer (integer 64))))
 
 (with-test (:name (:callback :point2l)
             :broken-on :interpreter)
