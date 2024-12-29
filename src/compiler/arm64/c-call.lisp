@@ -1161,45 +1161,42 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
   "Given argument allocations, copy arguments to callback frame."
   (let ((next-arg-off 0)
         (next-extra-off extra-offset))
-    (flet ((make-tn (offset &optional (sc-name 'any-reg))
-             (make-random-tn :kind :normal
-                             :sc (sc-or-lose sc-name)
-                             :offset offset)))
+    (labels ((make-tn (offset &optional (sc-name 'any-reg))
+               (make-random-tn :kind :normal
+                               :sc (sc-or-lose sc-name)
+                               :offset offset))
+             (write-extra-pointer ()
+               (format t "!!NSP[~A] := &NSP[~A] ~%" next-arg-off next-extra-off)
+               (inst add temp-tn to-nsp-tn next-extra-off)
+               (inst str temp-tn (@ to-nsp-tn next-arg-off))
+               (incf next-arg-off n-word-bytes))
+             (copy-small-rec (reg size)
+               (format t "!!NSP[~A] := R~A(~A) ~%" next-extra-off reg size)
+               (inst str (make-tn reg) (@ to-nsp-tn next-extra-off))
+               (incf next-extra-off n-word-bytes))
+             (copy-large-rec (reg-l reg-h)
+               (format t "!!NSP[~A] := R~A ++ R~A ~%" next-extra-off reg-h reg-l)
+               (inst stp (make-tn reg-l) (make-tn reg-h) (@ to-nsp-tn next-extra-off))
+               (incf next-extra-off (* 2 n-word-bytes)))
+             (copy-gpr-arg (gpr)
+               (format t "!!NSP[~A] := R~A ~%" next-arg-off gpr)
+               (inst str (make-tn gpr) (@ to-nsp-tn next-arg-off))
+               (incf next-arg-off n-word-bytes)))
       (dolist (alloc arg-allocs)
         (ecase (getf alloc :alloc)
           (:gpr
            (case (getf alloc :kind)
              ;; GPR-allocated records require copying to extras first, then make a pointer
              (:record
-              ;; Write pointer
-              ;; FIXME
-              (format t "!!NSP[~A] := &NSP[~A] ~%" next-arg-off next-extra-off)
-              (inst add temp-tn to-nsp-tn next-extra-off)
-              (inst str temp-tn (@ to-nsp-tn next-arg-off))
-              (incf next-arg-off n-word-bytes)
+              (write-extra-pointer)
               ;; Copy to extras
               (cond ((<= (getf alloc :size) 8)
-                     ;; FIXME
-                     (format t "!!NSP[~A] := R~A(~A) ~%"
-                             next-extra-off
-                             (car (getf alloc :gpr)) (getf alloc :size))
-                     (inst str (make-tn (car (getf alloc :gpr))) (@ to-nsp-tn next-extra-off))
-                     (incf next-extra-off n-word-bytes))
+                     (copy-small-rec (car (getf alloc :gpr)) (getf alloc :size)))
                     (t
-                     (format t "!!NSP[~A] := R~A ++ R~A ~%"
-                             next-extra-off
-                             (nth 1 (getf alloc :gpr)) (nth 0 (getf alloc :gpr)))
-                     (inst stp
-                           (make-tn (nth 0 (getf alloc :gpr)))
-                           (make-tn (nth 1 (getf alloc :gpr)))
-                           (@ to-nsp-tn next-extra-off))
-                     (incf next-extra-off (* 2 n-word-bytes)))))
+                     (copy-large-rec (nth 0 (getf alloc :gpr)) (nth 1 (getf alloc :gpr))))))
              ;; GPR-allocated args are simply copied
              (otherwise
-              (dolist (gpr (getf alloc :gpr))
-                (format t "!!NSP[~A] := R~A ~%" next-arg-off gpr)
-                (inst str (make-tn gpr) (@ to-nsp-tn next-arg-off))
-                (incf next-arg-off n-word-bytes)))))
+              (dolist (gpr (getf alloc :gpr)) (copy-gpr-arg gpr)))))
           ;; FPR-allocated args are copied
           (:fpr
            (let* ((src-reg-type (if (= 4 (getf alloc :size)) 'single-reg 'double-reg))
