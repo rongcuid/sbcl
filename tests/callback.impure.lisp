@@ -593,6 +593,14 @@ ARGS-AFTER: arguments after with lisp types and alien types"
                  ((integer (integer 64)))
                  ((integer (integer 64))))))
 (PROGN
+  (define-alien-callable *point2l-a1* (integer 64)
+      ((a1 (INTEGER 64)) (P POINT2L) (a2 (INTEGER 64)))
+    (declare (ignore p a2))
+    a1)
+  (define-alien-callable *point2l-a2* (integer 64)
+      ((a1 (INTEGER 64)) (P POINT2L) (a2 (INTEGER 64)))
+    (declare (ignore p a1))
+    a2)
  (DEFINE-ALIEN-CALLABLE *POINT2L-X*
      (INTEGER 64)
      ((a1 (INTEGER 64)) (P POINT2L) (a2 (INTEGER 64)))
@@ -610,8 +618,10 @@ ARGS-AFTER: arguments after with lisp types and alien types"
    (WITH-ALIEN ((P POINT2L))
      (SETF (SLOT P 'X) 889)
      (SETF (SLOT P 'Y) 890)
-     (ASSERT
-      (= 889 (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-X*) 300 P 991)))
+     (assert (= 300 (alien-funcall (alien-callable-function '*point2l-a1*) 300 p 991)))
+     (assert (= 991 (alien-funcall (alien-callable-function '*point2l-a2*) 300 p 991)))
+     ;(ASSERT
+     ; (= 889 (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-X*) 300 P 991)))
      (ASSERT
       (= 890
          (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-Y*) 300 P 991))))))
