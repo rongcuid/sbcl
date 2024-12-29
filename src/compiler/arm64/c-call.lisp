@@ -935,7 +935,7 @@ NOTE:
 (defun alien-callback-accessor-form (type sap offset)
   "NOTE: this is the Lisp calling convention, not AAPCS64"
   ;; FIXME
-  (format t "!!>>> TYPE: ~A~%" type)
+  (format t "!!>>> TYPE: ~A SAP: ~A OFFSET: ~A~%" type sap offset)
   (let ((parsed-type (parse-alien-type type nil)))
     (if (alien-record-type-p parsed-type)
         ;; SBCL represents records as a SAP, so it's pointer to pointer
@@ -1116,8 +1116,9 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
         (:stack (incf args-size (align-up (getf alloc :nsp-size) n-word-bytes)))
         ;; A copied argument requires passing only the SAP
         (:copy (incf args-size n-word-bytes))))
-    ;; Calculate final frame size
+    ;; Align arguments to max possible alignment
     (setf args-size (align-up args-size n-word-bytes))
+    ;; Calculate final frame size
     (setf frame-size (+ args-size extra-size))
     (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                +number-stack-alignment-mask+))
