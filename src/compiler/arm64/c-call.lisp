@@ -1170,11 +1170,11 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
                (inst add temp-tn to-nsp-tn next-extra-off)
                (inst str temp-tn (@ to-nsp-tn next-arg-off))
                (incf next-arg-off n-word-bytes))
-             (copy-small-rec (reg size)
+             (copy-rec-1 (reg size)
                (format t "!!NSP[~A] := R~A(~A) ~%" next-extra-off reg size)
                (inst str (make-tn reg) (@ to-nsp-tn next-extra-off))
                (incf next-extra-off n-word-bytes))
-             (copy-large-rec (reg-l reg-h)
+             (copy-rec-2 (reg-l reg-h)
                (format t "!!NSP[~A] := R~A ++ R~A ~%" next-extra-off reg-h reg-l)
                (inst stp (make-tn reg-l) (make-tn reg-h) (@ to-nsp-tn next-extra-off))
                (incf next-extra-off (* 2 n-word-bytes)))
@@ -1191,9 +1191,9 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
               (write-extra-pointer)
               ;; Copy to extras
               (cond ((<= (getf alloc :size) 8)
-                     (copy-small-rec (car (getf alloc :gpr)) (getf alloc :size)))
+                     (copy-rec-1 (car (getf alloc :gpr)) (getf alloc :size)))
                     (t
-                     (copy-large-rec (nth 0 (getf alloc :gpr)) (nth 1 (getf alloc :gpr))))))
+                     (copy-rec-2 (car (getf alloc :gpr)) (cadr (getf alloc :gpr))))))
              ;; GPR-allocated args are simply copied
              (otherwise
               (dolist (gpr (getf alloc :gpr)) (copy-gpr-arg gpr)))))
