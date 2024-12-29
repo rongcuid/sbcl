@@ -936,11 +936,14 @@ NOTE:
   "NOTE: this is the Lisp calling convention, not AAPCS64"
   ;; FIXME
   (format t "!!>>> TYPE: ~A SAP: ~A OFFSET: ~A~%" type sap offset)
+  ;`(deref (sap-alien (sap+ ,sap ,offset) (* ,type)))
   (let ((parsed-type (parse-alien-type type nil)))
     (if (alien-record-type-p parsed-type)
-        ;; SBCL represents records as a SAP, so it's pointer to pointer
-        `(deref (sap-alien (sap+ ,sap ,offset) (* (* ,type))))
-        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+        ;; SBCL represents records as a SAP
+        `(sap-alien (sap+ ,sap ,offset) ,type)
+        ;`(deref (sap-alien (sap+ ,sap ,offset) (* (* ,type))))
+        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type)))))
+  )
 
 #-sb-xc-host
 (defun alien-type-slot-info (type)
@@ -1087,29 +1090,22 @@ Ideally it should also be used in the C calling part."
   "Computes the callback frame info from argument allocations.
 Returning:
 - Frame size (including padding)
-- Total argument size (also the beginning offset of extra segment)
-- Extra end offset
+- Total argument size
 
-Frame is organized as following, where extras hold copies of arguments as needed:
+Frame is organized as following:
 
-|Arguments |Extras
+|Arguments |Padding
+
+FIXME: trying to put structs in main argument vector now
 
 NOTE: this is using Lisp calling convention, not AAPCS64!"
   (let ((frame-size 0)
-        (args-size 0)
-        (extra-size 0))
+        (args-size 0))
     (dolist (alloc arg-allocs)
       (ecase (getf alloc :alloc)
         ;; GPR args are copied as is, one word per register
         (:gpr
-         (case (getf alloc :kind)
-           ;; A struct passed by GPR requires an additional copy AND a SAP to the copy
-           (:record
-            (incf args-size n-word-bytes)
-            (incf extra-size (* n-word-bytes (length (getf alloc :gpr)))))
-           ;; Otherwise, copy GPR to stack
-           (otherwise
-            (loop for r in (getf alloc :gpr) do (incf args-size n-word-bytes)))))
+         (incf args-size (* n-word-bytes (length (getf alloc :gpr)))))
         ;; FPR args are copied as is
         (:fpr (incf args-size n-word-bytes))
         ;; Stack args are copied and aligned
@@ -1119,10 +1115,10 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
     ;; Align arguments to max possible alignment
     (setf args-size (align-up args-size n-word-bytes))
     ;; Calculate final frame size
-    (setf frame-size (+ args-size extra-size))
+    (setf frame-size args-size)
     (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                +number-stack-alignment-mask+))
-    (values frame-size args-size (+ args-size extra-size))))
+    (values frame-size args-size)))
 
 #-sb-xc-host
 (defun copy-int-arg-to-stack (size signed source-tn target-tn temp-tn)
@@ -1158,27 +1154,21 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
      (inst str temp-tn target-tn))))
 
 #-sb-xc-host
-(defun alien-callback-copy-arguments (arg-allocs from-nsp-tn to-nsp-tn extra-offset temp-tn)
+(defun alien-callback-copy-arguments (arg-allocs from-nsp-tn to-nsp-tn temp-tn)
   "Given argument allocations, copy arguments to callback frame."
-  (let ((next-arg-off 0)
-        (next-extra-off extra-offset))
+  (let ((next-arg-off 0))
     (labels ((make-tn (offset &optional (sc-name 'any-reg))
                (make-random-tn :kind :normal
                                :sc (sc-or-lose sc-name)
                                :offset offset))
-             (write-extra-pointer ()
-               (format t "!!NSP[~A] := &NSP[~A] ~%" next-arg-off next-extra-off)
-               (inst add temp-tn to-nsp-tn next-extra-off)
-               (inst str temp-tn (@ to-nsp-tn next-arg-off))
-               (incf next-arg-off n-word-bytes))
              (copy-rec-1 (reg size)
-               (format t "!!NSP[~A] := R~A(~A) ~%" next-extra-off reg size)
-               (inst str (make-tn reg) (@ to-nsp-tn next-extra-off))
-               (incf next-extra-off n-word-bytes))
+               (format t "!!NSP[~A] := R~A(~A) ~%" next-arg-off reg size)
+               (inst str (make-tn reg) (@ to-nsp-tn next-arg-off))
+               (incf next-arg-off n-word-bytes))
              (copy-rec-2 (reg-l reg-h)
-               (format t "!!NSP[~A] := R~A ++ R~A ~%" next-extra-off reg-h reg-l)
-               (inst stp (make-tn reg-l) (make-tn reg-h) (@ to-nsp-tn next-extra-off))
-               (incf next-extra-off (* 2 n-word-bytes)))
+               (format t "!!NSP[~A] := R~A ++ R~A ~%" next-arg-off reg-h reg-l)
+               (inst stp (make-tn reg-l) (make-tn reg-h) (@ to-nsp-tn next-arg-off))
+               (incf next-arg-off (* 2 n-word-bytes)))
              (copy-gpr-arg (gpr)
                (format t "!!NSP[~A] := R~A ~%" next-arg-off gpr)
                (inst str (make-tn gpr) (@ to-nsp-tn next-arg-off))
@@ -1187,10 +1177,8 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
         (ecase (getf alloc :alloc)
           (:gpr
            (case (getf alloc :kind)
-             ;; GPR-allocated records require copying to extras first, then make a pointer
              (:record
-              (write-extra-pointer)
-              ;; Copy to extras
+              ;; Copy to stack
               (cond ((<= (getf alloc :size) 8)
                      (copy-rec-1 (car (getf alloc :gpr)) (getf alloc :size)))
                     (t
@@ -1253,11 +1241,11 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
            (arg-allocs (allocate-arguments argument-types))
            (result-alloc (unless (alien-void-type-p result-type)
                              (car (allocate-arguments (list result-type))))))
-      (multiple-value-bind (frame-size extra-offset extra-end) (callback-frame-info arg-allocs)
+      (multiple-value-bind (frame-size args-end) (callback-frame-info arg-allocs)
         ;; FIXME remove this debug call when done
         (format t "!!===~%")
-        (format t "!!FRAME:~A = ARGS[0..~A] + EXTRAS[~A..~A] + PADDING[~A..~A]~%"
-                frame-size extra-offset extra-offset extra-end extra-end frame-size)
+        (format t "!!FRAME:~A = ARGS[0..~A] + PADDING[~A..~A]~%"
+                frame-size args-end args-end frame-size)
         (format t "!!ARG-ALLOCS: ~S~%" arg-allocs)
         (format t "!!RES-ALLOC: ~S~%" result-alloc)
         (assemble (segment 'nil)
@@ -1267,7 +1255,7 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
           (when (plusp frame-size)
             (inst sub nsp-tn nsp-tn frame-size))
           ;; Copy arguments
-          (alien-callback-copy-arguments arg-allocs nsp-save-tn nsp-tn extra-offset temp-tn)
+          (alien-callback-copy-arguments arg-allocs nsp-save-tn nsp-tn temp-tn)
           ;; arg0 to FUNCALL3 (function)
           (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
           (loadw r0-tn r0-tn)
