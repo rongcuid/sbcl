@@ -620,8 +620,8 @@ ARGS-AFTER: arguments after with lisp types and alien types"
      (SETF (SLOT P 'Y) 890)
      (assert (= 300 (alien-funcall (alien-callable-function '*point2l-a1*) 300 p 991)))
      (assert (= 991 (alien-funcall (alien-callable-function '*point2l-a2*) 300 p 991)))
-     ;(ASSERT
-     ; (= 889 (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-X*) 300 P 991)))
+     (ASSERT
+      (= 889 (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-X*) 300 P 991)))
      (ASSERT
       (= 890
          (ALIEN-FUNCALL (ALIEN-CALLABLE-FUNCTION '*POINT2L-Y*) 300 P 991))))))

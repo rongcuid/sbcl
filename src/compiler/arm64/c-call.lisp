@@ -1159,12 +1159,12 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
 #-sb-xc-host
 (defun alien-callback-copy-arguments (arg-allocs from-nsp-tn to-nsp-tn extra-offset temp-tn)
   "Given argument allocations, copy arguments to callback frame."
-  (flet ((make-tn (offset &optional (sc-name 'any-reg))
-           (make-random-tn :kind :normal
-                           :sc (sc-or-lose sc-name)
-                           :offset offset)))
-    (let ((next-arg-off 0)
-          (next-extra-off extra-offset))
+  (let ((next-arg-off 0)
+        (next-extra-off extra-offset))
+    (flet ((make-tn (offset &optional (sc-name 'any-reg))
+             (make-random-tn :kind :normal
+                             :sc (sc-or-lose sc-name)
+                             :offset offset)))
       (dolist (alloc arg-allocs)
         (ecase (getf alloc :alloc)
           (:gpr
@@ -1182,7 +1182,7 @@ NOTE: this is using Lisp calling convention, not AAPCS64!"
                      ;; FIXME
                      (format t "!!NSP[~A] := R~A(~A) ~%"
                              next-extra-off
-                              (car (getf alloc :gpr)) (getf alloc :size))
+                             (car (getf alloc :gpr)) (getf alloc :size))
                      (inst str (make-tn (car (getf alloc :gpr))) (@ to-nsp-tn next-extra-off))
                      (incf next-extra-off n-word-bytes))
                     (t
